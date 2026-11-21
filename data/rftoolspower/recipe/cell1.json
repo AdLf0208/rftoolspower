@@ -1,0 +1,18 @@
+{
+  "category": "misc",
+  "key": {
+    "F": "rftoolsbase:machine_frame",
+    "K": "rftoolspower:power_core1",
+    "r": "minecraft:redstone"
+  },
+  "pattern": [
+    "rKr",
+    "KFK",
+    "rKr"
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:cell1"
+  },
+  "type": "minecraft:crafting_shaped"
+}

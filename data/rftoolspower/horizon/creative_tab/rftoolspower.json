@@ -2,7 +2,10 @@
   "icon": "rftoolspower:coalgenerator",
   "items": [
     "rftoolspower:coalgenerator",
-    "rftoolspower:power_monitor"
+    "rftoolspower:power_monitor",
+    "rftoolspower:cell1",
+    "rftoolspower:cell2",
+    "rftoolspower:power_core1"
   ],
   "title": "itemGroup.rftoolspower"
 }

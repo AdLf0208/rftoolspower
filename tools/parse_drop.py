@@ -12,7 +12,10 @@ asked for:
 
     ok=1 component=present carried=3000 burn=503
 
-Usage: parse_drop.py "<reply line>" none|<FE>
+Usage: parse_drop.py "<reply line>" none|<FE> [type_id]
+
+`type_id` is the block entity type the payload must name — the generator's by default; a
+powercell passes its own (`rftoolspower:cell1_block_entity`).
 """
 
 from __future__ import annotations
@@ -25,10 +28,14 @@ TYPE = "rftoolspower:coalgenerator_block_entity"
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: parse_drop.py '<data get reply>' none|<FE>", file=sys.stderr)
+    if len(argv) not in (3, 4):
+        print(
+            "usage: parse_drop.py '<data get reply>' none|<FE> [type_id]",
+            file=sys.stderr,
+        )
         return 2
     line, expect = argv[1], argv[2].strip()
+    type_id = argv[3].strip() if len(argv) == 4 else TYPE
     present = COMPONENT in line
     carried = None
     burn = None
@@ -46,7 +53,7 @@ def main(argv: list[str]) -> int:
         except ValueError:
             print(f"bad expectation {expect!r}", file=sys.stderr)
             return 2
-        ok = present and carried == wanted and TYPE in line
+        ok = present and carried == wanted and type_id in line
     print(f"ok={1 if ok else 0}")
     print(f"component={'present' if present else 'absent'}")
     print(f"carried={carried if carried is not None else 'none'}")

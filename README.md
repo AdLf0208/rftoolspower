@@ -1,10 +1,10 @@
-# RFTools Power for Horizon — the Coal Generator and the Power Monitor
+# RFTools Power for Horizon — the Coal Generator, the Power Monitor and the Powercell
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.1**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.2**.
 
-Two families so far:
+Three families so far:
 
 **The Coal Generator** (slice 1)
 
@@ -28,6 +28,19 @@ Two families so far:
 - reads and sets the band through `/rftoolspower monitor <pos>` and
   `/rftoolspower band <pos> <min> <max>` — the harness's stand-in for upstream's GUI sliders.
 
+**The Powercell** (slice 3, `cell1`/`cell2`)
+
+- stores **500,000 FE** (tier 1) / **4,000,000 FE** (tier 2) per cell;
+- has six face modes — `NONE` (a fresh cell, all six), `INPUT`, `OUTPUT` — and moves at most
+  **250 / 1,000 FE a tick a side**, plus 25 % of that per extra cell in its network;
+- shares one store and one capacity with **every adjacent powercell, of any tier** (upstream's
+  `PowerCellNetwork` has no tier test): the capability answers the network's total, an insert fills
+  the cell asked first, and a cell with an `OUTPUT` face pushes the network's FE out;
+- keeps its own store on its item when broken;
+- reads out through `/rftoolspower cell <pos>` and sets a face with
+  `/rftoolspower side <pos> <face> NONE|INPUT|OUTPUT` — the harness's stand-in for the smart wrench
+  the parent port does not carry.
+
 ## Build
 
 ```sh
@@ -42,11 +55,11 @@ packed.
 
 | Path | What |
 |---|---|
-| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter) with their unit tests |
+| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the cell's tiers/faces/network/budgets) with their unit tests |
 | `src/support.rs` | the glue: both block entity Parts, the container and buffer declarations, the ticks, the click, the drops, the redstone, the commands |
 | `src/lib.rs` | the one `impl mod_api::Hooks` |
 | `assets/`, `data/` | the carried content, built by `tools/assemble_content.py` |
-| `tools/e2e.sh` | the in-game leg (phases A–T) |
+| `tools/e2e.sh` | the in-game leg (phases A–AD) |
 | `tools/build-e2e-game.sh`, `tools/harness-receiver/` | the e2e-only energy receiver the push is proven against (never in the `.hmod`) |
 | `notes.md` | the slices, the evidence, the gaps |
 | `FINDINGS.md` | the upstream behaviour extracted (analysis only) |

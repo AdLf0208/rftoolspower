@@ -1,12 +1,15 @@
 id = "rftoolspower"
 name = "RFTools Power"
-version = "0.1.1"
+version = "0.1.2"
 description = """A port of RFTools Power for Horizon: the Coal Generator, which burns coal, charcoal or a
 coal block for 600 ticks each (nine times that for a block) at 60 FE a tick into a 500,000 FE
 buffer, lights its own front while it burns, takes fuel from a hopper or a right click, gives its
 store out through the energy capability and pushes 2,000 FE a tick into an adjacent energy block;
-and the Power Monitor, which reads the block it faces every 20 ticks, shows its charge as a level
-0-5, and gives a redstone alarm on its display side inside a configureable percentage band."""
+the Power Monitor, which reads the block it faces every 20 ticks, shows its charge as a level
+0-5, and gives a redstone alarm on its display side inside a configureable percentage band; and the
+Powercell (tier 1 and tier 2), a 500,000 / 4,000,000 FE buffer whose six faces default to NONE and
+take or give FE only through a face set to INPUT or OUTPUT, and whose adjacent cells share one
+network — capacity and per-side throughput summed over every cell of it."""
 authors = ["McJty", "Horizon native mod contributors"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside the carried data/ and assets/. The id is the resource namespace and the only identity:

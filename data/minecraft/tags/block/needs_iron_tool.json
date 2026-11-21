@@ -1,6 +1,8 @@
 {
   "values": [
     "rftoolspower:coalgenerator",
-    "rftoolspower:power_monitor"
+    "rftoolspower:power_monitor",
+    "rftoolspower:cell1",
+    "rftoolspower:cell2"
   ]
 }

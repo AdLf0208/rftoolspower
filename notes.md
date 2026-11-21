@@ -1,10 +1,14 @@
-# RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor)
+# RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the powercell)
 
-> **Current state (2026-11-21): slice 2, package 0.1.1 at pin
+> **Current state (2026-11-22): slice 3, package 0.1.2 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
-> generator; slice 2 adds the **Power Monitor** and the generator's **energy push**
-> (`handleSendingEnergy`), from the port's own gap list (gaps 1 and 10). The 0.1.0 package is in
-> review upstream; 0.1.1 is the same entry's next version.
+> generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
+> (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
+> entity with a 500,000 / 4,000,000 FE buffer, six face modes that default to `NONE`, an adjacency
+> **network** that shares one store and capacity across cells of any tier, and the output push out
+> of an `OUTPUT` face. Gap 9 said `blocked(smartwrench-not-carried)`; the missing carrier is
+> replaced by the **`/rftoolspower side <pos> <face> NONE|INPUT|OUTPUT`** command, exactly as
+> `/rftoolspower band` stands in for the monitor's GUI sliders.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -26,9 +30,21 @@ MIT (`5195ba53…4b00`), and the provenance is in [`LICENSE-NOTICE.md`](LICENSE-
 [`CONTENT.md`](CONTENT.md). Publishable as a first publication under MIT with this source, subject
 to the campaign's maintainer approval (ARCHITECTURE.md §8).
 
-Status: **ported-partial** — the coal generator (A–M) and the power monitor plus the generator's
-energy push (N–T) are implemented and verified in game at the current pin. The gap list below is
-the rest of the mod.
+Status: **ported-partial** — the coal generator (A–M), the power monitor plus the generator's
+energy push (N–T) and the powercell (U–AD) are implemented and verified in game at the current pin.
+The gap list below is the rest of the mod.
+
+## What the powercell binds to (the 2026-11-21 parent-surface ruling)
+
+- The parent surface is again just **`rftoolsbase:machine_frame`** (cell1's recipe centre) and the
+  carried `power_core1`. No parent capability, machine or recipe type is used.
+- The **smart wrench is not carried** (gap 9's original blocker: `PowerCellBlock.wrenchUse` toggles
+  a face's mode). The stand-in is a **command**, not a fake item:
+  `/rftoolspower side <pos> <face> NONE|INPUT|OUTPUT`. A fresh cell is six `NONE`s in both cases —
+  upstream's own default — so the command reproduces the wrench's state machine, not a behaviour
+  the mod does not have.
+- `cell2` is carried because the network's tier behaviour needs a second capacity to be observable;
+  `cell3` is not (gap 9).
 
 ## Class + tier and the approach
 
@@ -270,6 +286,176 @@ signal never leaves the free face. The port follows the notify side (the display
 monitored block) for both the answer and the update; a user notices: the alarm reaches a lamp beside
 the monitor. The band's unset default is documented as the port's reading, not a defect.
 
+## Slice 3 — the powercell, tier 1 and tier 2 (package 0.1.2)
+
+Gap line it comes from (`## Gaps` below): **gap 9** — *"the powercell (`cell1/2/3`) — the mod's
+storage and its multiblock network — is `blocked(smartwrench-not-carried)`"*. Tier: still
+**machines**; block entities with a server tick, a capability and saved state. No GUI, no renderer,
+no linking item.
+
+### What it does (upstream `PowerCellTileEntity`, `PowerCellBlock`, `PowerCellConfig`,
+`data/{Tier,SideType,PowerCellNetwork}.java`, 1.21-7.0.6)
+
+- **The block.** `rftoolspower:cell1`/`cell2` on a plain full cube (`minecraft:iron_block`
+  template): hardness 2.0, blast 2.0, iron sound, an iron pickaxe's tool.
+- **The buffer.** One cell stores `tierNMaxRF` — **500,000** (tier 1) / **4,000,000** (tier 2); its
+  own store is the int `energy` in its saved compound (`saveAdditional`'s `tag.putLong("energy")`,
+  read back through the capability as the network's total).
+- **The six faces.** `SideType` `NONE`/`INPUT`/`OUTPUT`, **all `NONE` on a fresh cell**, saved as
+  upstream's own six-digit `mode` string in `Direction` order (`saveClientDataToNBT`). A face takes
+  FE in only through `INPUT` (`receiveEnergyFacing`'s mode check); a face gives FE out only through
+  `OUTPUT` (`sendOutEnergy`); the capability itself **never** lets a neighbour pull
+  (`extractEnergy` answers 0), so the cell pushes on its own tick, as upstream's does.
+- **The per-side cap.** One side moves `tierNMaxRFPerTick` — **250** (tier 1) / **1,000** (tier 2)
+  — plus `rfPerTickScale` (**0.25**) of that per extra cell in the network, truncated by upstream's
+  `(long)` cast: one cell 250, a pair **312**, nine 750. This is why a 2,000-a-tick generator fills
+  a lone tier-1 cell at 250 a tick and keeps the rest.
+- **The network.** Every powercell reachable through a shared face is one network
+  (`buildNetwork` walks from one `PowerCellTileEntity` to the next): the capability answers the
+  **sum** of the cells' stores and the **sum** of their capacities, and an insert fills the cell
+  asked first and then the rest (`receiveEnergyFacing`). A network larger than `networkMax`
+  (**729**) is `!isValid()` and moves nothing.
+- **The output push.** Each tick (`tickServer` → `sendOutEnergy`) a cell with any `OUTPUT` face
+  offers up to the network's per-side budget to the block on that face, **skipping another
+  powercell** (cells share through the network, never by pushing into each other), and drains what
+  was accepted from the network, its own store first (`extractEnergyFromNetwork`).
+- **The item.** A broken cell keeps its own store (upstream's `copy_components` of `item_energy`)
+  through `minecraft:block_entity_data`; the face modes are client data and do not travel. A
+  doctored item's amount is clamped to the block's tier when placed.
+- **The readouts.** `/rftoolspower cell <pos> [nonce]` prints tier/local/network/cells/sides in one
+  line; `/rftoolspower side <pos> <face> <mode>` sets a face and echoes the six modes. Both are the
+  harness's stand-ins for upstream's GUI and wrench.
+
+### Numbers and where they came from
+
+| Number | Value | Source |
+|---|---:|---|
+| tier-1 capacity | 500,000 FE | `PowerCellConfig.TIER1_MAXRF` (`tier1MaxRF`) |
+| tier-2 capacity | 4,000,000 FE | `TIER2_MAXRF` |
+| (tier 3, not carried) | 20,000,000 FE | `TIER3_MAXRF` |
+| tier-1 a side a tick | 250 FE | `TIER1_RFPERTICK` (`tier1MaxRFPerTick`) |
+| tier-2 a side a tick | 1,000 FE | `TIER2_RFPERTICK` |
+| per extra cell | +25 % of the per-side number | `RFPERTICK_SCALE` (`rfPerTickScale`, `0.25`) |
+| a network | at most 729 cells | `NETWORK_MAX` (`networkMax`, `9*9*9`) |
+| face modes | NONE 0 / OUTPUT 1 / INPUT 2, fresh all NONE | `SideType` ordinals, `modes` initialiser |
+| cell hardness | 2.0 / 2.0, pickaxe, iron sound | McJtyLib `BlockBuilder` default |
+| cell1 recipe | redstone / power core / machine frame (`"rKr"/"KFK"/"rKr"`) | `PowerCellModule.initDatagen` |
+| power core recipe | diamond / redstone / redstone block (`" d "/"rRr"/" r "`) | `PowerCellModule.initDatagen` |
+
+### Two brief assertions corrected from the artefact (rulings: the artefact wins)
+
+The dispatch brief asked for **a cell whose `energy` rises by exactly 2,000 a tick** from a
+2,000-a-tick generator, and for **a `cell2` beside a `cell1` not to join the network**. Both
+contradict 1.21-7.0.6:
+
+1. **The receive rate is 250 a tick, not 2,000.** `receiveEnergyFacing` begins
+   `maxReceive = Math.min(maxReceive, getRfPerTickReal())`, and `getRfPerTickReal` is
+   `per_side + (size-1)*per_side*0.25` — 250 for a lone tier-1 cell. The port implements the cap and
+   the leg asserts **exactly 250 × Δticks** on the cell *and* the matching loss on the generator
+   (phase W). A 2,000-a-tick acceptance would have been an invented mechanic (and a cheat: eight
+   times upstream's throughput).
+2. **A `cell2` beside a `cell1` does join the network.** `buildNetwork` recurses over every
+   adjacent `PowerCellTileEntity` with **no tier test**, and `redistributeNetwork` loops the three
+   tiers *inside one network* — a per-tier loop that would be dead code if networks were
+   single-tier. The network's capacity is therefore the sum of the tiers' capacities (a cell1 beside
+   a cell2 = 4,500,000). The port implements that and the leg proves both directions (phase Y):
+   adjacent cell1+cell2 share `5,000/4,500,000`; a cell2 one block away is its own
+   `0/4,000,000`. What the brief meant to exclude — membership by tier rather than adjacency — is
+   exactly what the differential shows is absent.
+
+Both corrections are in the e2e transcript, so a reader can check them against the jar's source.
+
+### Red → green
+
+The cell's rules were stubbed `todo!()` behind their tests; the failing run is
+`ports/_shared/evidence/rftoolspower/red-cell.log`:
+
+```
+test result: FAILED. 33 passed; 12 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+not yet implemented
+```
+
+Green: **50 passed; 0 failed** (`sdk-test.log`, which prints the package sha). The twelve new tests
+pin: the six `NONE`s of a fresh cell and upstream's six-digit saved string; one face at a time and
+the wrench's NONE→INPUT→OUTPUT cycle; the three tiers' capacities and per-side numbers; the 250 take
+from a 2,000 push; the 312 budget of a pair and the asking cell's tier setting it; the rest of a
+budget passing to the next cell; the network as the sum of mixed tiers; the 729-cell limit; the
+asked cell draining first; and the per-tier clamp of a doctored store.
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `native-build` reported
+`Compiling rftoolspower (1 of 1)` and installed `native-0a875da-ad5b2631abc2`; the two-mod e2e build
+is `native-0a875da-18dcc70fffdb` (`rfpowerharness`, `rftoolspower`), and its `native-mods.json`
+names version **0.1.2**.
+
+| log | verdict |
+|---|---|
+| `e2e-powercell.log` | **PASS**, `EXIT:0` — phases A–AD (the whole port, not just the cell) |
+| `e2e-powercell-selftest.log` | `FAIL: selftest: the cell's NONE face took nothing in 40 ticks, so the assertion is alive`, `EXIT:1` |
+| `e2e-powercell-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` (the unmodded Nightly) |
+| `e2e-powercell-selftest-monitor.log` | slice 2's inversion, `EXIT:1` (regression: still alive) |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=8 ok=8 missing-exit=0 bad-exit=0`.
+
+The parsed assertions, each from a `ctl` reply:
+
+| phase | what it asserts (observed) |
+|---|---|
+| U | a placed `cell1` reads `tier=1 local=0/500000 network=0/500000 cells=1 sides=none,none,none,none,none,none`, and `/data get … energy` is 0 |
+| V | 40 ticks against a 100,000 FE generator whose face is still `NONE`: the cell stays **0** and the generator stays **100,000** (the differential for W) |
+| W | `side … west input` echoes `west input (sides=none,none,none,none,input,none)`; over **38 ticks** the cell rises `2000 → 11500` (**+9,500 = 250 × 38**) and the generator falls `95750 → 86250` (**−9,500**); after the drain: cell `100000`, generator `0` |
+| X | two adjacent `cell1`s read the same `network=3000/1000000 cells=2` (locals 1,000 + 2,000); a third with one air block of gap reads `4000/500000 cells=1` |
+| Y | a `cell2` beside a `cell1`: both read `network=5000/4500000 cells=2`; a `cell2` with a gap reads `0/4000000 cells=1` |
+| Z | `east output`, 100,000 in the cell: over 29 ticks `98000 → 90750` (**−7,250 = 250 × 29**); after `east none`, cell 88,500 + receiver 11,500 = **100,000** (nothing created or lost) |
+| AA | `7000/500000 FE` and `west input` before and after save + quit + relaunch |
+| AB | a survival break of a 3,000 FE cell drops one whose `SelectedItem` carries `block_entity_data {id: "rftoolspower:cell1_block_entity", energy: 3000}`; placing it restores `3000 FE` |
+| AC | the power core's recipe crafts once (`rftoolspower:power_core1`) and consumes its diamond, redstone block and three redstones; cell1's recipe with a stone where `rftoolsbase:machine_frame` belongs crafts nothing |
+| AD | `side … nowhere input` → `unknown face 'nowhere' (down\|up\|north\|south\|west\|east)`; `side … west inputt` → `unknown mode 'inputt' (none\|input\|output)`; a stone position → `No RFTools Power power cell there.` — all **parsed replies**, never the command's (always 0) exit status |
+
+Counterfactual: `SELFTEST=1` inverts V and the leg fails as designed, so V can fail; W's differential
+is V itself (no mode, no transfer). The control leg proves U is not vacuous.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **A pure item needs its own `data/<mod>/horizon/item/<name>.json`.** The 26.3
+   `assets/<mod>/items/<name>.json` is only the client model definition: without the `horizon/item`
+   declaration, a recipe's result still *crafts* and the screen still shows
+   `rftoolspower:power_core1`, but `give @s rftoolspower:power_core1` answers `Unknown item` — the
+   in-game leg caught exactly that, and no `check`/`fits`/clippy run could.
+2. **`setblock` of the same block keeps its block entity data.** A re-run left the harness receiver
+   standing with a full store, so phase R's first sample read `100000` and the assertion was
+   vacuous. The leg now sets the spot to air, waits, and places the receiver again (`SX,101,36` and
+   `SX+1,101,68`).
+3. **Two `data get` reads are several ticks apart, and a store still moving is not conserved across
+   them** (`A(t1) + B(t2) = total − the change between the reads`). The leg asserts per-store rates
+   against each reply's own `t` (`ΔE == 250 × Δt`) and does its conservation check **at rest**
+   (after setting the face back to `NONE`, or after the generator is empty).
+4. **`ctl click-slot 200` puts a crafting result on the cursor**, not in the inventory; a second
+   click on a free hotbar slot stores it (`click-slot 8`), which is also how the leg proves the
+   ingredients were consumed.
+5. **A fill that spans unloaded End chunks answers "That position is not loaded" and lands
+   nothing.** The cell rows reach z=90, so the leg stands in them and retries the floor fill, then
+   asserts the floor and the air are really there before placing anything.
+6. **`/tmp` tmpfs**: the leg honours `E2E_TMP` (the launcher wrapper exports
+   `~/.cache/horizon-e2e/scratch`), so no scratch tree goes near the 7.5 GB tmpfs.
+
+### Upstream defects fixed (slice 3)
+
+None adopted. Two *documented simplifications*:
+
+- **The model's `upper`/`lower` states are not declared.** Upstream's `PowerCellBlock` declares two
+  boolean states for its connected-cell models, but its own `blockstates/cell1.json` carries only a
+  single `""` variant — a state/model mismatch that would render an invisible block in vanilla. This
+  slice draws one cell (a plain cube) and declares no extra states, so the block always renders.
+- **No GUI.** Upstream opens a powercell screen; this slice's right click reads the status line, and
+  the face modes are set by `/rftoolspower side` (the wrench stand-in).
+
+Also recorded: the network is rebuilt from the loaded cells on every read rather than cached as
+upstream's `PowerCellNetwork` object. A cell in an unloaded chunk is therefore not counted until its
+chunk loads; nothing is lost (each cell saves its own store), but a network straddling an unloaded
+chunk reads a smaller total for that moment.
+
 ## Engines traps this slice cost (measured, not read)
 
 1. **Creative keeps the container stack.** `ItemPlace::PlayerHand.extract` follows vanilla's
@@ -319,11 +505,12 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
    payload is the saved compound (the store); the engine keeps container items apart from it, and
    upstream copies them through its own `item_inventory` component. A user notices: a broken
    fuelled generator keeps its FE but not its coal.
-9. **The powercell (`cell1/2/3`)** — the mod's storage and its multiblock network — is
-   `blocked(smartwrench-not-carried)`: `PowerCellBlock.wrenchUse` toggles a side's NONE/INPUT/OUTPUT
-   mode, and a fresh cell's six faces are all `NONE`, so a cell cannot be filled without
-   `rftoolsbase:smartwrench`, which the parent port does not carry (`ports/rftoolsbase/notes.md`
-   gap 12).
+9. ~~**The powercell (`cell1/2/3`)**~~ — **ported in slice 3 for `cell1` and `cell2`** (the block,
+   the buffer, the six face modes, the adjacency network and the output push; the wrench's mode
+   toggle is the `/rftoolspower side` command, which needs no carrier). Still open: **`cell3`**
+   (20,000,000 FE, 4,000 FE a side — the same code with a third content block and recipe), the
+   **smart-wrench item** itself (`rftoolsbase:smartwrench`, `ports/rftoolsbase` gap 12), the
+   **powercell GUI** and the **powercell card**'s dimensional-cell linking.
 10. **The rest of the mod:** the **power level** display (`PowerLevelTileEntity`, the monitor's
     sibling — same tick, but a 0..9 ratio written straight to the redstone output and no level
     state), the dimensional cell (with its card-linked networks), the endergenic generator with the
@@ -365,27 +552,50 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
 | the GUI, its two sliders and the redstone input mode | not ported (gap 4; `/rftoolspower band` is the harness stand-in) |
 | TOP/Jade and the comparator output | not ported (gap 6) |
 
+## Coverage of the powercell family (slice 3)
+
+| family | state |
+|---|---|
+| `cell1`/`cell2`: block, item, plain-cube model, animated texture, tags, creative tab, lang | tested (U: placed, read the six faces and the store back; Y: a cell2 placed) |
+| the 500,000 / 4,000,000 FE buffer, per tier, through the network | tested (U, X, Y; unit tests pin all three tiers) |
+| the six face modes, all `NONE` on a fresh cell | tested (U: `sides=none,×6`; V: a `NONE` face refuses 100,000 FE over 40 ticks) |
+| INPUT: exactly 250 a tick for a lone tier-1 cell, 312 for a pair | tested (W: `ΔE == 250 × Δt` on both stores; unit tests pin 250 and 312) |
+| OUTPUT: 250 a tick out of one face, from the network's store | tested (Z: `−7,250` over 29 ticks; at rest the two stores still add to 100,000) |
+| the adjacency network: shared store and capacity, adjacent cells only | tested (X: 3,000/1,000,000 in both, a gap is alone; Y: cell1+cell2 = 5,000/4,500,000) |
+| a mixed-tier network (the artefact's behaviour, not the brief's) | tested (Y; the correction is documented above) |
+| the network's 729-cell limit | not in game (a 729-cell build is not worth the leg); unit test `a_network_past_upstreams_limit_takes_nothing` |
+| the store on the broken cell's item, and the per-tier clamp | tested (AB: 3,000 carried and restored; the clamp is a unit test) |
+| persistence of the store and the face modes | tested (AA) |
+| the `side` command and its refusals | tested (W, Y, Z, AA, AD) |
+| the `cell` readout | tested (U–AB, every line parsed by `tools/parse_cell.py`) |
+| `cell1`'s recipe | `blocked(rftoolsbase:machine_frame-absent)` (AC proves the pattern crafts nothing) |
+| the power core's recipe | tested (AC: crafts once, consumes its diamond, redstone block and three redstones) |
+| `cell2`'s recipe | not ported: McJtyLib's `copy_components` wrapper needs `power_core2`, whose recipe needs `rftoolsbase:dimensional_shard` (the parent) — it could never craft here, so it is not carried |
+| the smart wrench, the GUI, the powercell card, `cell3` | not ported (gap 9) |
+| the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
+
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
 
 ## Verification (this run)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **33 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **50 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.1 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 100,317 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.2 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
 | `verify-sdk-package.py rftoolspower` | **1/1** |
 | the leg | `PASS` + `EXIT:0`; selftest `EXIT:1`; control `EXIT:1`; `--strict` 4/4 |
 
-## Artifact (0.1.1)
+## Artifact (0.1.2)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 73,339 B | `6df52b7421749bc7fea622dd3359e84ce3ff847ea2454d2ce9ef3ef79c2d15f5` | 45 |
+| `rftoolspower.hmod` (port root) | 100,317 B | `989543d73da03afec9117d28ef3c4bf9175d55c03e2e5ce387461815622f6ebb` | 69 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1, `src/runtime.rs` byte-identical in
-the archive.
+the archive. The 0.1.1 artifact (73,339 B, `6df52b74…`, 45 entries) is the slice-2 record; its
+gates are kept as `sdk-*-0.1.1.log` beside this run's.

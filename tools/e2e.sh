@@ -46,10 +46,24 @@
 #     receiver ends full and the generator empty, and the monitor facing the receiver reads 5
 #  S  a monitor item's `block_entity_data` band is restored when it is placed
 #  T  the monitor's carried recipe needs `rftoolsbase:machine_base`; without it, nothing crafts
+#  U  a fresh cell1 is empty, one cell in its network, and its six faces are NONE
+#  V  that fresh cell refuses the generator's push (the differential for W)
+#  W  with its west face INPUT it takes exactly 250 FE a tick (tier1MaxRFPerTick) and the
+#     generator's store falls by the same amount
+#  X  a second cell1 beside it shares one network (stored and capacity), while a cell with a gap
+#     does not
+#  Y  a cell2 beside a cell1 joins the same network (upstream gates the network on adjacency, not
+#     on tier) and a cell2 with a gap does not
+#  Z  an OUTPUT face pushes the network's 250 a tick into a neighbour (the harness receiver)
+#  AA the cell's store and its face modes survive save + relaunch
+#  AB a broken cell carries its own store on its item and placing it gives it back
+#  AC the power core crafts and is consumed; cell1's recipe crafts nothing without the parent's
+#     machine frame
+#  AD the `side` command's refusals are parsed replies, not the command's (always 0) status
 #
-# SELFTEST=1 inverts phase O (the empty generator must read the charged level 3) and exits
-# non-zero, proving the monitor's level assertion can fail; SELFTEST_GENERATOR=1 keeps slice 1's
-# inversion of C (the generator must make no FE while burning).
+# SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
+# non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
+# of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C.
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -63,6 +77,7 @@ RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}
 TMP=${E2E_TMP:-/tmp/opencode}
 SOCK=${SOCK:-$TMP/rftoolspower-e2e.sock}
 SELFTEST=${SELFTEST:-0}
+SELFTEST_MONITOR=${SELFTEST_MONITOR:-0}
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
 WORLD=RFToolsPowerE2E
@@ -74,6 +89,9 @@ TICKS_PER_COAL=600
 TICKS_PER_COAL_BLOCK=5400
 BLOCK=rftoolspower:coalgenerator
 MONITOR=rftoolspower:power_monitor
+CELL=rftoolspower:cell1
+CELL2=rftoolspower:cell2
+CORE=rftoolspower:power_core1
 RECEIVER=rfpowerharness:receiver
 COAL=minecraft:coal
 CHARCOAL=minecraft:charcoal
@@ -145,8 +163,16 @@ arena() {
         fi
     done
     [ "$loaded" = true ] || fail "the End arena chunk never loaded"
-    ctl command "execute in minecraft:the_end run fill $((X0 - 4)) 100 -24 $((X0 + 6)) 100 48 minecraft:stone" >/dev/null
-    ctl wait 6 >/dev/null
+    # The fill spans several chunks and `loaded` above only checks one of them, so a first fill
+    # can answer "That position is not loaded"; retry the floor until it is really there.
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        ctl command "execute in minecraft:the_end run fill $((X0 - 4)) 100 -24 $((X0 + 6)) 100 48 minecraft:stone" >/dev/null
+        ctl wait 6 >/dev/null
+        [ "$(block_name "$X0" 100 0)" = "minecraft:stone" ] && break
+        echo "  the arena floor fill did not land (attempt $attempt); waiting for the chunks" >&2
+        ctl wait 40 >/dev/null
+    done
     ctl command "execute in minecraft:the_end run fill $((X0 - 4)) 101 -24 $((X0 + 6)) 108 48 minecraft:air" >/dev/null
     ctl wait 6 >/dev/null
     ctl command "execute in minecraft:the_end run kill @e[type=!player]" >/dev/null
@@ -642,7 +668,7 @@ expect_level 1
 expect_alarm 0
 expect_block_level "$((SX + 1))" 101 24 1
 expect_lamp "$((SX + 2))" 101 24 false
-if [ "$SELFTEST" = 1 ]; then
+if [ "$SELFTEST_MONITOR" = 1 ]; then
     echo "(selftest: asserting the empty generator reads the charged level)"
     [ "$LEVEL" = 3 ] || fail "selftest: the empty generator reads level $LEVEL, not the charged 3, so the assertion is alive"
 fi
@@ -690,24 +716,29 @@ ctl wait 8 >/dev/null
 place_kept "$((SX - 1))" 101 36
 info "$((SX - 1))" 101 36
 expect_energy 100000
+# An air step first: a re-run leaves the previous run's receiver standing with its store, and a
+# `setblock` of the same block keeps the block entity's data (the receiver must start empty).
+ctl command "execute in minecraft:the_end run setblock $SX 101 36 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
 ctl command "execute in minecraft:the_end run setblock $SX 101 36 $RECEIVER" >/dev/null
 ctl wait 4 >/dev/null
 [ "$(block_name "$SX" 101 36)" = "$RECEIVER" ] || fail "the harness receiver did not place at $SX,101,36"
-place_monitor "$((SX + 1))" 101 36
-aim_monitor "$((SX + 1))" 101 36 east
+# Sample at once: 100,000 at 2,000 a tick fills a 100,000 receiver in fifty ticks, so a later
+# sample would catch the transfer already finished (and a full receiver accepts nothing).
 G0=$(energy_of "$((SX - 1))" 101 36); R0=$(energy_of "$SX" 101 36)
 echo "  before: generator $G0 FE, receiver $R0 FE"
+[ "$R0" -lt 100000 ] || fail "the receiver was already full ($R0 FE) before the window: the sample is too late"
 ctl wait 100 >/dev/null
 G1=$(energy_of "$((SX - 1))" 101 36); R1=$(energy_of "$SX" 101 36)
 echo "  after 100 ticks: generator $G1 FE, receiver $R1 FE"
 [ "$R1" -gt "$R0" ] || fail "the generator never pushed: the receiver still holds $R1 FE"
 [ "$G1" = 0 ] || fail "the generator still holds $G1 FE after pushing into a receiver with room"
 [ "$R1" = 100000 ] || fail "the receiver holds $R1 FE, expected its full 100,000"
-[ "$G0" -lt 100000 ] || fail "the generator still holds all 100,000 FE: it is not pushing"
 [ $(((R1 - R0) % 2000)) = 0 ] \
     || fail "the receiver gained $((R1 - R0)) FE, not a multiple of the 2,000 a tick a push moves"
 echo "  the generator's 100,000 FE moved into the receiver in 2,000-FE pushes (it ends full, the generator empty)"
-ctl command "execute in minecraft:the_end run setblock $((SX - 1)) 101 36 minecraft:air" >/dev/null
+place_monitor "$((SX + 1))" 101 36
+aim_monitor "$((SX + 1))" 101 36 east
 ctl wait 30 >/dev/null
 monitor "$((SX + 1))" 101 36
 expect_target "$RECEIVER"
@@ -757,4 +788,366 @@ ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  the machine base is what the monitor's recipe needs and RFToolsBase is not in this build"
 
-echo "PASS: a placed generator is empty and dark; one coal in its slot starts a 600-tick burn, spends it from the hand and lights the block; FE rises by exactly 60 a tick while it burns; the burn ends, the block goes dark and FE stops (no fuel, no FE); a stone is refused; charcoal is fuel and a coal block burns 5,400 ticks; the buffer clamps at 500,000 FE while the generator keeps burning; a hopper over it feeds the slot; the store survives save and relaunch; a broken generator's item carries its store and placing it restores it, while an item doctored to 999,999 FE is clamped to 500,000; an unknown id is refused; the generator's recipe's machine-frame cell crafts nothing without RFToolsBase; a monitor facing a 250,000 FE generator reads level 3 with its unset band silent, an empty generator reads level 1, stone reads level 0 as not an energy block, a 40..60 band lights the lamp at 50 % and 90..100 puts it out, the generator pushes 100,000 FE into an adjacent receiver (2,000 a tick) whose monitor then reads level 5, a monitor item keeps its band, and the monitor's own recipe crafts nothing without the parent's machine base"
+
+# --- the powercell -------------------------------------------------------
+# Everything above has used rows z=0..42. The cells get their own floor and rows (44..90).
+# The cell rows reach z=90, further than the slice-1/2 arena, so stand in them first: a fill that
+# spans unloaded chunks answers "That position is not loaded" and lands nothing.
+ctl command "execute in minecraft:the_end run tp @s $((SX)).5 101 68.5" >/dev/null
+ctl wait 40 >/dev/null
+for attempt in 1 2 3; do
+    ctl command "execute in minecraft:the_end run fill $((SX - 4)) 100 44 $((SX + 6)) 100 90 minecraft:stone" >/dev/null
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$SX" 100 68)" = "minecraft:stone" ] && break
+    echo "  the cell arena floor fill did not land (attempt $attempt); waiting for the chunks" >&2
+    ctl wait 40 >/dev/null
+done
+[ "$(block_name "$SX" 100 68)" = "minecraft:stone" ] || fail "the cell arena floor is not stone"
+ctl command "execute in minecraft:the_end run fill $((SX - 4)) 101 44 $((SX + 6)) 108 90 minecraft:air" >/dev/null
+ctl wait 8 >/dev/null
+[ "$(block_name "$SX" 101 68)" = "minecraft:air" ] || fail "the cell arena air fill did not land"
+ctl command "gamemode creative" >/dev/null
+
+# A cell item, optionally doctored to carry ENERGY (`minecraft:block_entity_data`, the same
+# carrier the generator uses; `TypedEntityData.loadInto` needs the id to match the type).
+give_cell() { # give_cell ITEM [ENERGY]
+    local item=$1 energy=${2:-} type
+    ctl command "clear @s" >/dev/null
+    if [ -n "$energy" ]; then
+        type=rftoolspower:cell1_block_entity
+        [ "$item" = "$CELL2" ] && type=rftoolspower:cell2_block_entity
+        ctl command "give @s $item[minecraft:block_entity_data={id:\"$type\",energy:$energy}]" >/dev/null
+    else
+        ctl command "give @s $item" >/dev/null
+    fi
+    ctl wait 8 >/dev/null
+}
+
+place_held() { # place_held X Y Z ITEM — place the item the player already carries
+    local x=$1 y=$2 z=$3 item=$4
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select "$item" >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at-block "$x" $((y - 1)) "$z" up >/dev/null \
+        || fail "cannot aim at the floor under $x,$y,$z"
+    place_block "$x" "$y" "$z" "$item" \
+        || fail "ctl place $item at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$item" ] || fail "$item did not place at $x,$y,$z"
+}
+
+pick_up_item() { # pick_up_item X Y Z ITEM
+    ctl collect 8 >/dev/null 2>&1 || true
+    ctl wait 10 >/dev/null
+    if [ "$(held_count "$4")" = 0 ]; then
+        ctl command "execute in minecraft:the_end run tp @s $1.5 $2 $3.5" >/dev/null
+        ctl wait 20 >/dev/null
+    fi
+    [ "$(held_count "$4")" != 0 ] \
+        || fail "the broken $4 was not picked up: $(ctl inventory | jq -c '{hotbar,main}')"
+}
+
+held_item_line_for() { # held_item_line_for ITEM
+    ctl select "$1" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "data get entity @s SelectedItem" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl messages 8 | jq -r '.chat[]' | grep -m1 'has the following entity data' || true
+}
+
+cell_state() { # cell_state X Y Z — the `/rftoolspower cell` line, parsed
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower cell $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower cell reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_cell.py" "$line" --nonce "$NONCE")"
+    [ "${ok:-0}" = 1 ] || fail "the cell line did not parse: $line"
+    echo "  $line" >&2
+}
+
+side_set() { # side_set X Y Z FACE MODE
+    local line
+    say "rftoolspower side $1 $2 $3 $4 $5"
+    line=$(await_line "Power Cell side at $1,$2,$3: $4 $5")
+    [ -n "$line" ] || fail "no 'Power Cell side' reply for $4 $5: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_side.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the side reply did not parse: $line"
+    [ "$REFUSAL" = none ] && [ "$FACE" = "$4" ] && [ "$MODE" = "$5" ] \
+        || fail "the side command answered $REFUSAL/$FACE/$MODE for $4 $5: $line"
+    echo "  $line" >&2
+}
+
+side_refused() { # side_refused X Y Z FACE MODE KIND WORD
+    local line
+    say "rftoolspower side $1 $2 $3 $4 $5"
+    line=$(await_line "unknown $6 '$7'")
+    [ -n "$line" ] || fail "no 'unknown $6' refusal for $4 $5: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_side.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the refusal did not parse: $line"
+    [ "$REFUSAL" = "$6" ] && [ "$WORD" = "$7" ] \
+        || fail "expected a $6 refusal naming '$7', got $REFUSAL/${WORD:-none}: $line"
+    echo "  $line" >&2
+}
+
+expect_tier() { [ "$TIER" = "$1" ] || fail "the cell is tier $TIER, expected $1"; }
+expect_cells() { [ "$CELLS" = "$1" ] || fail "the network holds $CELLS cells, expected $1"; }
+expect_local() { [ "$LOCAL" = "$1" ] || fail "the cell holds $LOCAL FE locally, expected $1"; }
+expect_network() {
+    [ "$NETWORK" = "$1" ] && [ "$NCAP" = "$2" ] \
+        || fail "the network reads $NETWORK/$NCAP FE, expected $1/$2"
+}
+expect_sides() { [ "$SIDES" = "$1" ] || fail "the cell's faces are $SIDES, expected $1"; }
+
+echo "== U: a fresh cell1 is empty, alone in its network, and all six faces are NONE =="
+give_cell "$CELL" 0
+place_held "$SX" 101 48 "$CELL"
+cell_state "$SX" 101 48
+expect_tier 1
+expect_cells 1
+expect_local 0
+expect_network 0 500000
+expect_sides "none,none,none,none,none,none"
+[ "$(energy_of "$SX" 101 48)" = 0 ] || fail "a fresh cell's saved energy is not 0"
+echo "  a fresh cell1: local 0/500000, one cell in the network, six NONE faces"
+
+echo "== V: a fresh cell refuses the push (its west face is NONE) =="
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",burn:0,burn_max:0,energy:100000}]" >/dev/null
+ctl wait 8 >/dev/null
+place_held "$((SX - 1))" 101 48 "$BLOCK"
+info "$((SX - 1))" 101 48
+expect_energy 100000
+ctl wait 40 >/dev/null
+cell_state "$SX" 101 48
+expect_local 0
+info "$((SX - 1))" 101 48
+expect_energy 100000
+if [ "$SELFTEST" = 1 ]; then
+    echo "(selftest: asserting the NONE face took the generator's FE)"
+    [ "$LOCAL" != 0 ] || fail "selftest: the cell's NONE face took nothing in 40 ticks, so the assertion is alive"
+fi
+echo "  40 ticks against a 100,000 FE generator: the cell still holds 0 and the generator 100,000"
+
+echo "== W: with its west face INPUT the cell takes exactly 250 FE a tick =="
+side_set "$SX" 101 48 west input
+expect_sides "none,none,none,none,input,none"
+cell_state "$SX" 101 48
+T0=$T; E0=$LOCAL
+info "$((SX - 1))" 101 48
+GT0=$T; GE0=$ENERGY
+ctl wait 20 >/dev/null
+cell_state "$SX" 101 48
+DT=$((T - T0))
+DE=$((LOCAL - E0))
+echo "  over $DT ticks: cell $E0 -> $LOCAL FE (+$DE)"
+[ "$DT" -ge 10 ] || fail "only $DT ticks passed; the window is too small to assert"
+[ "$DE" = $((250 * DT)) ] \
+    || fail "the cell took $DE FE over $DT ticks, expected exactly $((250 * DT)): tier1MaxRFPerTick is 250 a side a tick, not the generator's 2,000"
+info "$((SX - 1))" 101 48
+GDT=$((T - GT0)); GDROP=$((GE0 - ENERGY))
+echo "  over $GDT ticks: generator $GE0 -> $ENERGY FE (-$GDROP)"
+[ "$GDT" -ge 10 ] || fail "only $GDT generator ticks passed; the window is too small to assert"
+[ "$GDROP" = $((250 * GDT)) ] \
+    || fail "the generator lost $GDROP FE over $GDT ticks, expected $((250 * GDT)): it keeps the 1,750 a tick the cell refuses"
+echo "  the tier-1 cap is upstream's: 250 a tick reaches the cell, the rest stays in the generator"
+ctl wait 420 >/dev/null
+cell_state "$SX" 101 48
+expect_local 100000
+info "$((SX - 1))" 101 48
+expect_energy 0
+echo "  the generator's 100,000 FE arrived: cell 100,000, generator 0"
+
+echo "== X: a second cell1 beside it shares one network; a cell with a gap does not =="
+give_cell "$CELL" 1000
+place_held "$SX" 101 54 "$CELL"
+give_cell "$CELL" 2000
+place_held "$SX" 101 55 "$CELL"
+cell_state "$SX" 101 54
+expect_cells 2
+expect_local 1000
+expect_network 3000 1000000
+cell_state "$SX" 101 55
+expect_cells 2
+expect_local 2000
+expect_network 3000 1000000
+give_cell "$CELL" 4000
+place_held "$SX" 101 57 "$CELL"
+cell_state "$SX" 101 57
+expect_cells 1
+expect_local 4000
+expect_network 4000 500000
+echo "  adjacent (54/55): both read the 3,000/1,000,000 network; with a gap (57): its own 4,000/500,000"
+
+echo "== Y: a cell2 beside a cell1 joins the same network (adjacency, not tier) =="
+give_cell "$CELL" 5000
+place_held "$SX" 101 60 "$CELL"
+give_cell "$CELL2"
+place_held "$SX" 101 61 "$CELL2"
+cell_state "$SX" 101 60
+expect_cells 2
+expect_local 5000
+expect_network 5000 4500000
+cell_state "$SX" 101 61
+expect_cells 2
+expect_local 0
+expect_network 5000 4500000
+give_cell "$CELL2"
+place_held "$SX" 101 63 "$CELL2"
+cell_state "$SX" 101 63
+expect_cells 1
+expect_local 0
+expect_network 0 4000000
+echo "  cell1+cell2 share 5,000/4,500,000; the cell2 with a gap is its own 4,000,000"
+
+echo "== Z: an OUTPUT face pushes the network's FE into a neighbour =="
+give_cell "$CELL" 100000
+place_held "$SX" 101 68 "$CELL"
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 68 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 68 $RECEIVER" >/dev/null
+ctl wait 4 >/dev/null
+[ "$(block_name "$((SX + 1))" 101 68)" = "$RECEIVER" ] || fail "the harness receiver did not place at $((SX + 1)),101,68"
+side_set "$SX" 101 68 east output
+expect_sides "none,none,none,none,none,output"
+cell_state "$SX" 101 68
+T0=$T; E0=$LOCAL
+ctl wait 20 >/dev/null
+cell_state "$SX" 101 68
+DT=$((T - T0))
+DE=$((E0 - LOCAL))
+echo "  over $DT ticks: cell $E0 -> $LOCAL FE (-$DE)"
+[ "$DT" -ge 10 ] || fail "only $DT ticks passed; the window is too small to assert"
+[ "$DE" = $((250 * DT)) ] \
+    || fail "the cell gave out $DE FE over $DT ticks, expected exactly $((250 * DT)) (tier1MaxRFPerTick)"
+# Stop the push before reading the receiver: two stores that are still moving are read a few
+# ticks apart, so a conservation check across them needs both at rest.
+side_set "$SX" 101 68 east none
+cell_state "$SX" 101 68
+STILL=$LOCAL
+R1=$(energy_of "$((SX + 1))" 101 68)
+[ "$R1" -gt 0 ] || fail "the OUTPUT face never reached the receiver: it still holds $R1 FE"
+[ $((STILL + R1)) = 100000 ] \
+    || fail "at rest the cell ($STILL) and the receiver ($R1) hold $((STILL + R1)) FE between them, not the 100,000 that was seeded"
+echo "  the cell pushed 250 FE a tick out of its OUTPUT face; at rest the two stores still add to 100,000"
+
+echo "== AA: a cell keeps its store and its face modes across save + relaunch =="
+give_cell "$CELL" 7000
+place_held "$SX" 101 74 "$CELL"
+side_set "$SX" 101 74 west input
+cell_state "$SX" 101 74
+SAVED=$LOCAL
+ctl save >/dev/null
+ctl wait 10 >/dev/null
+ctl quit >/dev/null 2>&1 || true
+sleep 2
+launch
+ctl command "execute in minecraft:the_end run tp @s $((SX - 2)).5 101 74.5" >/dev/null
+ctl wait 40 >/dev/null
+[ "$(block_name "$SX" 101 74)" = "$CELL" ] || fail "the cell did not survive the relaunch"
+cell_state "$SX" 101 74
+[ "$LOCAL" -ge "$SAVED" ] || fail "after the relaunch the cell holds $LOCAL FE, was $SAVED before the save"
+expect_sides "none,none,none,none,input,none"
+echo "  after save + relaunch: $LOCAL/$LCAP FE, west face still input"
+
+echo "== AB: a broken cell carries its own store =="
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 6 >/dev/null
+give_cell "$CELL" 3000
+place_held "$SX" 101 78 "$CELL"
+cell_state "$SX" 101 78
+expect_local 3000
+break_block "$SX" 101 78 minecraft:iron_pickaxe
+pick_up_item "$SX" 101 78 "$CELL"
+DROP_LINE=$(held_item_line_for "$CELL")
+[ -n "$DROP_LINE" ] || fail "no /data get reply for the picked-up cell: $(ctl messages 8 | jq -c '.chat')"
+echo "  $DROP_LINE" >&2
+DROP=$(python3 "$PORT/tools/parse_drop.py" "$DROP_LINE" 3000 rftoolspower:cell1_block_entity) || true
+eval "$DROP"
+[ "${ok:-0}" = 1 ] || fail "the dropped cell does not carry 3,000 FE: $DROP_LINE"
+echo "  the item carries $carried FE"
+place_held "$SX" 101 78 "$CELL"
+cell_state "$SX" 101 78
+[ "$LOCAL" -ge 3000 ] || fail "the placed-back cell holds $LOCAL FE, expected at least 3,000"
+echo "  placed back at $LOCAL FE"
+
+echo "== AC: the power core crafts, and the cell's recipe needs the parent's machine frame =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+for item in minecraft:diamond minecraft:redstone minecraft:redstone_block; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 8 >/dev/null
+TX=$((SX + 4)); TY=101; TZ=78
+ctl setblock "$TX" "$TY" "$TZ" minecraft:air >/dev/null
+ctl setblock "$TX" "$TY" "$TZ" minecraft:crafting_table >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $((TX - 1)).5 $TY $((TZ)).5" >/dev/null
+ctl wait 4 >/dev/null
+ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the click"
+ctl wait 6 >/dev/null
+GRID=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
+[ "$GRID" = 10 ] || fail "the crafting table did not open its grid ($GRID grid slots)"
+D0=$(held_count minecraft:diamond); R0=$(held_count minecraft:redstone); B0=$(held_count minecraft:redstone_block)
+# " d " / "rRr" / " r ": a diamond over a redstone block, redstone around it.
+place_one minecraft:diamond 101
+place_one minecraft:redstone 103
+place_one minecraft:redstone_block 104
+place_one minecraft:redstone 105
+place_one minecraft:redstone 107
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the power core's recipe: '$RESULT'" >&2
+[ "$RESULT" = "$CORE" ] || fail "the power core's recipe made '$RESULT'"
+# The output slot puts the craft on the cursor; a second click stores it in the hotbar.
+ctl click-slot 200 >/dev/null
+ctl wait 3 >/dev/null
+ctl click-slot 8 >/dev/null
+ctl wait 6 >/dev/null
+[ "$(held_count "$CORE")" = 1 ] || fail "the crafted core is not in the inventory: $(ctl screen | jq -c '[.slots[]? | select(.item != null) | {slot, item, count}]')"
+LEFT=$(ctl screen | jq '[.slots[]? | select(.slot >= 100 and .slot <= 108 and .item != null)] | length')
+[ "$LEFT" = 0 ] || fail "the crafting grid still holds $LEFT ingredients after the craft"
+D1=$(held_count minecraft:diamond); R1=$(held_count minecraft:redstone); B1=$(held_count minecraft:redstone_block)
+[ $((D0 - D1)) = 1 ] || fail "the core's diamond was not consumed ($D0 -> $D1)"
+[ $((R0 - R1)) = 3 ] || fail "the core's three redstones were not consumed ($R0 -> $R1)"
+[ $((B0 - B1)) = 1 ] || fail "the core's redstone block was not consumed ($B0 -> $B1)"
+echo "  the core crafted once and its diamond, redstone block and three redstones were consumed"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+ctl command "clear @s" >/dev/null
+for item in minecraft:redstone minecraft:stone "$CORE"; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 8 >/dev/null
+ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the second click"
+ctl wait 6 >/dev/null
+# "rKr" / "KFK" / "rKr" with a stone where `rftoolsbase:machine_frame` belongs.
+place_one minecraft:redstone 100
+place_one "$CORE" 101
+place_one minecraft:redstone 102
+place_one "$CORE" 103
+place_one minecraft:stone 104
+place_one "$CORE" 105
+place_one minecraft:redstone 106
+place_one "$CORE" 107
+place_one minecraft:redstone 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  cell1's recipe with a stone where rftoolsbase:machine_frame belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "a stone in the machine frame's cell crafted $RESULT"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  the machine frame is what cell1's recipe needs and RFToolsBase is not in this build"
+
+echo "== AD: the side command's refusals are parsed replies, not the exit status =="
+side_refused "$SX" 101 48 nowhere input face nowhere
+side_refused "$SX" 101 48 west inputt mode inputt
+say "rftoolspower side $SX 101 30 west input"
+LINE=$(await_line "power cell there")
+[ -n "$LINE" ] || fail "no refusal for a position with no cell: $(ctl messages 8 | jq -c '.chat')"
+eval "$(python3 "$PORT/tools/parse_side.py" "$LINE")"
+[ "${ok:-0}" = 1 ] || fail "the no-cell refusal did not parse: $LINE"
+[ "$REFUSAL" = target ] || fail "a stone position answered '$REFUSAL', expected a no-cell refusal: $LINE"
+echo "  $LINE"
+echo "  a bad face, a bad mode and a position with no cell are three parsed refusals"
+
+echo "PASS: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

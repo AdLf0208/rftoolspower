@@ -1,6 +1,9 @@
 {
+  "block.rftoolspower.cell1": "Powercell (Low)",
+  "block.rftoolspower.cell2": "Powercell (Medium)",
   "block.rftoolspower.coalgenerator": "Coal Generator",
   "block.rftoolspower.power_monitor": "Power Monitor",
+  "item.rftoolspower.power_core1": "Power Core (Low)",
   "itemGroup.rftoolspower": "RFTools Power",
   "message.rftoolspower.shiftmessage": "<Press Shift>"
 }

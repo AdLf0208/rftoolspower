@@ -1,4 +1,4 @@
-# RFTools Power — upstream behaviour extracted (slice 1)
+# RFTools Power — upstream behaviour extracted (slices 1–3)
 
 Analysis only. Repository `https://github.com/McJtyMods/RFToolsPower`, branch `1.21_neo`, commit
 **`e44463cacddb85155839373b42d39bc705d618c0`** (2026-06-16, `version=1.21-7.0.6`) — the exact
@@ -56,3 +56,29 @@ From `unzip -l` of the jar plus the module classes: coal generator; powercell `c
 side-mode network and the powercell card; power monitor and power level; dimensional cell
 (simple/normal/advanced/creative) with card-linked networks; endergenic generator, pearl injector and
 ender monitor; blazing generator, agitator and infuser with blazing rods.
+
+## Slice 3: the powercell (read for the same commits)
+
+Files read (`1.21_neo`, `e44463c`):
+
+| File | What it gave |
+|---|---|
+| `modules/powercell/blocks/PowerCellTileEntity.java` | the tier's capacity/per-side numbers, the six `modes` (fresh all `NONE`), `toggleMode`'s NONE→INPUT→OUTPUT cycle, `saveClientDataToNBT`'s six-digit `mode` string, `receiveEnergyFacing`'s mode test and `Math.min(maxReceive, getRfPerTickReal())` cap, `receiveEnergyLocal`, `sendOutEnergy`/`extractEnergyFromNetwork` (local first, skip other powercells), `SidedHandler` (extract 0), `NullHandler` (no side, takes nothing), the network walk `buildNetwork`, `redistributeNetwork` (per tier *within* one network) and `isValid`'s `networkMax` |
+| `modules/powercell/blocks/PowerCellBlock.java` | `wrenchUse → toggleMode(side)`; `getStateForPlacement`/`updateShape`'s `UPPER`/`LOWER` (model connection); `getComponentsToPreserve` = `ITEM_ENERGY`; `setPlacedBy` restores the item's energy and forces a network rebuild |
+| `modules/powercell/PowerCellConfig.java` | 500,000 / 4,000,000 / 20,000,000 FE; 250 / 1,000 / 4,000 a side a tick; `rfPerTickScale` 0.25; `networkMax` 729 |
+| `modules/powercell/data/{Tier,SideType,PowerCellNetwork}.java` | the tier order and block ids; `SideType` ordinals (NONE 0, OUTPUT 1, INPUT 2); the network's cached energy/capacity and its positions set |
+| `modules/powercell/PowerCellModule.java` | cell1/2/3 registration; the cell1 recipe (`"rKr"/"KFK"/"rKr"` with a machine frame and `power_core1`); cell2/3's `copy_components` recipes; the three power-core recipes; `ironPickaxeTags()` |
+
+**The load-bearing finding, against the brief:** the network is **not** same-tier.
+`buildNetwork` recurses into every adjacent `PowerCellTileEntity` with no tier test, and
+`redistributeNetwork` iterates all three tiers inside one network — so a cell1 and a cell2 side by
+side share one store and one summed capacity (4,500,000), and only the *rates* are per cell. The
+port implements the artefact; the leg proves adjacency, not tier, decides membership.
+
+The other finding: **the per-side cap is the receive limit**. A 2,000-a-tick neighbour fills a lone
+tier-1 cell at 250 a tick, not 2,000; a tier-2 cell at 1,000. The port's leg asserts exactly
+`ΔE == 250 × Δt` and the matching loss on the generator.
+
+Recorded simplification: upstream's `PowerCellBlock` declares `upper`/`lower` states for connected
+models, but its own `blockstates/cell1.json` has only the `""` variant (a state/model mismatch); the
+port draws one plain cube and declares no extra states.

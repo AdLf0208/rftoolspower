@@ -5,21 +5,25 @@
 //! back. Its tests pin what it *declares* (one insert-only fuel slot, a store that gives out 2,000
 //! FE a tick and takes nothing in), that the state written to the saved compound reads back, and the
 //! exact line `/rftoolspower info` prints.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
 use mod_api::{
     self, BlockClick, BlockDropsEvent, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
-    BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, BlockSignalEvent, BlockState, Command,
-    CommandArgumentValue, Compound, Direction, ENERGY, Flow, Host, HostTransaction,
-    InteractionResult, IsSignalSourceEvent, ItemPart, ItemPlace, ItemResource, ItemStack,
-    LevelHost, LevelRef, LevelSide, ModContainer, ModEnergyBuffer, NeighbourUpdate,
-    OnBlockPlacedByEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
-    StateForPlacementEvent, Tag, Text, UseItemOnEvent, UseWithoutItemEvent,
+    BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, BlockSide, BlockSignalEvent,
+    BlockState, Command, CommandArgumentValue, Compound, Direction, ENERGY, EnergyHandler, Flow,
+    Host, HostTransaction, InteractionResult, IsSignalSourceEvent, ItemPart, ItemPlace,
+    ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, ModContainer, ModEnergyBuffer,
+    NeighbourUpdate, OnBlockPlacedByEvent, Registrar, RegistrationContext, RunModCommandEvent,
+    ServerHost, StateForPlacementEvent, Tag, Text, Transaction, UseItemOnEvent,
+    UseWithoutItemEvent,
 };
 
 use crate::runtime::{
-    CAPACITY, EXTRACT_PER_TICK, Fuel, Generator, Monitor, OBSERVE_TICKS, restored, send_amount,
+    CAPACITY, Cell, EXTRACT_PER_TICK, Fuel, Generator, Monitor, NETWORK_MAX, OBSERVE_TICKS,
+    SideMode, Sides, Tier, as_capability, capacity as network_capacity, clamped_energy,
+    network_valid, receive as network_receive, restored, rf_per_tick, send_amount,
+    stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -78,6 +82,21 @@ const NO_MONITOR: &str = "No RFTools Power power monitor there.";
 /// The strongest signal a monitor's alarm gives.
 const ALARM_SIGNAL: i32 = 15;
 
+// The powercell (`PowerCellModule.CELL1`/`CELL2`). Its block entity type is named apart from its
+// block for the reason [`GENERATOR_TYPE`] is; the type id is what a broken cell's payload names.
+/// `rftoolspower:cell1`, the tier-1 cell (500,000 FE, 250 a side a tick).
+pub(crate) const CELL1: &str = "rftoolspower:cell1";
+const CELL1_TYPE: &str = "cell1_block_entity";
+const CELL1_TYPE_ID: &str = "rftoolspower:cell1_block_entity";
+/// `rftoolspower:cell2`, the tier-2 cell (4,000,000 FE, 1,000 a side a tick).
+pub(crate) const CELL2: &str = "rftoolspower:cell2";
+const CELL2_TYPE: &str = "cell2_block_entity";
+const CELL2_TYPE_ID: &str = "rftoolspower:cell2_block_entity";
+/// The six face modes, saved as upstream's own six-digit string (`saveClientDataToNBT`).
+const KEY_MODE: &str = "mode";
+/// What a read where no cell stands answers.
+const NO_CELL: &str = "No RFTools Power power cell there.";
+
 // ---------------------------------------------------------------------------
 // What the mod declares for its block
 // ---------------------------------------------------------------------------
@@ -118,6 +137,38 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     if let Err(error) = r.block_entity_part(&kind, MonitorPart) {
         context.refuse(&format!(
             "rftoolspower: the power monitor part was refused: {error}"
+        ));
+    }
+
+    // The powercells: tier 1 and tier 2 (`cell1`/`cell2`). Each has its own block entity type and
+    // its own energy capability — the faces' modes and the shared network are not the game's
+    // plain buffer, so the handler is this port's.
+    declare_cell(r, context, CELL1_TYPE, "cell1", CELL1, Tier::One);
+    declare_cell(r, context, CELL2_TYPE, "cell2", CELL2, Tier::Two);
+}
+
+/// Declare one powercell: its block entity type, its energy capability and its Part.
+fn declare_cell(
+    r: &mut dyn Registrar,
+    context: &RegistrationContext,
+    type_name: &str,
+    block_path: &str,
+    block_id: &str,
+    tier: Tier,
+) {
+    let kind = r.block_entity_type(type_name).blocks(&[block_path]).build();
+    let block = r.block_key(block_id);
+    // `PowerCellTileEntity.SidedHandler`: the amount and capacity are the *network's*, and only a
+    // face whose mode is INPUT takes anything in. Asked with no side (upstream's NullHandler) it
+    // still reads, and takes nothing.
+    r.block_capability(&ENERGY, &block, |_host, at, _state, entity| {
+        entity.map(|_| Box::new(CellEnergy { at }) as Box<dyn EnergyHandler>)
+    });
+    let item = r.item_key(block_id);
+    r.item_part(item, CellItemPart);
+    if let Err(error) = r.block_entity_part(&kind, CellPart { tier }) {
+        context.refuse(&format!(
+            "rftoolspower: the {block_path} part was refused: {error}"
         ));
     }
 }
@@ -645,6 +696,562 @@ pub(crate) fn set_band(
 }
 
 // ---------------------------------------------------------------------------
+// The powercell
+// ---------------------------------------------------------------------------
+
+/// A direction's face number: vanilla's `Direction.ordinal()`, which upstream indexes its saved
+/// `modes` with.
+fn face_index(direction: Direction) -> usize {
+    match direction {
+        Direction::Down => 0,
+        Direction::Up => 1,
+        Direction::North => 2,
+        Direction::South => 3,
+        Direction::West => 4,
+        Direction::East => 5,
+    }
+}
+
+/// A saved string, `None` when absent or of another type.
+fn text(saved: &Tag, key: &str) -> Option<String> {
+    match saved.get(key) {
+        Some(Tag::String(value)) => Some(value.to_string_lossy()),
+        _ => None,
+    }
+}
+
+/// Write one string into a saved compound.
+fn set_text(saved: &mut Tag, key: &str, value: &str) {
+    if let Tag::Compound(nbt) = saved {
+        nbt.insert(key.into(), Tag::String(value.into()));
+    }
+}
+
+/// The cell a saved compound holds for `tier`, clamped to that tier's capacity.
+fn read_cell(saved: &Tag, tier: Tier) -> Cell {
+    Cell {
+        tier,
+        energy: clamped_energy(tier, int(saved, KEY_ENERGY)),
+    }
+}
+
+/// Write a cell's own store back into a saved compound.
+fn write_cell(saved: &mut Tag, cell: &Cell) {
+    set_int(saved, KEY_ENERGY, cell.energy);
+}
+
+/// The six face modes a saved compound holds (`PowerCellTileEntity.loadClientDataFromNBT`); a
+/// fresh or unreadable compound is six `NONE`s.
+fn read_sides_from(saved: &Tag) -> Sides {
+    text(saved, KEY_MODE).map_or_else(Sides::fresh, |saved| Sides::from_saved(&saved))
+}
+
+/// Write the six face modes in upstream's own six-digit form.
+fn write_sides(saved: &mut Tag, sides: Sides) {
+    set_text(saved, KEY_MODE, &sides.to_saved());
+}
+
+/// One cell of a network and where it stands.
+struct Network {
+    positions: Vec<[i32; 3]>,
+    cells: Vec<Cell>,
+}
+
+impl Network {
+    /// What the network holds.
+    fn stored(&self) -> u64 {
+        network_stored(&self.cells)
+    }
+
+    /// What the network can hold.
+    fn capacity(&self) -> u64 {
+        network_capacity(&self.cells)
+    }
+
+    /// How many cells are in it.
+    fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// How many cells are in it.
+    fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Take up to `request` in, the cell asked first (see [`crate::runtime::receive`]).
+    fn receive(&mut self, request: u32) -> u32 {
+        network_receive(&mut self.cells, request)
+    }
+
+    /// Drain up to `amount`, the cell asked first (see [`crate::runtime::take`]).
+    fn take(&mut self, amount: u32) -> u32 {
+        network_take(&mut self.cells, amount)
+    }
+
+    /// The stores the cells held before a move, to write back only what changed.
+    fn energies(&self) -> Vec<i32> {
+        self.cells.iter().map(|cell| cell.energy).collect()
+    }
+
+    /// Write every cell whose store moved back to its saved compound, except the one at `skip`
+    /// (a cell out for its own tick writes its own payload instead). True when anything was
+    /// written.
+    fn write(
+        &self,
+        host: &mut dyn ServerHost,
+        level: LevelRef,
+        skip: [i32; 3],
+        before: &[i32],
+    ) -> bool {
+        let mut changed = false;
+        for (index, cell) in self.cells.iter().enumerate() {
+            if before.get(index).copied() == Some(cell.energy) || self.positions[index] == skip {
+                continue;
+            }
+            let Some(entity) = host.block_entity(level, self.positions[index]) else {
+                continue;
+            };
+            let Some(saved) = entity.data(&*host) else {
+                continue;
+            };
+            let mut saved = Tag::Compound(saved);
+            write_cell(&mut saved, cell);
+            if let Tag::Compound(data) = saved {
+                let _ = entity.replace_data(host, data);
+            }
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// The cell at `pos`, if the block there is a powercell and its block entity reads.
+fn cell_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<Cell> {
+    let tier = Tier::of_block(block_id(&*host, level, pos)?.as_str())?;
+    let entity = host.block_entity(level, pos)?;
+    let saved = entity.data(&*host)?;
+    Some(read_cell(&Tag::Compound(saved), tier))
+}
+
+/// The network the cell at `pos` belongs to (`PowerCellTileEntity.buildNetwork`): every powercell
+/// reachable through a shared face, of **any** tier — upstream walks from one
+/// `PowerCellTileEntity` to the next and only the per-tier redistribution and the capacities
+/// differ by tier. The cell asked comes first, then its neighbours breadth-first.
+///
+/// `self_state` answers for a cell that is out for its own tick: its handle cannot be read then,
+/// so the caller hands in what it already knows and that becomes the first entry.
+fn network_of(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    self_state: Option<(Tier, i32)>,
+) -> Option<Network> {
+    let level = level?;
+    let mut positions = Vec::new();
+    let mut cells = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    match self_state {
+        Some((tier, energy)) => cells.push(Cell {
+            tier,
+            energy: clamped_energy(tier, energy),
+        }),
+        None => cells.push(cell_at(host, level, pos)?),
+    }
+    positions.push(pos);
+    seen.insert(pos);
+    queue.push_back(pos);
+    while let Some(at) = queue.pop_front() {
+        for direction in Direction::ALL {
+            let normal = direction.normal();
+            let next = [at[0] + normal[0], at[1] + normal[1], at[2] + normal[2]];
+            if !seen.insert(next) {
+                continue;
+            }
+            let Some(cell) = cell_at(host, level, next) else {
+                continue;
+            };
+            cells.push(cell);
+            positions.push(next);
+            queue.push_back(next);
+            if cells.len() > NETWORK_MAX {
+                // Upstream's `networkMax`: a bigger network is `!isValid()` and moves nothing.
+                // Stop the walk so a doctored world cannot make this unbounded.
+                return Some(Network { positions, cells });
+            }
+        }
+    }
+    Some(Network { positions, cells })
+}
+
+/// The six modes of the cell at `pos`, or a fresh cell's when there is none.
+fn read_sides(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Sides {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return Sides::fresh();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return Sides::fresh();
+    };
+    read_sides_from(&Tag::Compound(saved))
+}
+
+/// `PowerCellTileEntity.SidedHandler`: the network's store behind the cell's energy capability,
+/// taking FE in only through a face whose mode is `INPUT`, and never giving any out (the cell
+/// pushes on its own tick, exactly as upstream's `extractEnergy` answers 0).
+struct CellEnergy {
+    at: BlockSide,
+}
+
+impl CellEnergy {
+    /// The network this face belongs to, or `None` when the block is no longer a cell.
+    fn network(&self, host: &mut dyn ServerHost) -> Option<Network> {
+        network_of(host, Some(self.at.level), self.at.pos, None)
+    }
+}
+
+impl EnergyHandler for CellEnergy {
+    fn amount(&self, host: &mut dyn ServerHost) -> u32 {
+        self.network(host)
+            .map_or(0, |network| as_capability(network.stored()))
+    }
+
+    fn capacity(&self, host: &mut dyn ServerHost) -> u32 {
+        self.network(host)
+            .map_or(0, |network| as_capability(network.capacity()))
+    }
+
+    fn insert(&self, host: &mut dyn ServerHost, _tx: &Transaction, amount: u32) -> u32 {
+        if amount == 0 {
+            return 0;
+        }
+        // Upstream's `getEnergyStorage(null)` is the NullHandler: no side, nothing taken.
+        let Some(face) = self.at.side else {
+            return 0;
+        };
+        // `receiveEnergyFacing` checks the mode of the face the FE arrives through.
+        if read_sides(host, self.at.level, self.at.pos).get(face_index(face)) != SideMode::Input {
+            return 0;
+        }
+        let Some(mut network) = self.network(host) else {
+            return 0;
+        };
+        if network.is_empty() || !network_valid(network.len()) {
+            return 0;
+        }
+        let before = network.energies();
+        let received = network.receive(amount);
+        if received > 0 {
+            network.write(host, self.at.level, [i32::MIN; 3], &before);
+        }
+        received
+    }
+
+    fn extract(&self, _host: &mut dyn ServerHost, _tx: &Transaction, _amount: u32) -> u32 {
+        0
+    }
+}
+
+/// One powercell tick (`PowerCellTileEntity.tickServer` → `sendOutEnergy`): for every face whose
+/// mode is `OUTPUT`, offer up to the network's per-side budget to the block there, skipping
+/// another powercell (cells share through the network, never by pushing into each other), and
+/// drain what the neighbours accepted from the network, this cell first.
+///
+/// Returns whether the saved payload moved (the engine discards a tick's payload edits unless
+/// the tick answers `Changed`).
+pub(crate) fn tick_cell(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    tier: Tier,
+    saved: &mut Tag,
+) -> bool {
+    let sides = read_sides_from(saved);
+    if !sides.any_output() {
+        return false;
+    }
+    let Some(level) = level else {
+        return false;
+    };
+    let own = read_cell(saved, tier);
+    let Some(mut network) = network_of(host, Some(level), pos, Some((tier, own.energy))) else {
+        return false;
+    };
+    if !network_valid(network.len()) {
+        return false;
+    }
+    let before = network.energies();
+    let mut budget = network.stored();
+    let per_face = u64::from(rf_per_tick(tier, network.len()));
+    let mut moved = 0;
+    for (face, direction) in Direction::ALL.into_iter().enumerate() {
+        if sides.get(face) != SideMode::Output {
+            continue;
+        }
+        if budget == 0 {
+            break;
+        }
+        let normal = direction.normal();
+        let target = [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]];
+        // Upstream: `if (!(te instanceof PowerCellTileEntity))` — a cell is never a push target.
+        if cell_at(host, level, target).is_some() {
+            continue;
+        }
+        let offer = u32::try_from(budget.min(per_face)).unwrap_or(0);
+        if offer == 0 {
+            continue;
+        }
+        let Some(handler) = level.capability(host, &ENERGY, target, Some(direction.opposite()))
+        else {
+            continue;
+        };
+        let received = host
+            .transaction(|host, tx| -> Result<u32, ()> { Ok(handler.insert(host, tx, offer)) })
+            .unwrap_or(0);
+        let received = received.min(offer);
+        budget -= u64::from(received);
+        moved += received;
+    }
+    if moved == 0 {
+        return false;
+    }
+    network.take(moved);
+    let self_energy = network.cells[0].energy;
+    let written = network.write(host, level, pos, &before);
+    let self_changed = self_energy != own.energy;
+    if self_changed {
+        write_cell(saved, &network.cells[0]);
+    }
+    self_changed || written
+}
+
+/// A powercell's report line, as `/rftoolspower cell` and a click print it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cell_line(
+    pos: [i32; 3],
+    tier: Tier,
+    cell: &Cell,
+    stored: u64,
+    capacity: u64,
+    cells: usize,
+    sides: Sides,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Power Cell at {},{},{}: tier={} local={}/{} network={}/{} cells={} sides={} t={t}{suffix}",
+        pos[0],
+        pos[1],
+        pos[2],
+        tier.suffix(),
+        cell.energy,
+        tier.capacity(),
+        as_capability(stored),
+        as_capability(capacity),
+        cells,
+        sides.names(),
+    )
+}
+
+/// The powercell at `pos`, or [`NO_CELL`].
+pub(crate) fn cell_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    let Some(tier) = block_id(&*host, level, pos).and_then(|id| Tier::of_block(&id)) else {
+        return NO_CELL.to_owned();
+    };
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_CELL.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_CELL.to_owned();
+    };
+    let saved = Tag::Compound(saved);
+    let cell = read_cell(&saved, tier);
+    let sides = read_sides_from(&saved);
+    let (stored, capacity, cells) = network_of(host, Some(level), pos, None).map_or(
+        (
+            u64::try_from(cell.energy.max(0)).unwrap_or(0),
+            u64::try_from(tier.capacity()).unwrap_or(0),
+            1,
+        ),
+        |network| (network.stored(), network.capacity(), network.len()),
+    );
+    let t = level.game_time(&*host).unwrap_or(0);
+    cell_line(pos, tier, &cell, stored, capacity, cells, sides, t, nonce)
+}
+
+/// Set one face of a cell (`PowerCellTileEntity.toggleMode`'s absolute form — the harness's
+/// stand-in for the smart wrench the parent port does not carry). Answers the line a player
+/// reads, including the refusal when the face or the mode is not one.
+pub(crate) fn set_side(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    face_name: &str,
+    mode_name: &str,
+) -> String {
+    if block_id(&*host, level, pos)
+        .and_then(|id| Tier::of_block(&id))
+        .is_none()
+    {
+        return NO_CELL.to_owned();
+    }
+    let Some(face) = dir_from_name(&face_name.to_ascii_lowercase()) else {
+        return format!(
+            "Power Cell at {},{},{}: unknown face '{face_name}' (down|up|north|south|west|east)",
+            pos[0], pos[1], pos[2]
+        );
+    };
+    let Some(mode) = SideMode::parse(mode_name) else {
+        return format!(
+            "Power Cell at {},{},{}: unknown mode '{mode_name}' (none|input|output)",
+            pos[0], pos[1], pos[2]
+        );
+    };
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_CELL.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_CELL.to_owned();
+    };
+    let mut saved = Tag::Compound(saved);
+    let mut sides = read_sides_from(&saved);
+    if !sides.set(face_index(face), mode) {
+        return format!(
+            "Power Cell at {},{},{}: unknown face '{face_name}' (down|up|north|south|west|east)",
+            pos[0], pos[1], pos[2]
+        );
+    }
+    write_sides(&mut saved, sides);
+    if let Tag::Compound(data) = saved {
+        let _ = entity.replace_data(host, data);
+    }
+    let _ = entity.set_changed(&mut *host);
+    format!(
+        "Power Cell side at {},{},{}: {} {} (sides={})",
+        pos[0],
+        pos[1],
+        pos[2],
+        dir_name(face),
+        mode.name(),
+        sides.names()
+    )
+}
+
+/// A click on a cell reads its status in the action bar (there is no GUI in this slice), so the
+/// block's own menu never opens.
+pub(crate) fn cell_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    Tier::of_block(&block_id(&*host, level, click.pos)?)?;
+    let line = cell_status_line(host, level, click.pos, None);
+    if let Some(player) = host.player(click.player) {
+        let _ = player.action_bar(host, Text::literal(line));
+    }
+    Some(InteractionResult::Success)
+}
+
+/// A powercell: it ticks to push out of its OUTPUT faces, and a click reads it.
+pub(crate) struct CellPart {
+    tier: Tier,
+}
+
+#[mod_api::horizon_part]
+impl BlockPart for CellPart {
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseItemOnEvent<'_>,
+    ) -> Option<InteractionResult> {
+        cell_click(host, event.click)
+    }
+
+    fn use_without_item(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseWithoutItemEvent<'_>,
+    ) -> Option<InteractionResult> {
+        cell_click(host, event.click)
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for CellPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound — no FE, every face `NONE`
+    /// (`PowerCellTileEntity.modes`), which is why a fresh cell takes nothing in.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: the cell ticks its OUTPUT faces. Never clear a value an earlier
+    /// mod set.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: push out of every OUTPUT face, the network paying for it.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let changed = tick_cell(host, level, pos, self.tier, &mut saved);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
+/// A powercell item's Part: clamp what a placed item's `block_entity_data` restored to the
+/// block's own tier (`PowerCellBlock.setPlacedBy` reads the item's energy; a doctored one is
+/// clamped here).
+pub(crate) struct CellItemPart;
+
+#[mod_api::horizon_part]
+impl ItemPart for CellItemPart {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        let Some(level) = event
+            .placer
+            .and_then(|player| player.level(&*host))
+            .or_else(|| in_place_level(host))
+        else {
+            return;
+        };
+        let Some(tier) = block_id(&*host, level, event.pos).and_then(|id| Tier::of_block(&id))
+        else {
+            return;
+        };
+        let Some(entity) = host.block_entity(level, event.pos) else {
+            return;
+        };
+        let Some(saved) = entity.data(&*host) else {
+            return;
+        };
+        let mut saved = Tag::Compound(saved);
+        let cell = read_cell(&saved, tier);
+        if cell.energy == int(&saved, KEY_ENERGY) {
+            return;
+        }
+        write_cell(&mut saved, &cell);
+        if let Tag::Compound(data) = saved {
+            let _ = entity.replace_data(host, data);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The click
 // ---------------------------------------------------------------------------
 
@@ -753,37 +1360,46 @@ pub(crate) fn entity_data_patch(saved: &Compound, type_id: &str) -> Compound {
 
 /// `Hooks::block_drops`: a broken generator keeps its store on its own item, so a player who breaks
 /// a burning or charged generator and places it again does not lose the FE or the burn; a monitor
-/// keeps its configured alarm band the same way (upstream's `ITEM_POWER_MONITOR_DATA`).
+/// keeps its configured alarm band the same way (upstream's `ITEM_POWER_MONITOR_DATA`), and a
+/// powercell keeps its own local store (upstream's `copy_components` of `item_energy` — the face
+/// modes are client data and do not travel).
 pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow {
-    let block = level.state_block(event.state);
-    let patch = match block {
-        Some(GENERATOR) => {
-            let Some(entity) = event.block_entity else {
-                return Flow::Continue;
-            };
-            let Some(saved) = level.block_entity_data(entity) else {
-                return Flow::Continue;
-            };
-            if !crate::runtime::carried(&read_generator(&Tag::Compound(saved.clone()))) {
-                return Flow::Continue;
-            }
-            entity_data_patch(&saved, GENERATOR_TYPE_ID)
+    let Some(block) = level.state_block(event.state) else {
+        return Flow::Continue;
+    };
+    let Some(entity) = event.block_entity else {
+        return Flow::Continue;
+    };
+    let Some(saved) = level.block_entity_data(entity) else {
+        return Flow::Continue;
+    };
+    let patch = if let Some(tier) = Tier::of_block(block) {
+        let cell = read_cell(&Tag::Compound(saved), tier);
+        if cell.energy == 0 {
+            return Flow::Continue;
         }
-        Some(MONITOR) => {
-            let Some(entity) = event.block_entity else {
-                return Flow::Continue;
-            };
-            let Some(saved) = level.block_entity_data(entity) else {
-                return Flow::Continue;
-            };
-            // An unconfigured monitor has nothing worth carrying; a configured band does.
-            let state = read_monitor(&Tag::Compound(saved.clone()));
-            if !Monitor::band_set(state.minimum, state.maximum) {
-                return Flow::Continue;
-            }
-            entity_data_patch(&saved, MONITOR_TYPE_ID)
+        let mut payload = Compound::new();
+        payload.insert(KEY_ENERGY.into(), Tag::Int(cell.energy));
+        let type_id = if tier == Tier::One {
+            CELL1_TYPE_ID
+        } else {
+            CELL2_TYPE_ID
+        };
+        entity_data_patch(&payload, type_id)
+    } else if block == GENERATOR {
+        if !crate::runtime::carried(&read_generator(&Tag::Compound(saved.clone()))) {
+            return Flow::Continue;
         }
-        _ => return Flow::Continue,
+        entity_data_patch(&saved, GENERATOR_TYPE_ID)
+    } else if block == MONITOR {
+        // An unconfigured monitor has nothing worth carrying; a configured band does.
+        let state = read_monitor(&Tag::Compound(saved.clone()));
+        if !Monitor::band_set(state.minimum, state.maximum) {
+            return Flow::Continue;
+        }
+        entity_data_patch(&saved, MONITOR_TYPE_ID)
+    } else {
+        return Flow::Continue;
     };
     // The block's loot is the block itself, so its data goes on every drop the table made.
     for drop in event.drops.iter_mut() {
@@ -965,13 +1581,16 @@ impl BlockEntityPart for MonitorPart {
 // The command
 // ---------------------------------------------------------------------------
 
-/// The mod's commands. `info` and `monitor` are the harness's readouts (there is no GUI in this
-/// slice); `band` sets the monitor's alarm band, the stand-in for upstream's two GUI sliders.
+/// The mod's commands. `info`, `monitor` and `cell` are the harness's readouts (there is no GUI in
+/// this slice); `band` sets the monitor's alarm band and `side` sets a powercell face's mode, the
+/// stand-ins for upstream's GUI sliders and its smart wrench.
 pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
     for usage in [
         "rftoolspower info <pos:block_pos> [nonce:word]",
         "rftoolspower monitor <pos:block_pos> [nonce:word]",
         "rftoolspower band <pos:block_pos> <minimum:integer> <maximum:integer>",
+        "rftoolspower cell <pos:block_pos> [nonce:word]",
+        "rftoolspower side <pos:block_pos> <face:word> <mode:word>",
     ] {
         commands.push(Command::op(usage, OPERATOR_LEVEL));
     }
@@ -1037,14 +1656,22 @@ fn integer_of(event: &RunModCommandEvent<'_>, name: &str) -> i32 {
     }
 }
 
-/// Run `/rftoolspower info|monitor|band …`; `Flow::Cancel` when it was ours.
+/// A plain `word` argument, as typed.
+fn word_of<'a>(event: &'a RunModCommandEvent<'_>, name: &str) -> Option<&'a str> {
+    match event.command.argument(name) {
+        Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+        _ => None,
+    }
+}
+
+/// Run `/rftoolspower info|monitor|band|cell|side …`; `Flow::Cancel` when it was ours.
 pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
     let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
     let subcommand = match literals.as_slice() {
         ["rftoolspower", name] => *name,
         _ => return Flow::Continue,
     };
-    if !matches!(subcommand, "info" | "monitor" | "band") {
+    if !matches!(subcommand, "info" | "monitor" | "band" | "cell" | "side") {
         return Flow::Continue;
     }
     if !may_read(event.source.permission()) {
@@ -1059,8 +1686,8 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
     let level = command_level(host, event);
     if level.is_none() {
         let _ = host.commands().feedback(Text::literal(match subcommand {
-            "monitor" => NO_MONITOR,
-            "band" => NO_MONITOR,
+            "monitor" | "band" => NO_MONITOR,
+            "cell" | "side" => NO_CELL,
             _ => NO_GENERATOR,
         }));
         return Flow::Cancel;
@@ -1071,6 +1698,14 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
     let line = match subcommand {
         "info" => status_line(host, level, *pos, nonce_of(event)),
         "monitor" => monitor_status_line(host, level, *pos, nonce_of(event)),
+        "cell" => cell_status_line(host, level, *pos, nonce_of(event)),
+        "side" => set_side(
+            host,
+            level,
+            *pos,
+            word_of(event, "face").unwrap_or_default(),
+            word_of(event, "mode").unwrap_or_default(),
+        ),
         _ => set_band(
             host,
             level,
@@ -1397,10 +2032,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_three_the_harness_types() {
+    fn the_commands_are_the_five_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 5);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -1414,9 +2049,144 @@ mod tests {
             "rftoolspower band <pos:block_pos> <minimum:integer> <maximum:integer>",
             "the band is set the way upstream's GUI sliders set it"
         );
+        assert_eq!(
+            commands[3].usage, "rftoolspower cell <pos:block_pos> [nonce:word]",
+            "the cell's readout"
+        );
+        assert_eq!(
+            commands[4].usage, "rftoolspower side <pos:block_pos> <face:word> <mode:word>",
+            "the side mode is set the way the smart wrench toggles it"
+        );
         for command in &commands {
             assert_eq!(command.level, OPERATOR_LEVEL);
         }
+    }
+
+    #[test]
+    fn the_cells_store_and_modes_read_back_from_the_compound_they_wrote() {
+        let mut saved = compound();
+        assert_eq!(read_cell(&saved, Tier::One).energy, 0);
+        assert_eq!(
+            read_sides_from(&saved),
+            Sides::fresh(),
+            "a fresh cell is all NONE"
+        );
+        let cell = Cell {
+            tier: Tier::One,
+            energy: 12_345,
+        };
+        write_cell(&mut saved, &cell);
+        let mut sides = Sides::fresh();
+        assert!(sides.set(4, SideMode::Input), "west");
+        assert!(sides.set(5, SideMode::Output), "east");
+        write_sides(&mut saved, sides);
+        assert_eq!(saved.get(KEY_ENERGY), Some(&Tag::Int(12_345)));
+        assert_eq!(
+            saved.get(KEY_MODE),
+            Some(&Tag::String("000021".into())),
+            "upstream's six digits, Direction order (west INPUT=2, east OUTPUT=1)"
+        );
+        assert_eq!(read_cell(&saved, Tier::One), cell);
+        assert_eq!(read_sides_from(&saved), sides);
+    }
+
+    #[test]
+    fn a_doctored_cell_reads_clamped_to_its_tier() {
+        let mut saved = compound();
+        set_int(&mut saved, KEY_ENERGY, 9_000_000);
+        assert_eq!(read_cell(&saved, Tier::One).energy, 500_000);
+        assert_eq!(read_cell(&saved, Tier::Two).energy, 4_000_000);
+        set_int(&mut saved, KEY_ENERGY, -40);
+        assert_eq!(read_cell(&saved, Tier::One).energy, 0);
+        set_text(&mut saved, KEY_MODE, "999999");
+        assert_eq!(
+            read_sides_from(&saved),
+            Sides::fresh(),
+            "an unreadable mode string is a fresh cell, not half-applied"
+        );
+    }
+
+    #[test]
+    fn the_cell_readout_is_the_line_the_e2e_asserts() {
+        let mut sides = Sides::fresh();
+        assert!(sides.set(4, SideMode::Input));
+        let cell = Cell {
+            tier: Tier::One,
+            energy: 12_500,
+        };
+        assert_eq!(
+            cell_line(
+                [302, 101, 0],
+                Tier::One,
+                &cell,
+                12_500,
+                500_000,
+                1,
+                sides,
+                324,
+                Some("7")
+            ),
+            "Power Cell at 302,101,0: tier=1 local=12500/500000 network=12500/500000 cells=1 \
+             sides=none,none,none,none,input,none t=324 nonce=7"
+        );
+        assert_eq!(
+            cell_line(
+                [303, 101, 0],
+                Tier::Two,
+                &Cell {
+                    tier: Tier::Two,
+                    energy: 0
+                },
+                12_500,
+                4_500_000,
+                2,
+                Sides::fresh(),
+                7,
+                None
+            ),
+            "Power Cell at 303,101,0: tier=2 local=0/4000000 network=12500/4500000 cells=2 \
+             sides=none,none,none,none,none,none t=7"
+        );
+    }
+
+    #[test]
+    fn a_cells_store_rides_alone_on_its_item() {
+        let mut payload = Compound::new();
+        payload.insert(KEY_ENERGY.into(), Tag::Int(3_000));
+        let patch = Tag::Compound(entity_data_patch(&payload, CELL1_TYPE_ID));
+        let Some(Tag::Compound(data)) = patch.get(BLOCK_ENTITY_DATA) else {
+            panic!("the patch names the vanilla component");
+        };
+        let data = Tag::Compound(data.clone());
+        assert_eq!(
+            data.get("id"),
+            Some(&Tag::String(CELL1_TYPE_ID.into())),
+            "the payload names the cell's block entity type"
+        );
+        assert_eq!(read_cell(&data, Tier::One).energy, 3_000);
+        assert_eq!(
+            data.get(KEY_MODE),
+            None,
+            "the face modes are client data and do not travel on the item"
+        );
+    }
+
+    #[test]
+    fn the_face_number_is_vanillas_direction_ordinal() {
+        assert_eq!(face_index(Direction::Down), 0);
+        assert_eq!(face_index(Direction::Up), 1);
+        assert_eq!(face_index(Direction::North), 2);
+        assert_eq!(face_index(Direction::South), 3);
+        assert_eq!(face_index(Direction::West), 4);
+        assert_eq!(face_index(Direction::East), 5);
+        for direction in Direction::ALL {
+            assert_eq!(
+                dir_from_name(dir_name(direction)),
+                Some(direction),
+                "the command's face words round-trip"
+            );
+        }
+        assert_eq!(dir_from_name("westx"), None);
     }
 
     #[test]

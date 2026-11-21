@@ -2,7 +2,7 @@
 
 `assets/` and `data/` at the package root are generated from two jars by
 [`tools/assemble_content.py`](tools/assemble_content.py); rerun it to rebuild, or `--check` to
-re-derive into a temporary tree and compare (`ok: 63 entries re-derive exactly`). They ship inside
+re-derive into a temporary tree and compare (`ok: 90 entries re-derive exactly`). They ship inside
 the SDK package `rftoolspower.hmod`, beside `src/` and `horizon-mod.toml`.
 
 The two jars, both MIT, both already in this campaign's licence cache:
@@ -53,7 +53,26 @@ Nothing is invented. Everything below that is not a straight copy is a change 26
 | `data/rftoolspower/recipe/power_monitor.json` | comparator / redstone / machine base / redstone block (`" P "`, `"rAr"`, `" R "`) |
 | `data/rftoolspower/advancement/recipes/misc/power_monitor.json` | the recipe unlock (machine base) |
 | `data/rftoolspower/loot_table/blocks/power_monitor.json` | the monitor's drop |
-| `data/minecraft/tags/block/{mineable/pickaxe,needs_iron_tool}.json` | both blocks (upstream's `ironPickaxeTags()`) |
+| `data/minecraft/tags/block/{mineable/pickaxe,needs_iron_tool}.json` | every block (upstream's `ironPickaxeTags()`) |
+
+Slice 3 adds:
+
+| File | What |
+|---|---|
+| `assets/rftoolspower/blockstates/cell1.json`, `cell2.json` | the jar's own single-variant blockstates |
+| `assets/rftoolspower/models/block/cell1.json`, `cell2.json` | a plain `cube_all` with `cellboth_t1`/`_t2` (the jar's model, parent qualified as `minecraft:block/cube_all`) |
+| `assets/rftoolspower/textures/block/powercell/cellboth_t1.png`, `_t2.png` (+ `.mcmeta`) | the cells' animated faces, byte for byte |
+| `assets/rftoolspower/models/item/cell1.json`, `cell2.json`, `power_core1.json` | the item models (`item/handheld` qualified to `minecraft:item/handheld` for the core) |
+| `assets/rftoolspower/items/cell1.json`, `cell2.json`, `power_core1.json` | the 26.3 item definitions |
+| `assets/rftoolspower/textures/item/power_core1.png` | the core's texture, byte for byte |
+| `data/rftoolspower/horizon/block/cell1.json`, `cell2.json` | a plain full cube (`minecraft:iron_block` template), hardness 2.0 / blast 2.0, pickaxe, iron sound |
+| `data/rftoolspower/horizon/item/power_core1.json` | the core is a **pure item**, so it needs its own declaration (`minecraft:stick` template) — without it a recipe still crafts but `give` refuses the id |
+| `data/rftoolspower/recipe/cell1.json` | redstone / power core / machine frame (`"rKr"/"KFK"/"rKr"`), the jar's own |
+| `data/rftoolspower/recipe/power_core1.json` | diamond / redstone / redstone block (`" d "/"rRr"/" r "`), the jar's own |
+| `data/rftoolspower/advancement/recipes/misc/{cell1,power_core1}.json` | the two recipe unlocks, in the jar's own (26.3-shaped) predicate form |
+| `data/rftoolspower/loot_table/blocks/cell1.json`, `cell2.json` | the block drop (`copy_name` kept; `copy_components` dropped — the store rides on `block_entity_data`) |
+| `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.cell1`/`cell2`, `item.rftoolspower.power_core1` (upstream's names) |
+| `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | + the two cells and the core |
 
 ## Patched, because 1.21.1 → 26.3 differs
 
@@ -63,17 +82,21 @@ Nothing is invented. Everything below that is not a straight copy is a change 26
 | the loot table | the `copy_components` function is removed (it names mcjtylib's `item_energy`, `item_inventory` and `infusable` components, which this port does not register); `copy_name` stays. The store travels through `minecraft:block_entity_data`, written by `Hooks::block_drops` |
 | the block model | `rftoolsbase:block/base/…` → `rftoolspower:block/base/…` (the base textures travel in this package) |
 | `coalgenerator_on.json` | the jar's parent is `rftoolsbase:block/rftoolsblock_glow`, a custom glow-overlay model with an animated `coalgenerator_glow.png`; the pin cannot run it, so the lit variant is the same cube. The `lit` state is real; the overlay is a recorded gap |
-| the advancement | the predicate rewritten to 26.3's `{"items": […]}` shape under `conditions` |
+| the advancement | the predicate rewritten to 26.3's `{"items": […]}` shape under `conditions` (the cell/core files already ship that shape) |
+| the cell recipes | the 1.21.1 `{"item": X}` ingredient objects become bare ids (`{"tag": T}` → `#T`) |
+| `cell2`'s recipe | **not carried**: McJtyLib's `copy_components` wrapper around a shaped recipe needing `power_core2`, whose recipe needs `rftoolsbase:dimensional_shard` — a parent item this build does not carry, so it could never craft |
 | the lang | only the three keys this slice can show (block name, tab, shift line); upstream's GUI and tooltip strings are not carried because nothing reads them |
 
 ## What the content cannot do alone
 
 - **The monitor's recipe needs `rftoolsbase:machine_base`** (the parent port declares it), so with
   only this package the pattern crafts nothing (`phase T` proves the negative).
-- **The recipe needs `rftoolsbase:machine_frame`**, an item the `rftoolsbase` port's content
-  declares (`data/rftoolsbase/horizon/item/machine_frame.json`). A game with only this port has the
-  recipe loaded but uncraftable, so the e2e proves the pattern crafts nothing without it (`phase M`).
-  With both ports installed the recipe works as upstream's does.
+- **The recipes need `rftoolsbase:machine_frame`** (the generator's and cell1's), an item the
+  `rftoolsbase` port's content declares (`data/rftoolsbase/horizon/item/machine_frame.json`). A game
+  with only this port has the recipes loaded but uncraftable, so the e2e proves the patterns craft
+  nothing without it (`phase M`, `phase AC`). With both ports installed the recipes work as
+  upstream's do. The power core's recipe needs only vanilla items, so it is proven to craft in this
+  build (`phase AC`).
 - **The `lit` overlay** (see above): the block is dark or lit by its state, not by a glow layer.
 - **The GUI textures** (`assets/rftoolspower/textures/gui/coalgenerator.png`) are not carried: there
   is no menu in this slice.

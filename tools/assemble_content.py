@@ -214,13 +214,22 @@ ADVANCEMENT = {
 LANG = {
     "block.rftoolspower.coalgenerator": "Coal Generator",
     "block.rftoolspower.power_monitor": "Power Monitor",
+    "block.rftoolspower.cell1": "Powercell (Low)",
+    "block.rftoolspower.cell2": "Powercell (Medium)",
+    "item.rftoolspower.power_core1": "Power Core (Low)",
     "itemGroup.rftoolspower": "RFTools Power",
     "message.rftoolspower.shiftmessage": "<Press Shift>",
 }
 
 CREATIVE_TAB = {
     "icon": "rftoolspower:coalgenerator",
-    "items": ["rftoolspower:coalgenerator", "rftoolspower:power_monitor"],
+    "items": [
+        "rftoolspower:coalgenerator",
+        "rftoolspower:power_monitor",
+        "rftoolspower:cell1",
+        "rftoolspower:cell2",
+        "rftoolspower:power_core1",
+    ],
     "title": "itemGroup.rftoolspower",
 }
 
@@ -228,12 +237,55 @@ TAGS = {
     "data/minecraft/tags/block/mineable/pickaxe.json": [
         "rftoolspower:coalgenerator",
         "rftoolspower:power_monitor",
+        "rftoolspower:cell1",
+        "rftoolspower:cell2",
     ],
     "data/minecraft/tags/block/needs_iron_tool.json": [
         "rftoolspower:coalgenerator",
         "rftoolspower:power_monitor",
+        "rftoolspower:cell1",
+        "rftoolspower:cell2",
     ],
 }
+
+# A powercell is a plain full cube (`PowerCellBlock` has only `upper`/`lower` for its model's
+# connection shapes; this slice draws one cell, so the states are not declared) and it is
+# McJtyLib's STANDARD_IRON: hardness 2.0, blast 2.0, iron sound, an iron pickaxe's tool.
+CELL_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "item": True,
+}
+
+# `McJtyLib`'s standard loot with the `copy_components` function dropped (it names mcjtylib's
+# `item_energy`, which this port does not register); the store travels through
+# `minecraft:block_entity_data`, written by `Hooks::block_drops`.
+def cell_loot(name: str) -> dict:
+    return {
+        "type": "minecraft:block",
+        "pools": [
+            {
+                "bonus_rolls": 0.0,
+                "entries": [
+                    {
+                        "type": "minecraft:item",
+                        "functions": [
+                            {"function": "minecraft:copy_name", "source": "block_entity"}
+                        ],
+                        "name": f"rftoolspower:{name}",
+                    }
+                ],
+                "name": name,
+                "rolls": 1.0,
+            }
+        ],
+        "random_sequence": f"rftoolspower:blocks/{name}",
+    }
 
 
 def read_jar(jar: Path, name: str) -> bytes:
@@ -308,6 +360,89 @@ def build(out: Path) -> None:
     write(out / f"data/rftoolspower/loot_table/blocks/{MONITOR}.json", MONITOR_LOOT)
     write(out / f"data/rftoolspower/recipe/{MONITOR}.json", MONITOR_RECIPE)
     write(out / f"data/rftoolspower/advancement/recipes/misc/{MONITOR}.json", MONITOR_ADVANCEMENT)
+
+    # --- the powercells: tier 1 and tier 2, one plain cube each, and the power core that
+    # `cell1`'s recipe is built from. `cell2`'s own recipe is *not* carried: it is McJtyLib's
+    # `copy_components` wrapper around a shaped recipe needing `power_core2`, whose recipe needs
+    # `rftoolsbase:dimensional_shard` — a parent item this build does not carry, so it could never
+    # craft (recorded in notes.md).
+    for tier, name in ((1, "cell1"), (2, "cell2")):
+        write(
+            out / f"assets/rftoolspower/blockstates/{name}.json",
+            {"variants": {"": {"model": f"rftoolspower:block/{name}"}}},
+        )
+        write(
+            out / f"assets/rftoolspower/models/block/{name}.json",
+            {
+                "parent": "minecraft:block/cube_all",
+                "textures": {"all": f"rftoolspower:block/powercell/cellboth_t{tier}"},
+            },
+        )
+        write(
+            out / f"assets/rftoolspower/models/item/{name}.json",
+            {"parent": f"rftoolspower:block/{name}"},
+        )
+        write(
+            out / f"assets/rftoolspower/items/{name}.json",
+            {"model": {"model": f"rftoolspower:item/{name}", "type": "minecraft:model"}},
+        )
+        for suffix in ("", ".mcmeta"):
+            texture = f"assets/rftoolspower/textures/block/powercell/cellboth_t{tier}.png{suffix}"
+            binary(out / texture, read_jar(POWER, texture))
+        write(out / f"data/rftoolspower/horizon/block/{name}.json", CELL_DECL)
+        write(out / f"data/rftoolspower/loot_table/blocks/{name}.json", cell_loot(name))
+
+    write(out / "data/rftoolspower/recipe/cell1.json", patched_recipe("cell1"))
+    write(
+        out / "data/rftoolspower/advancement/recipes/misc/cell1.json",
+        json.loads(read_jar(POWER, "data/rftoolspower/advancement/recipes/misc/cell1.json")),
+    )
+    write(out / "data/rftoolspower/recipe/power_core1.json", patched_recipe("power_core1"))
+    write(
+        out / "data/rftoolspower/advancement/recipes/misc/power_core1.json",
+        json.loads(
+            read_jar(POWER, "data/rftoolspower/advancement/recipes/misc/power_core1.json")
+        ),
+    )
+    write(
+        out / "assets/rftoolspower/models/item/power_core1.json",
+        {
+            "parent": "minecraft:item/handheld",
+            "textures": {"layer0": "rftoolspower:item/power_core1"},
+        },
+    )
+    write(
+        out / "assets/rftoolspower/items/power_core1.json",
+        {"model": {"model": "rftoolspower:item/power_core1", "type": "minecraft:model"}},
+    )
+    # A pure item is registered by its own horizon/item declaration, not by a block: `give` and a
+    # recipe's result both resolve the item registry, and without this file the id exists only as
+    # a stack the recipe produced (the e2e caught exactly that: "Unknown item
+    # 'rftoolspower:power_core1'"). A stick's template is a plain 64-stack item.
+    write(out / "data/rftoolspower/horizon/item/power_core1.json", {"template": "minecraft:stick"})
+    binary(
+        out / "assets/rftoolspower/textures/item/power_core1.png",
+        read_jar(POWER, "assets/rftoolspower/textures/item/power_core1.png"),
+    )
+
+
+def ingredient(value: object) -> object:
+    """A 1.21.1 recipe ingredient as 26.3 spells it: `{"item": X}` → X, `{"tag": T}` → `#T`."""
+    if isinstance(value, dict) and len(value) == 1:
+        if "item" in value:
+            return value["item"]
+        if "tag" in value:
+            return f"#{value['tag']}"
+    return value
+
+
+def patched_recipe(name: str) -> dict:
+    """A shaped recipe from the jar with only its ingredient spellings changed for 26.3."""
+    recipe = json.loads(read_jar(POWER, f"data/rftoolspower/recipe/{name}.json"))
+    if recipe.get("type") != "minecraft:crafting_shaped":
+        raise SystemExit(f"{name}: unexpected recipe type {recipe.get('type')!r}")
+    recipe["key"] = {key: ingredient(value) for key, value in recipe["key"].items()}
+    return recipe
 
 
 def write(path: Path, value: object) -> None:

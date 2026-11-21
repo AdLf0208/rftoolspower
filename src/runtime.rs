@@ -309,6 +309,322 @@ pub fn send_amount(stored: i32, send_per_tick: i32) -> u32 {
     u32::try_from(stored.max(0).min(send_per_tick.max(0))).unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// The powercell (`PowerCellTileEntity`, `PowerCellBlock`, `PowerCellConfig`)
+// ---------------------------------------------------------------------------
+
+/// The most blocks upstream lets one powercell network hold (`networkMax`, `9*9*9`); a larger
+/// network is `!isValid()` and takes nothing in and gives nothing out.
+pub const NETWORK_MAX: usize = 9 * 9 * 9;
+/// The extra a network's throughput gains per extra cell, in percent (`rfPerTickScale`, `0.25`).
+pub const SCALE_PERCENT: u32 = 25;
+
+/// A powercell's tier (`data/Tier.java`), read from the block's own id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    /// `rftoolspower:cell1`.
+    One,
+    /// `rftoolspower:cell2`.
+    Two,
+    /// `rftoolspower:cell3`.
+    Three,
+}
+
+impl Tier {
+    /// The tier a cell block is, or `None` for a block that is not a powercell.
+    #[must_use]
+    pub fn of_block(block: &str) -> Option<Self> {
+        match block {
+            "rftoolspower:cell1" => Some(Self::One),
+            "rftoolspower:cell2" => Some(Self::Two),
+            "rftoolspower:cell3" => Some(Self::Three),
+            _ => None,
+        }
+    }
+
+    /// The tier's saved digit (`Tier.getSuffix`: 1, 2, 3), also the readout's `tier=`.
+    #[must_use]
+    pub const fn suffix(self) -> u8 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+        }
+    }
+
+    /// One cell's capacity: `tierNMaxRF` (500,000 / 4,000,000 / 20,000,000).
+    #[must_use]
+    pub const fn capacity(self) -> i32 {
+        match self {
+            Self::One => 500_000,
+            Self::Two => 4_000_000,
+            Self::Three => 20_000_000,
+        }
+    }
+
+    /// The most one side of one cell moves a tick: `tierNMaxRFPerTick` (250 / 1,000 / 4,000).
+    #[must_use]
+    pub const fn per_side(self) -> i32 {
+        match self {
+            Self::One => 250,
+            Self::Two => 1_000,
+            Self::Three => 4_000,
+        }
+    }
+}
+
+/// A cell face's mode (`data/SideType.java`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideMode {
+    /// Takes nothing in and gives nothing out (`NONE`, upstream's default on every fresh face).
+    None,
+    /// Takes FE in from the block on that face (`INPUT`).
+    Input,
+    /// Gives FE out to the block on that face (`OUTPUT`).
+    Output,
+}
+
+impl SideMode {
+    /// The mode as a command and the readout spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+
+    /// The mode a word spells (`none`/`input`/`output`, case-insensitive).
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "input" => Some(Self::Input),
+            "output" => Some(Self::Output),
+            _ => None,
+        }
+    }
+
+    /// Upstream's saved digit for the mode (`SideType.ordinal()`: NONE 0, OUTPUT 1, INPUT 2).
+    #[must_use]
+    const fn digit(self) -> char {
+        match self {
+            Self::None => '0',
+            Self::Output => '1',
+            Self::Input => '2',
+        }
+    }
+
+    /// The mode a saved digit spells.
+    #[must_use]
+    fn of_digit(digit: char) -> Option<Self> {
+        match digit {
+            '0' => Some(Self::None),
+            '1' => Some(Self::Output),
+            '2' => Some(Self::Input),
+            _ => None,
+        }
+    }
+
+    /// What the smart wrench's right click makes of this mode (`PowerCellTileEntity.toggleMode`:
+    /// NONE → INPUT → OUTPUT → NONE).
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::None => Self::Input,
+            Self::Input => Self::Output,
+            Self::Output => Self::None,
+        }
+    }
+}
+
+/// A cell's six face modes, by `Direction` number: 0 down, 1 up, 2 north, 3 south, 4 west,
+/// 5 east — vanilla's enum order, which upstream indexes with `side.ordinal()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sides([SideMode; 6]);
+
+impl Sides {
+    /// A fresh cell: every face `NONE`, upstream's `modes` initialiser.
+    #[must_use]
+    pub const fn fresh() -> Self {
+        Self([SideMode::None; 6])
+    }
+
+    /// The mode of one face; a face number out of range reads `NONE`.
+    #[must_use]
+    pub fn get(self, face: usize) -> SideMode {
+        self.0.get(face).copied().unwrap_or(SideMode::None)
+    }
+
+    /// Set one face's mode. False (and nothing changed) for a face number out of range.
+    pub fn set(&mut self, face: usize, mode: SideMode) -> bool {
+        let Some(slot) = self.0.get_mut(face) else {
+            return false;
+        };
+        *slot = mode;
+        true
+    }
+
+    /// Whether any face gives FE out — upstream's `outputCount > 0`, which is what makes the
+    /// block tick a send at all.
+    #[must_use]
+    pub fn any_output(self) -> bool {
+        self.0.contains(&SideMode::Output)
+    }
+
+    /// How many faces give FE out.
+    #[must_use]
+    pub fn output_count(self) -> usize {
+        self.0
+            .iter()
+            .filter(|mode| **mode == SideMode::Output)
+            .count()
+    }
+
+    /// The modes a saved compound's `mode` string holds: upstream writes one digit per face in
+    /// `Direction` order (`saveClientDataToNBT`) and needs six of them; anything else is a fresh
+    /// cell's six `NONE`s.
+    #[must_use]
+    pub fn from_saved(text: &str) -> Self {
+        let mut sides = Self::fresh();
+        let digits: Vec<char> = text.chars().collect();
+        if digits.len() != 6 {
+            return sides;
+        }
+        for (face, digit) in digits.into_iter().enumerate() {
+            // One unreadable digit is a doctored string; do not half-apply it.
+            let Some(mode) = SideMode::of_digit(digit) else {
+                return Self::fresh();
+            };
+            sides.0[face] = mode;
+        }
+        sides
+    }
+
+    /// The saved form: one digit per face, upstream's own six-character string.
+    #[must_use]
+    pub fn to_saved(self) -> String {
+        self.0.into_iter().map(SideMode::digit).collect()
+    }
+
+    /// The modes as the readout prints them, in face order.
+    #[must_use]
+    pub fn names(self) -> String {
+        self.0
+            .into_iter()
+            .map(SideMode::name)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// One cell of a network, as the rules need it: its tier and its own stored FE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cell {
+    /// The cell's tier.
+    pub tier: Tier,
+    /// The cell's own store, 0…[`Tier::capacity`].
+    pub energy: i32,
+}
+
+/// An amount clamped into one cell's range.
+#[must_use]
+pub fn clamped_energy(tier: Tier, energy: i32) -> i32 {
+    energy.clamp(0, tier.capacity())
+}
+
+/// Whether a network of `cells` blocks is one upstream would use: `networkMax`.
+#[must_use]
+pub fn network_valid(cells: usize) -> bool {
+    cells <= NETWORK_MAX
+}
+
+/// The most one side of a network of `cells` moves a tick: upstream's `getRfPerTickReal`,
+/// `per_side + (cells - 1) * per_side * rfPerTickScale`, truncated to an integer by its `(long)`
+/// cast — so a lone tier-1 cell moves 250 and a pair moves 312 (312.5 cut down).
+#[must_use]
+pub fn rf_per_tick(tier: Tier, cells: usize) -> u32 {
+    let per_side = f64::from(tier.per_side());
+    let extra = u32::try_from(cells.saturating_sub(1)).map_or(0.0, f64::from);
+    let scaled = per_side + extra * per_side * f64::from(SCALE_PERCENT) / 100.0;
+    // `as u64` truncates toward zero, as upstream's `(long)` cast does.
+    u32::try_from(scaled as u64).unwrap_or(u32::MAX)
+}
+
+/// What the network holds, as upstream's `PowerCellNetwork.getEnergy` sums its cells' locals.
+#[must_use]
+pub fn stored(cells: &[Cell]) -> u64 {
+    cells
+        .iter()
+        .map(|cell| u64::try_from(cell.energy.max(0)).unwrap_or(0))
+        .sum()
+}
+
+/// What the network can hold: the sum of its cells' capacities, which is why a mixed-tier
+/// network's total is the sum of each tier's own capacity.
+#[must_use]
+pub fn capacity(cells: &[Cell]) -> u64 {
+    cells
+        .iter()
+        .map(|cell| u64::try_from(cell.tier.capacity()).unwrap_or(0))
+        .sum()
+}
+
+/// A network total as the energy capability answers it: upstream's `getStoredPower`/
+/// `getCapacity` cast to `int` with `Math.min(Integer.MAX_VALUE, …)`, so a network past 2.1
+/// billion FE reads as 2,147,483,647 rather than wrapping.
+#[must_use]
+pub fn as_capability(total: u64) -> u32 {
+    u32::try_from(total.min(i32::MAX as u64)).unwrap_or(i32::MAX as u32)
+}
+
+/// Take up to `request` into a network, the cell asked first and then the rest of the network,
+/// as upstream's `receiveEnergyFacing` fills its own block and then walks the network. Capped by
+/// [`rf_per_tick`] (the budget is per side, not shared between the cell's faces) and by the
+/// network's free room; returns how much actually went in.
+///
+/// `cells[0]` is the cell that was asked, and its tier decides the budget.
+pub fn receive(cells: &mut [Cell], request: u32) -> u32 {
+    let Some(asked) = cells.first() else {
+        return 0;
+    };
+    // Upstream's `network == null || !network.isValid()` guard: nothing moves at all.
+    if !network_valid(cells.len()) || request == 0 {
+        return 0;
+    }
+    let mut left = request.min(rf_per_tick(asked.tier, cells.len()));
+    let mut taken = 0;
+    for cell in cells.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let room = u32::try_from(cell.tier.capacity().saturating_sub(cell.energy)).unwrap_or(0);
+        let put = left.min(room);
+        cell.energy = cell.energy.saturating_add(i32::try_from(put).unwrap_or(0));
+        left -= put;
+        taken += put;
+    }
+    taken
+}
+
+/// Take up to `amount` out of a network, the cell asked first and then the rest, as upstream's
+/// `extractEnergyFromNetwork` drains its own block before its neighbours. Returns how much came.
+pub fn take(cells: &mut [Cell], amount: u32) -> u32 {
+    let mut left = amount;
+    let mut taken = 0;
+    for cell in cells.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let got = left.min(u32::try_from(cell.energy.max(0)).unwrap_or(0));
+        cell.energy -= i32::try_from(got).unwrap_or(0);
+        left -= got;
+        taken += got;
+    }
+    taken
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +969,249 @@ mod tests {
             0,
             "a negative store is empty"
         );
+    }
+
+    // --- the powercell -----------------------------------------------------
+
+    fn cell(tier: Tier, energy: i32) -> Cell {
+        Cell { tier, energy }
+    }
+
+    #[test]
+    fn a_fresh_cell_has_six_none_faces() {
+        let fresh = Sides::fresh();
+        for face in 0..6 {
+            assert_eq!(fresh.get(face), SideMode::None, "face {face}");
+        }
+        assert!(!fresh.any_output(), "a fresh cell gives nothing out");
+        assert_eq!(fresh.output_count(), 0);
+        assert_eq!(fresh.to_saved(), "000000", "upstream's six digits");
+        assert_eq!(fresh.names(), "none,none,none,none,none,none");
+        assert_eq!(Sides::fresh().get(9), SideMode::None, "no tenth face");
+    }
+
+    #[test]
+    fn a_side_mode_is_set_one_face_at_a_time_and_reads_back_from_the_saved_string() {
+        let mut sides = Sides::fresh();
+        assert!(sides.set(4, SideMode::Input), "west");
+        assert!(sides.set(0, SideMode::Output), "down");
+        assert_eq!(sides.get(4), SideMode::Input);
+        assert_eq!(sides.get(0), SideMode::Output);
+        assert_eq!(sides.get(5), SideMode::None, "east untouched");
+        assert_eq!(
+            sides.to_saved(),
+            "100020",
+            "one digit per face, Direction order"
+        );
+        assert_eq!(sides.names(), "output,none,none,none,input,none");
+        assert_eq!(Sides::from_saved("100020"), sides);
+        assert_eq!(sides.output_count(), 1);
+        assert!(sides.any_output());
+        assert!(!sides.set(6, SideMode::Input), "there is no seventh face");
+        assert_eq!(
+            sides.to_saved(),
+            "100020",
+            "an out-of-range face changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_saved_mode_string_is_upstreams_and_a_broken_one_is_a_fresh_cell() {
+        assert_eq!(Sides::from_saved(""), Sides::fresh());
+        assert_eq!(
+            Sides::from_saved("0021"),
+            Sides::fresh(),
+            "four digits is not six"
+        );
+        assert_eq!(
+            Sides::from_saved("2222221"),
+            Sides::fresh(),
+            "seven digits is not six"
+        );
+        assert_eq!(
+            Sides::from_saved("999999"),
+            Sides::fresh(),
+            "9 is not a SideType ordinal"
+        );
+        let mixed = Sides::from_saved("012012");
+        assert_eq!(mixed.get(0), SideMode::None);
+        assert_eq!(mixed.get(1), SideMode::Output);
+        assert_eq!(mixed.get(2), SideMode::Input);
+        assert_eq!(mixed.get(3), SideMode::None);
+        assert_eq!(mixed.get(4), SideMode::Output);
+        assert_eq!(mixed.get(5), SideMode::Input);
+        assert_eq!(mixed.names(), "none,output,input,none,output,input");
+    }
+
+    #[test]
+    fn the_wrench_cycles_none_input_output() {
+        assert_eq!(SideMode::None.next(), SideMode::Input);
+        assert_eq!(SideMode::Input.next(), SideMode::Output);
+        assert_eq!(SideMode::Output.next(), SideMode::None);
+        assert_eq!(SideMode::parse("NONE"), Some(SideMode::None));
+        assert_eq!(SideMode::parse("input"), Some(SideMode::Input));
+        assert_eq!(SideMode::parse("Output"), Some(SideMode::Output));
+        assert_eq!(SideMode::parse("in"), None);
+        assert_eq!(
+            SideMode::parse("0"),
+            None,
+            "the saved digit is not a mode word"
+        );
+        assert_eq!(SideMode::None.name(), "none");
+        assert_eq!(SideMode::Input.name(), "input");
+        assert_eq!(SideMode::Output.name(), "output");
+    }
+
+    #[test]
+    fn the_three_tiers_are_upstreams_config_numbers() {
+        assert_eq!(Tier::of_block("rftoolspower:cell1"), Some(Tier::One));
+        assert_eq!(Tier::of_block("rftoolspower:cell2"), Some(Tier::Two));
+        assert_eq!(Tier::of_block("rftoolspower:cell3"), Some(Tier::Three));
+        assert_eq!(Tier::of_block("rftoolspower:coalgenerator"), None);
+        assert_eq!(Tier::of_block("minecraft:stone"), None);
+        assert_eq!(Tier::of_block("rftoolspower:cell10"), None);
+        assert_eq!(
+            [Tier::One, Tier::Two, Tier::Three].map(Tier::capacity),
+            [500_000, 4_000_000, 20_000_000],
+            "tier1MaxRF / tier2MaxRF / tier3MaxRF"
+        );
+        assert_eq!(
+            [Tier::One, Tier::Two, Tier::Three].map(Tier::per_side),
+            [250, 1_000, 4_000],
+            "tierNMaxRFPerTick"
+        );
+        assert_eq!(
+            [Tier::One, Tier::Two, Tier::Three].map(Tier::suffix),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_tier_one_cell_takes_two_hundred_and_fifty_of_a_two_thousand_push() {
+        let mut network = [cell(Tier::One, 0)];
+        assert_eq!(
+            receive(&mut network, 2_000),
+            250,
+            "the per-side number caps the take, not the generator's 2,000"
+        );
+        assert_eq!(network[0].energy, 250);
+        assert_eq!(
+            receive(&mut network, 100),
+            100,
+            "a smaller request is taken whole"
+        );
+        assert_eq!(network[0].energy, 350);
+        assert_eq!(receive(&mut network, 0), 0, "nothing asked, nothing taken");
+    }
+
+    #[test]
+    fn the_network_budget_grows_a_quarter_of_the_per_side_number_per_extra_cell() {
+        assert_eq!(rf_per_tick(Tier::One, 1), 250);
+        assert_eq!(
+            rf_per_tick(Tier::One, 2),
+            312,
+            "250 + 62.5, truncated as upstream's (long) cast"
+        );
+        assert_eq!(rf_per_tick(Tier::One, 9), 750, "250 + 8 * 62.5");
+        assert_eq!(rf_per_tick(Tier::Two, 1), 1_000);
+        assert_eq!(rf_per_tick(Tier::Two, 2), 1_250);
+        assert_eq!(rf_per_tick(Tier::Three, 3), 6_000, "4,000 + 2 * 1,000");
+        let mut pair = [cell(Tier::One, 0), cell(Tier::One, 0)];
+        assert_eq!(receive(&mut pair, 2_000), 312, "the pair's own budget");
+        let mut mixed = [cell(Tier::One, 0), cell(Tier::Two, 0)];
+        assert_eq!(
+            receive(&mut mixed, 2_000),
+            312,
+            "the asking cell's tier sets the budget, not the biggest cell's"
+        );
+    }
+
+    #[test]
+    fn a_full_cell_passes_the_rest_of_its_budget_to_the_network() {
+        let mut network = [cell(Tier::One, 500_000), cell(Tier::One, 499_000)];
+        assert_eq!(
+            receive(&mut network, 2_000),
+            312,
+            "the asking cell is full, the neighbour has room"
+        );
+        assert_eq!(network[0].energy, 500_000);
+        assert_eq!(network[1].energy, 499_312);
+        let mut full = [cell(Tier::One, 500_000), cell(Tier::One, 500_000)];
+        assert_eq!(receive(&mut full, 2_000), 0, "no room anywhere");
+        let mut nearly = [cell(Tier::One, 500_000 - 40), cell(Tier::One, 500_000)];
+        assert_eq!(
+            receive(&mut nearly, 2_000),
+            40,
+            "room decides the take, not the budget"
+        );
+    }
+
+    #[test]
+    fn a_network_is_the_sum_of_its_cells_whatever_their_tier() {
+        let network = [
+            cell(Tier::One, 1_000),
+            cell(Tier::One, 2_000),
+            cell(Tier::Two, 4_000),
+        ];
+        assert_eq!(stored(&network), 7_000);
+        assert_eq!(
+            capacity(&network),
+            5_000_000,
+            "500,000 + 500,000 + 4,000,000 — tiers share one network"
+        );
+        assert_eq!(as_capability(stored(&network)), 7_000);
+        assert_eq!(
+            as_capability(u64::from(u32::MAX)),
+            i32::MAX as u32,
+            "upstream's Math.min(Integer.MAX_VALUE, …)"
+        );
+    }
+
+    #[test]
+    fn a_network_past_upstreams_limit_takes_nothing() {
+        let mut big = vec![cell(Tier::One, 0); NETWORK_MAX + 1];
+        assert!(!network_valid(big.len()));
+        assert_eq!(receive(&mut big, 2_000), 0, "!isValid(): no insert at all");
+        assert!(big.iter().all(|cell| cell.energy == 0));
+        let mut limit = vec![cell(Tier::One, 0); NETWORK_MAX];
+        assert!(network_valid(limit.len()));
+        assert_eq!(
+            receive(&mut limit, 2_000),
+            2_000,
+            "the request caps the take, not the network's 45,750 budget"
+        );
+        assert_eq!(receive(&mut [], 2_000), 0, "no cell, no take");
+    }
+
+    #[test]
+    fn the_cell_asked_drains_first_and_then_the_network() {
+        let mut network = [
+            cell(Tier::One, 100),
+            cell(Tier::One, 1_000),
+            cell(Tier::One, 1_000),
+        ];
+        assert_eq!(take(&mut network, 450), 450);
+        assert_eq!(network[0].energy, 0, "the asking cell is drained first");
+        assert_eq!(network[1].energy, 650);
+        assert_eq!(network[2].energy, 1_000);
+        assert_eq!(
+            take(&mut network, 10_000),
+            1_650,
+            "never more than it holds"
+        );
+        assert_eq!(stored(&network), 0);
+        assert_eq!(take(&mut network, 10), 0, "an empty network gives nothing");
+    }
+
+    #[test]
+    fn a_doctored_cell_energy_is_clamped_to_its_own_tier() {
+        assert_eq!(clamped_energy(Tier::One, 999_999), 500_000);
+        assert_eq!(clamped_energy(Tier::One, -5), 0);
+        assert_eq!(
+            clamped_energy(Tier::Two, 999_999),
+            999_999,
+            "a tier-2 cell holds more than a tier-1 one"
+        );
+        assert_eq!(clamped_energy(Tier::Three, 25_000_000), 20_000_000);
     }
 }
