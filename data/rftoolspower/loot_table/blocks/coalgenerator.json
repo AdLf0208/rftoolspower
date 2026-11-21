@@ -1,0 +1,23 @@
+{
+  "pools": [
+    {
+      "bonus_rolls": 0.0,
+      "entries": [
+        {
+          "functions": [
+            {
+              "function": "minecraft:copy_name",
+              "source": "block_entity"
+            }
+          ],
+          "name": "rftoolspower:coalgenerator",
+          "type": "minecraft:item"
+        }
+      ],
+      "name": "coalgenerator",
+      "rolls": 1.0
+    }
+  ],
+  "random_sequence": "rftoolspower:blocks/coalgenerator",
+  "type": "minecraft:block"
+}

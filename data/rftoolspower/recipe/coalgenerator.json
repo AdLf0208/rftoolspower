@@ -1,0 +1,18 @@
+{
+  "category": "misc",
+  "key": {
+    "F": "rftoolsbase:machine_frame",
+    "T": "minecraft:redstone_torch",
+    "c": "#minecraft:coals"
+  },
+  "pattern": [
+    "cTc",
+    "cFc",
+    "cTc"
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:coalgenerator"
+  },
+  "type": "minecraft:crafting_shaped"
+}

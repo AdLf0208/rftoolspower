@@ -1,0 +1,23 @@
+id = "rftoolspower"
+name = "RFTools Power"
+version = "0.1.0"
+description = """A port of RFTools Power for Horizon: the Coal Generator, which burns coal, charcoal or a
+coal block for 600 ticks each (nine times that for a block) at 60 FE a tick into a 500,000 FE
+buffer, lights its own front while it burns, takes fuel from a hopper or a right click, gives its
+store out through the energy capability, and keeps that store on its item when it is broken."""
+authors = ["McJty", "Horizon native mod contributors"]
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside the carried data/ and assets/. The id is the resource namespace and the only identity:
+# Cargo's package name and version are not the mod's.
+api = "0.2"
+# The installation side, not the hook's: an integrated server belongs to the client
+# installation, so a single-player world and a LAN host need both.
+side = "both"
+# registries: "May add blocks, items, mob effects and entity types to your worlds" — the generator
+# block and its item are carried content, and the code declares their block entity type.
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
