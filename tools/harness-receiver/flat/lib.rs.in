@@ -1,0 +1,56 @@
+//! The e2e's bare energy receiver.
+//!
+//! One block, `rfpowerharness:receiver`, standing on `minecraft:stone`, with a 100,000 FE buffer
+//! that takes 10,000 FE a face an insert and gives nothing out. It carries no tick and no
+//! behaviour: the game's `ModEnergyBuffer` reads and writes `energy` in the block entity's saved
+//! compound, which is exactly what the leg reads back with `/data get block`.
+use mod_api::{
+    self, BlockEntityEvent, BlockEntityPart, BlockPart, Compound, Host, Hooks, LevelSide,
+    Registrar, RegistrationContext,
+};
+
+#[derive(Default)]
+struct Mod;
+
+#[mod_api::horizon_mod]
+impl Hooks for Mod {
+    fn register(&self, r: &mut dyn Registrar, context: &RegistrationContext) {
+        let kind = r
+            .block_entity_type("receiver_block_entity")
+            .blocks(&["receiver"])
+            .build();
+        let block = r.block_key("rfpowerharness:receiver");
+        r.block_energy(
+            &block,
+            mod_api::ModEnergyBuffer {
+                capacity: 100_000,
+                max_insert: 10_000,
+                max_extract: 0,
+                insert_faces: [true; 6],
+                extract_faces: [false; 6],
+            },
+        );
+        if let Err(error) = r.block_entity_part(&kind, ReceiverPart) {
+            context.refuse(&format!("rfpowerharness: the receiver part was refused: {error}"));
+        }
+    }
+}
+
+struct ReceiverPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for ReceiverPart {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for ReceiverPart {
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    fn block_entity_ticks(&self, _host: &dyn Host, _event: &mut mod_api::BlockEntityTicksEvent<'_>) {
+    }
+}

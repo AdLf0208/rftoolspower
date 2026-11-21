@@ -1,7 +1,8 @@
 {
   "icon": "rftoolspower:coalgenerator",
   "items": [
-    "rftoolspower:coalgenerator"
+    "rftoolspower:coalgenerator",
+    "rftoolspower:power_monitor"
   ],
   "title": "itemGroup.rftoolspower"
 }

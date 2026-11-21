@@ -1,5 +1,6 @@
 {
   "block.rftoolspower.coalgenerator": "Coal Generator",
+  "block.rftoolspower.power_monitor": "Power Monitor",
   "itemGroup.rftoolspower": "RFTools Power",
   "message.rftoolspower.shiftmessage": "<Press Shift>"
 }

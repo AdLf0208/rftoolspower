@@ -1,0 +1,19 @@
+{
+  "category": "misc",
+  "key": {
+    "A": "rftoolsbase:machine_base",
+    "P": "minecraft:comparator",
+    "R": "minecraft:redstone_block",
+    "r": "minecraft:redstone"
+  },
+  "pattern": [
+    " P ",
+    "rAr",
+    " R "
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:power_monitor"
+  },
+  "type": "minecraft:crafting_shaped"
+}

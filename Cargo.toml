@@ -6,10 +6,10 @@
 #
 # Cargo's name and version are not the mod's identity: horizon-mod.toml is.
 name = "rftoolspower"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
-description = "RFTools Power for Horizon: the coal generator"
+description = "RFTools Power for Horizon: the coal generator and the power monitor"
 publish = false
 
 [dependencies]

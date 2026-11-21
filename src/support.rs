@@ -5,16 +5,22 @@
 //! back. Its tests pin what it *declares* (one insert-only fuel slot, a store that gives out 2,000
 //! FE a tick and takes nothing in), that the state written to the saved compound reads back, and the
 //! exact line `/rftoolspower info` prints.
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use mod_api::{
     self, BlockClick, BlockDropsEvent, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
-    BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue,
-    Compound, Flow, Host, HostTransaction, InteractionResult, ItemPart, ItemPlace, ItemResource,
-    ItemStack, LevelHost, LevelRef, LevelSide, ModContainer, ModEnergyBuffer, OnBlockPlacedByEvent,
-    Registrar, RegistrationContext, RunModCommandEvent, ServerHost, Tag, Text, UseItemOnEvent,
-    UseWithoutItemEvent,
+    BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, BlockSignalEvent, BlockState, Command,
+    CommandArgumentValue, Compound, Direction, ENERGY, Flow, Host, HostTransaction,
+    InteractionResult, IsSignalSourceEvent, ItemPart, ItemPlace, ItemResource, ItemStack,
+    LevelHost, LevelRef, LevelSide, ModContainer, ModEnergyBuffer, NeighbourUpdate,
+    OnBlockPlacedByEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
+    StateForPlacementEvent, Tag, Text, UseItemOnEvent, UseWithoutItemEvent,
 };
 
-use crate::runtime::{CAPACITY, EXTRACT_PER_TICK, Fuel, Generator, restored};
+use crate::runtime::{
+    CAPACITY, EXTRACT_PER_TICK, Fuel, Generator, Monitor, OBSERVE_TICKS, restored, send_amount,
+};
 
 /// The generator block; the block entity type carries its own path.
 pub(crate) const GENERATOR: &str = "rftoolspower:coalgenerator";
@@ -49,6 +55,29 @@ const NO_GENERATOR: &str = "No RFTools Power coal generator there.";
 /// Vanilla's stack limit, for an item this world does not know.
 const DEFAULT_STACK: u32 = 64;
 
+/// The power monitor (`MonitorModule.POWER_MONITOR`).
+pub(crate) const MONITOR: &str = "rftoolspower:power_monitor";
+/// The monitor's block entity type, named apart from its block for the reason
+/// [`GENERATOR_TYPE`] is (`actuallyadditions` measured the host skipping a same-id entity).
+const MONITOR_TYPE: &str = "power_monitor_block_entity";
+/// That type's registry id, which the monitor item's `block_entity_data` names.
+const MONITOR_TYPE_ID: &str = "rftoolspower:power_monitor_block_entity";
+/// The monitor's `level` state: upstream's `IntegerProperty.create("level", 0, 5)`.
+const KEY_LEVEL: &str = "level";
+/// The monitor's alarm band and flag (upstream's `PowerMonitorData` plus its `inAlarm` field).
+const KEY_MINIMUM: &str = "minimum";
+const KEY_MAXIMUM: &str = "maximum";
+const KEY_ALARM: &str = "alarm";
+/// The 20-tick observation counter (upstream's `counter` field, kept saved here because the tick
+/// reply discards payload edits that are not reported as changed).
+const KEY_COUNTER: &str = "counter";
+/// The monitor's read side (upstream's `LogicSupport.getFacing(state).getInputSide()`).
+const KEY_FACING: &str = "facing";
+/// What a read where no monitor stands answers.
+const NO_MONITOR: &str = "No RFTools Power power monitor there.";
+/// The strongest signal a monitor's alarm gives.
+const ALARM_SIGNAL: i32 = 15;
+
 // ---------------------------------------------------------------------------
 // What the mod declares for its block
 // ---------------------------------------------------------------------------
@@ -75,6 +104,20 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     if let Err(error) = r.block_entity_part(&kind, GeneratorPart) {
         context.refuse(&format!(
             "rftoolspower: the coal generator part was refused: {error}"
+        ));
+    }
+
+    // The monitor: a block entity type, a Part and its item's Part. It has no container and no
+    // energy buffer — it reads the block it faces, it is not a battery.
+    let kind = r
+        .block_entity_type(MONITOR_TYPE)
+        .blocks(&["power_monitor"])
+        .build();
+    let item = r.item_key(MONITOR);
+    r.item_part(item, MonitorItemPart);
+    if let Err(error) = r.block_entity_part(&kind, MonitorPart) {
+        context.refuse(&format!(
+            "rftoolspower: the power monitor part was refused: {error}"
         ));
     }
 }
@@ -135,6 +178,46 @@ pub(crate) fn write_generator(saved: &mut Tag, state: &Generator) {
     set_int(saved, KEY_ENERGY, state.energy);
     set_int(saved, KEY_BURN, state.burn as i32);
     set_int(saved, KEY_BURN_MAX, state.burn_max as i32);
+}
+
+/// A saved flag, false when absent or of another type (vanilla's NBT boolean is a byte).
+fn flag(saved: &Tag, key: &str) -> bool {
+    match saved.get(key) {
+        Some(Tag::Byte(value)) => *value != 0,
+        _ => false,
+    }
+}
+
+/// Write one boolean into a saved compound as vanilla's byte.
+fn set_flag(saved: &mut Tag, key: &str, value: bool) {
+    if let Tag::Compound(nbt) = saved {
+        nbt.insert(key.into(), Tag::Byte(i8::from(value)));
+    }
+}
+
+/// The monitor a saved compound holds, with every value clamped (`Monitor::restored`).
+pub(crate) fn read_monitor(saved: &Tag) -> Monitor {
+    let counter = match saved.get(KEY_COUNTER) {
+        Some(Tag::Int(value)) => u32::try_from(*value).unwrap_or(0),
+        // A fresh block entity observes 20 ticks after placement, as upstream's field does.
+        _ => OBSERVE_TICKS,
+    };
+    Monitor::restored(
+        int(saved, KEY_LEVEL),
+        int(saved, KEY_MINIMUM),
+        int(saved, KEY_MAXIMUM),
+        flag(saved, KEY_ALARM),
+        counter,
+    )
+}
+
+/// Write the monitor back into a saved compound.
+pub(crate) fn write_monitor(saved: &mut Tag, state: &Monitor) {
+    set_int(saved, KEY_LEVEL, state.level);
+    set_int(saved, KEY_MINIMUM, state.minimum);
+    set_int(saved, KEY_MAXIMUM, state.maximum);
+    set_flag(saved, KEY_ALARM, state.alarm);
+    set_int(saved, KEY_COUNTER, state.counter as i32);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +299,9 @@ pub(crate) fn tick_generator(
     let before = read_generator(saved);
     let mut state = before.clone();
     let mut changed = false;
+    // Upstream's order: push to the neighbours first, from the store the tick started with,
+    // then burn and generate.
+    push_energy(host, level, pos, &mut state);
     if state.wants_fuel()
         && let Some(stack) = items.get(FUEL_SLOT).and_then(Option::clone)
         && let Some(fuel) = Fuel::of(&item_id(&*host, &stack))
@@ -232,6 +318,330 @@ pub(crate) fn tick_generator(
         mirror_lit(host, pos, state.lit());
     }
     changed
+}
+
+/// `CoalGeneratorTileEntity.handleSendingEnergy`: offer up to [`EXTRACT_PER_TICK`] to each of the
+/// six neighbours that answers the energy capability, and take what it accepted out of the store.
+///
+/// Upstream offers `SENDPERTICK` to *each* neighbour (the budget is per face, not shared) and
+/// runs this before generation, from the store the tick started with; [`tick_generator`] does the
+/// same. A target's own insert limit and room decide what actually moves.
+pub(crate) fn push_energy(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    state: &mut Generator,
+) {
+    let Some(level) = level else {
+        return;
+    };
+    for direction in Direction::ALL {
+        let offer = send_amount(state.energy, EXTRACT_PER_TICK);
+        if offer == 0 {
+            break;
+        }
+        let normal = direction.normal();
+        let target = [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]];
+        // The neighbour's face toward this generator (`facing.getOpposite()` upstream).
+        let Some(handler) = level.capability(host, &ENERGY, target, Some(direction.opposite()))
+        else {
+            continue;
+        };
+        let moved = host
+            .transaction(|host, tx| -> Result<u32, ()> { Ok(handler.insert(host, tx, offer)) })
+            .unwrap_or(0);
+        state.energy -= i32::try_from(moved).unwrap_or(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The power monitor
+// ---------------------------------------------------------------------------
+
+/// A direction's vanilla name (`facing=north`).
+fn dir_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Down => "down",
+        Direction::Up => "up",
+        Direction::North => "north",
+        Direction::South => "south",
+        Direction::West => "west",
+        Direction::East => "east",
+    }
+}
+
+/// The direction a vanilla name spells.
+fn dir_from_name(name: &str) -> Option<Direction> {
+    Direction::ALL
+        .into_iter()
+        .find(|direction| dir_name(*direction) == name)
+}
+
+/// The horizontal direction a placer's yaw faces: 0° south, 90° west, 180° north, −90° east.
+///
+/// The monitor's `facing` is its **display front**, set facing the placer as a furnace's is; the
+/// block it monitors is the one behind it, which is upstream's logic-slab input side (a monitor
+/// mounts on the machine and its screen points away from it).
+pub(crate) fn facing_from_yaw(yaw: f32) -> Direction {
+    match (yaw / 90.0).round().rem_euclid(4.0) as i32 {
+        0 => Direction::South,
+        1 => Direction::West,
+        2 => Direction::North,
+        _ => Direction::East,
+    }
+}
+
+/// The face a monitor gives its alarm on: the display side, opposite the read side.
+pub(crate) fn output_face(read: Direction) -> Direction {
+    read.opposite()
+}
+
+/// The block a monitor reads (behind its display front) and the read direction.
+pub(crate) fn read_target(
+    host: &dyn Host,
+    level: LevelRef,
+    pos: [i32; 3],
+) -> Option<([i32; 3], Direction)> {
+    let name = level.block_property(host, pos, KEY_FACING)?;
+    let read = dir_from_name(name.as_str())?.opposite();
+    let normal = read.normal();
+    Some((
+        [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]],
+        read,
+    ))
+}
+
+/// The store and capacity of the block at `target`, if it answers the energy capability.
+pub(crate) fn energy_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    target: [i32; 3],
+) -> Option<(u32, u32)> {
+    let handler = level.capability(host, &ENERGY, target, None)?;
+    Some((handler.amount(&mut *host), handler.capacity(&mut *host)))
+}
+
+/// Mirror the monitor's level and alarm into its block state, and let the neighbours re-read the
+/// redstone output when it changed (a lamp on the display side must light at once).
+pub(crate) fn mirror_monitor(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    state: &Monitor,
+) {
+    let _ = host.set_block_property(pos, KEY_LEVEL, &state.level.to_string());
+    let _ = host.set_block_property(pos, KEY_LIT, if state.alarm { "true" } else { "false" });
+    if let Some(source) = level.block_state(&*host, pos) {
+        let _ = level.update_neighbors(host, pos, source, NeighbourUpdate::Neighbours);
+    }
+}
+
+/// One monitor tick (`PowerMonitorTileEntity.tickServer`): count the 20 ticks down, then read the
+/// block it faces and set its level and alarm. True when the saved state moved.
+pub(crate) fn tick_monitor(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    saved: &mut Tag,
+) -> bool {
+    let before = read_monitor(saved);
+    let mut state = before.clone();
+    let due = state.tick();
+    if due {
+        // A tick is only asked in the level in place; if none answers (shutdown), keep the last
+        // reading rather than treating the monitor as facing nothing.
+        if let Some(level) = level {
+            let observed = read_target(&*host, level, pos)
+                .and_then(|(target, _read)| energy_at(host, level, target));
+            state.observe(observed);
+        }
+    }
+    let changed = state != before;
+    if changed {
+        write_monitor(saved, &state);
+        if let Some(level) = level {
+            mirror_monitor(host, level, pos, &state);
+        }
+    }
+    changed
+}
+
+/// A state decoded for `block_signal`, cached by ordinal: a state's properties never change.
+#[derive(Clone, Copy)]
+struct MonitorFace {
+    read: Direction,
+    alarm: bool,
+}
+
+static MONITOR_FACES: LazyLock<Mutex<HashMap<BlockState, MonitorFace>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Decode a serialized monitor state into its display face and alarm
+/// (`rftoolspower:power_monitor[facing=east,level=3,lit=true]`).
+pub(crate) fn parse_monitor_state(text: &str) -> Option<(Direction, bool)> {
+    let (block, rest) = text.split_once('[')?;
+    if block != MONITOR {
+        return None;
+    }
+    let mut read = None;
+    let mut alarm = false;
+    for property in rest.strip_suffix(']')?.split(',') {
+        let (key, value) = property.split_once('=')?;
+        match key {
+            KEY_FACING => read = Some(dir_from_name(value)?),
+            KEY_LIT => alarm = value == "true",
+            _ => {}
+        }
+    }
+    Some((read?, alarm))
+}
+
+/// The decoded state, through the cache `block_signal` (asked very often) reads.
+fn monitor_face(level: &dyn LevelHost, state: BlockState) -> Option<MonitorFace> {
+    if let Some(hit) = MONITOR_FACES
+        .lock()
+        .expect("the monitor state cache is never held across a panic")
+        .get(&state)
+    {
+        return Some(*hit);
+    }
+    // The state's `facing` is the display front; the block read is behind it, and the alarm
+    // leaves through the display, so the read side is its opposite.
+    let (display, alarm) = parse_monitor_state(&level.state_string(state)?)?;
+    let face = MonitorFace {
+        read: display.opposite(),
+        alarm,
+    };
+    MONITOR_FACES
+        .lock()
+        .expect("the monitor state cache is never held across a panic")
+        .insert(state, face);
+    Some(face)
+}
+
+/// `block_signal`: the alarm's 15 on the display side while it holds, nothing anywhere else.
+///
+/// Upstream answers only `getSignal` (weak) and leaves `getDirectSignal` at 0; so does this.
+pub(crate) fn monitor_signal(level: &dyn LevelHost, event: &mut BlockSignalEvent) {
+    if event.direct {
+        return;
+    }
+    let Some(face) = monitor_face(level, event.state) else {
+        return;
+    };
+    if face.alarm && event.face == output_face(face.read) {
+        event.signal = ALARM_SIGNAL;
+    }
+}
+
+/// `is_signal_source`: a monitor answers the signal query, so redstone wire connects to it.
+pub(crate) fn monitor_signal_source(level: &dyn LevelHost, event: &mut IsSignalSourceEvent) {
+    if level.state_block(event.state) == Some(MONITOR) {
+        event.source = true;
+    }
+}
+
+/// `LogicSlabBlock.getStateForPlacement`: the placer's look is the monitor's read side.
+pub(crate) fn monitor_placement(
+    level: &dyn LevelHost,
+    event: &StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    if level.state_block(event.state) != Some(MONITOR) {
+        return None;
+    }
+    let read = facing_from_yaw(event.context.yaw);
+    Some(level.state_with_property(event.state, KEY_FACING, dir_name(read)))
+}
+
+/// The monitor's report line, as `/rftoolspower monitor` and a click print it.
+pub(crate) fn monitor_line(
+    pos: [i32; 3],
+    state: &Monitor,
+    target: Option<(&str, Option<(u32, u32)>)>,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let band = if Monitor::band_set(state.minimum, state.maximum) {
+        format!("{}..{}", state.minimum, state.maximum)
+    } else {
+        format!("{}..{} (unset)", state.minimum, state.maximum)
+    };
+    let target = match target {
+        Some((id, Some((stored, max)))) => format!("target={id} stored={stored} max={max}"),
+        Some((id, None)) => format!("target={id} (not an energy block) stored=- max=-"),
+        None => "target=none stored=- max=-".to_owned(),
+    };
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Power Monitor at {},{},{}: level={} band={band} {target} alarm={} t={t}{suffix}",
+        pos[0], pos[1], pos[2], state.level, state.alarm,
+    )
+}
+
+/// The monitor's line for the block at `pos`, or [`NO_MONITOR`].
+pub(crate) fn monitor_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(MONITOR) {
+        return NO_MONITOR.to_owned();
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_MONITOR.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_MONITOR.to_owned();
+    };
+    let state = read_monitor(&Tag::Compound(saved));
+    let target = read_target(&*host, level, pos).map(|(target, _read)| target);
+    let report = target.map(|target| {
+        let id = block_id(&*host, level, target);
+        let energy = energy_at(host, level, target);
+        (id.unwrap_or_else(|| "none".to_owned()), energy)
+    });
+    let t = level.game_time(&*host).unwrap_or(0);
+    let report = report.as_ref().map(|(id, energy)| (id.as_str(), *energy));
+    monitor_line(pos, &state, report, t, nonce)
+}
+
+/// Set a monitor's alarm band (`PowerMonitorData.withMinimum`/`withMaximum`); the next
+/// observation applies it. Answers the line a player reads.
+pub(crate) fn set_band(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    minimum: i32,
+    maximum: i32,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(MONITOR) {
+        return NO_MONITOR.to_owned();
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_MONITOR.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_MONITOR.to_owned();
+    };
+    let mut saved = Tag::Compound(saved);
+    let current = read_monitor(&saved);
+    let banded = Monitor::restored(
+        current.level,
+        minimum,
+        maximum,
+        current.alarm,
+        current.counter,
+    );
+    write_monitor(&mut saved, &banded);
+    if let Tag::Compound(data) = saved {
+        let _ = entity.replace_data(host, data);
+    }
+    let _ = entity.set_changed(&mut *host);
+    format!(
+        "Power Monitor band at {},{},{}: {}..{} (alarm at the next observation)",
+        pos[0], pos[1], pos[2], banded.minimum, banded.maximum
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -330,34 +740,52 @@ pub(crate) fn insert_from_hand(
 // A broken generator keeps its store
 // ---------------------------------------------------------------------------
 
-/// `saved` tagged as the generator's data, under the vanilla component's name: the patch a broken
-/// generator's drop carries (upstream's loot table copies its energy component; this is the
-/// vanilla carrier).
-pub(crate) fn entity_data_patch(saved: &Compound) -> Compound {
+/// `saved` tagged as the block entity type's data, under the vanilla component's name: the patch
+/// a broken block's drop carries (upstream's loot table copies its components; this is the
+/// vanilla carrier, and `TypedEntityData.loadInto` only loads a payload whose `id` names the type).
+pub(crate) fn entity_data_patch(saved: &Compound, type_id: &str) -> Compound {
     let mut payload = saved.clone();
-    payload.insert("id".into(), Tag::String(GENERATOR_TYPE_ID.into()));
+    payload.insert("id".into(), Tag::String(type_id.into()));
     let mut patch = Compound::new();
     patch.insert(BLOCK_ENTITY_DATA.into(), Tag::Compound(payload));
     patch
 }
 
 /// `Hooks::block_drops`: a broken generator keeps its store on its own item, so a player who breaks
-/// a burning or charged generator and places it again does not lose the FE or the burn.
+/// a burning or charged generator and places it again does not lose the FE or the burn; a monitor
+/// keeps its configured alarm band the same way (upstream's `ITEM_POWER_MONITOR_DATA`).
 pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow {
-    if level.state_block(event.state) != Some(GENERATOR) {
-        return Flow::Continue;
-    }
-    let Some(entity) = event.block_entity else {
-        return Flow::Continue;
+    let block = level.state_block(event.state);
+    let patch = match block {
+        Some(GENERATOR) => {
+            let Some(entity) = event.block_entity else {
+                return Flow::Continue;
+            };
+            let Some(saved) = level.block_entity_data(entity) else {
+                return Flow::Continue;
+            };
+            if !crate::runtime::carried(&read_generator(&Tag::Compound(saved.clone()))) {
+                return Flow::Continue;
+            }
+            entity_data_patch(&saved, GENERATOR_TYPE_ID)
+        }
+        Some(MONITOR) => {
+            let Some(entity) = event.block_entity else {
+                return Flow::Continue;
+            };
+            let Some(saved) = level.block_entity_data(entity) else {
+                return Flow::Continue;
+            };
+            // An unconfigured monitor has nothing worth carrying; a configured band does.
+            let state = read_monitor(&Tag::Compound(saved.clone()));
+            if !Monitor::band_set(state.minimum, state.maximum) {
+                return Flow::Continue;
+            }
+            entity_data_patch(&saved, MONITOR_TYPE_ID)
+        }
+        _ => return Flow::Continue,
     };
-    let Some(saved) = level.block_entity_data(entity) else {
-        return Flow::Continue;
-    };
-    if !crate::runtime::carried(&read_generator(&Tag::Compound(saved.clone()))) {
-        return Flow::Continue;
-    }
-    let patch = entity_data_patch(&saved);
-    // The generator's loot is the generator itself, so its store goes on every drop the table made.
+    // The block's loot is the block itself, so its data goes on every drop the table made.
     for drop in event.drops.iter_mut() {
         let _ = drop.stack.apply_components(&patch);
     }
@@ -401,17 +829,152 @@ impl ItemPart for GeneratorItemPart {
     }
 }
 
+/// The monitor item's Part: clamp what a placed item's `block_entity_data` restored.
+pub(crate) struct MonitorItemPart;
+
+#[mod_api::horizon_part]
+impl ItemPart for MonitorItemPart {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        let Some(level) = event
+            .placer
+            .and_then(|player| player.level(&*host))
+            .or_else(|| in_place_level(host))
+        else {
+            return;
+        };
+        if block_id(&*host, level, event.pos).as_deref() != Some(MONITOR) {
+            return;
+        }
+        let Some(entity) = host.block_entity(level, event.pos) else {
+            return;
+        };
+        let Some(saved) = entity.data(&*host) else {
+            return;
+        };
+        let mut saved = Tag::Compound(saved);
+        let current = read_monitor(&saved);
+        let clamped = Monitor::restored(
+            current.level,
+            current.minimum,
+            current.maximum,
+            current.alarm,
+            current.counter,
+        );
+        if clamped == current {
+            return;
+        }
+        write_monitor(&mut saved, &clamped);
+        if let Tag::Compound(data) = saved {
+            let _ = entity.replace_data(host, data);
+        }
+        mirror_monitor(host, level, event.pos, &clamped);
+    }
+}
+
+/// A click on a monitor reads its status in the action bar (there is no GUI in this slice), so
+/// the furnace template's own menu never opens.
+pub(crate) fn monitor_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    if block_id(&*host, level, click.pos).as_deref() != Some(MONITOR) {
+        return None;
+    }
+    let line = monitor_status_line(host, level, click.pos, None);
+    if let Some(player) = host.player(click.player) {
+        let _ = player.action_bar(host, Text::literal(line));
+    }
+    Some(InteractionResult::Success)
+}
+
+/// The Power Monitor: it ticks every 20 ticks against the block it faces and answers redstone on
+/// its display side.
+pub(crate) struct MonitorPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for MonitorPart {
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseItemOnEvent<'_>,
+    ) -> Option<InteractionResult> {
+        monitor_click(host, event.click)
+    }
+
+    fn use_without_item(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseWithoutItemEvent<'_>,
+    ) -> Option<InteractionResult> {
+        monitor_click(host, event.click)
+    }
+
+    /// The placer's look sets the read side; the display is opposite it.
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        monitor_placement(level, event)
+    }
+
+    /// The alarm's 15 on the display side.
+    fn block_signal(&self, level: &dyn LevelHost, event: &mut BlockSignalEvent) {
+        monitor_signal(level, event);
+    }
+
+    /// A monitor answers the signal query, so wire connects to it.
+    fn is_signal_source(&self, level: &dyn LevelHost, event: &mut IsSignalSourceEvent) {
+        monitor_signal_source(level, event);
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for MonitorPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound; the tick fills it.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: it ticks. Never clear a value an earlier mod set.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: count the observation window down, then read the block it faces.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let changed = tick_monitor(host, level, pos, &mut saved);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The command
 // ---------------------------------------------------------------------------
 
-/// `/rftoolspower info <pos> [nonce]`: the harness's readout of one generator (a harness addition;
-/// there is no GUI in this slice).
+/// The mod's commands. `info` and `monitor` are the harness's readouts (there is no GUI in this
+/// slice); `band` sets the monitor's alarm band, the stand-in for upstream's two GUI sliders.
 pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
-    commands.push(Command::op(
+    for usage in [
         "rftoolspower info <pos:block_pos> [nonce:word]",
-        OPERATOR_LEVEL,
-    ));
+        "rftoolspower monitor <pos:block_pos> [nonce:word]",
+        "rftoolspower band <pos:block_pos> <minimum:integer> <maximum:integer>",
+    ] {
+        commands.push(Command::op(usage, OPERATOR_LEVEL));
+    }
 }
 
 /// Whether a command source may read a generator: an operator, or the console (level 4).
@@ -450,35 +1013,72 @@ pub(crate) fn status_line(
     )
 }
 
-/// Run `/rftoolspower info <pos> [nonce]`; `Flow::Cancel` when it was ours.
+/// The running level the command was run in.
+fn command_level(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Option<LevelRef> {
+    host.levels()
+        .list_levels()
+        .into_iter()
+        .find(|level| level.dimension() == event.command.dimension)
+}
+
+/// The harness's nonce, which proves a reply is fresh.
+fn nonce_of<'a>(event: &'a RunModCommandEvent<'_>) -> Option<&'a str> {
+    match event.command.argument("nonce") {
+        Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+        _ => None,
+    }
+}
+
+/// A required integer argument, 0 when it is absent or another kind.
+fn integer_of(event: &RunModCommandEvent<'_>, name: &str) -> i32 {
+    match event.command.argument(name) {
+        Some(CommandArgumentValue::Integer(value)) => *value,
+        _ => 0,
+    }
+}
+
+/// Run `/rftoolspower info|monitor|band …`; `Flow::Cancel` when it was ours.
 pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
     let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
-    if literals.as_slice() != ["rftoolspower", "info"] {
+    let subcommand = match literals.as_slice() {
+        ["rftoolspower", name] => *name,
+        _ => return Flow::Continue,
+    };
+    if !matches!(subcommand, "info" | "monitor" | "band") {
         return Flow::Continue;
     }
     if !may_read(event.source.permission()) {
         let _ = host.commands().feedback(Text::literal(format!(
-            "rftoolspower info needs an operator (permission level {OPERATOR_LEVEL})"
+            "rftoolspower {subcommand} needs an operator (permission level {OPERATOR_LEVEL})"
         )));
         return Flow::Cancel;
     }
     let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
         return Flow::Continue;
     };
-    let Some(level) = host
-        .levels()
-        .list_levels()
-        .into_iter()
-        .find(|level| level.dimension() == event.command.dimension)
-    else {
-        let _ = host.commands().feedback(Text::literal(NO_GENERATOR));
+    let level = command_level(host, event);
+    if level.is_none() {
+        let _ = host.commands().feedback(Text::literal(match subcommand {
+            "monitor" => NO_MONITOR,
+            "band" => NO_MONITOR,
+            _ => NO_GENERATOR,
+        }));
+        return Flow::Cancel;
+    }
+    let Some(level) = level else {
         return Flow::Cancel;
     };
-    let nonce = match event.command.argument("nonce") {
-        Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
-        _ => None,
+    let line = match subcommand {
+        "info" => status_line(host, level, *pos, nonce_of(event)),
+        "monitor" => monitor_status_line(host, level, *pos, nonce_of(event)),
+        _ => set_band(
+            host,
+            level,
+            *pos,
+            integer_of(event, "minimum"),
+            integer_of(event, "maximum"),
+        ),
     };
-    let line = status_line(host, level, *pos, nonce);
     let _ = host.commands().feedback(Text::literal(line));
     Flow::Cancel
 }
@@ -547,7 +1147,7 @@ impl BlockEntityPart for GeneratorPart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{COAL_BLOCK_TICKS, TICKS_PER_COAL};
+    use crate::runtime::{COAL_BLOCK_TICKS, MAX_LEVEL, PERCENT, TICKS_PER_COAL};
 
     fn compound() -> Tag {
         Tag::Compound(Compound::new())
@@ -650,7 +1250,6 @@ mod tests {
     fn the_command_is_the_readout_at_the_operator_level() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 1);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the harness's spelling, with the three words parsed as one block position"
@@ -683,7 +1282,7 @@ mod tests {
         let Tag::Compound(saved) = saved else {
             panic!("write_generator keeps the compound");
         };
-        let patch = Tag::Compound(entity_data_patch(&saved));
+        let patch = Tag::Compound(entity_data_patch(&saved, GENERATOR_TYPE_ID));
         let Some(Tag::Compound(payload)) = patch.get(BLOCK_ENTITY_DATA) else {
             panic!("the patch names the vanilla component");
         };
@@ -698,5 +1297,145 @@ mod tests {
             state,
             "the item carries exactly the FE and burn the machine held"
         );
+    }
+
+    // --- the power monitor -------------------------------------------------
+
+    #[test]
+    fn the_monitors_saved_state_reads_back_and_a_doctored_one_is_clamped() {
+        let mut saved = compound();
+        assert_eq!(read_monitor(&saved), Monitor::new(), "a fresh monitor");
+        let state = Monitor::restored(3, 40, 60, true, 7);
+        write_monitor(&mut saved, &state);
+        assert_eq!(read_monitor(&saved), state);
+        assert_eq!(saved.get(KEY_LEVEL), Some(&Tag::Int(3)));
+        assert_eq!(saved.get(KEY_MINIMUM), Some(&Tag::Int(40)));
+        assert_eq!(saved.get(KEY_MAXIMUM), Some(&Tag::Int(60)));
+        assert_eq!(saved.get(KEY_ALARM), Some(&Tag::Byte(1)));
+        assert_eq!(saved.get(KEY_COUNTER), Some(&Tag::Int(7)));
+
+        let mut doctored = compound();
+        set_int(&mut doctored, KEY_LEVEL, 12);
+        set_int(&mut doctored, KEY_MINIMUM, -20);
+        set_int(&mut doctored, KEY_MAXIMUM, 900);
+        set_int(&mut doctored, KEY_COUNTER, 0);
+        let read = read_monitor(&doctored);
+        assert_eq!(read.level, MAX_LEVEL);
+        assert_eq!((read.minimum, read.maximum), (0, PERCENT as i32));
+        assert_eq!(read.counter, 1, "a zero counter is due next tick");
+    }
+
+    #[test]
+    fn the_monitor_readout_is_the_line_the_e2e_asserts() {
+        let state = Monitor::restored(3, 0, 0, false, 20);
+        assert_eq!(
+            monitor_line(
+                [303, 101, 0],
+                &state,
+                Some((MONITOR_GENERATOR_LINE, Some((250_000, 500_000)))),
+                324,
+                Some("1")
+            ),
+            "Power Monitor at 303,101,0: level=3 band=0..0 (unset) \
+             target=rftoolspower:coalgenerator stored=250000 max=500000 alarm=false t=324 nonce=1"
+        );
+        assert_eq!(
+            monitor_line(
+                [303, 101, -6],
+                &Monitor::restored(0, 40, 60, false, 20),
+                Some(("minecraft:stone", None)),
+                7,
+                None
+            ),
+            "Power Monitor at 303,101,-6: level=0 band=40..60 \
+             target=minecraft:stone (not an energy block) stored=- max=- alarm=false t=7"
+        );
+    }
+
+    /// The test's target id, a constant so the expected line reads as upstream's block.
+    const MONITOR_GENERATOR_LINE: &str = "rftoolspower:coalgenerator";
+
+    #[test]
+    fn the_display_face_is_set_from_the_placer_and_the_alarm_leaves_through_it() {
+        assert_eq!(facing_from_yaw(0.0), Direction::South);
+        assert_eq!(facing_from_yaw(90.0), Direction::West);
+        assert_eq!(facing_from_yaw(180.0), Direction::North);
+        assert_eq!(facing_from_yaw(-90.0), Direction::East);
+        assert_eq!(facing_from_yaw(270.0), Direction::East);
+        for read in [
+            Direction::North,
+            Direction::South,
+            Direction::West,
+            Direction::East,
+        ] {
+            assert_eq!(
+                output_face(read),
+                read.opposite(),
+                "the alarm leaves through the display face, opposite the block the monitor reads"
+            );
+        }
+        // A placer looking west is the monitor's display side: the watched machine is east.
+        assert_eq!(Direction::West.opposite(), Direction::East);
+    }
+
+    #[test]
+    fn a_monitor_state_decodes_its_read_side_and_alarm() {
+        assert_eq!(
+            parse_monitor_state("rftoolspower:power_monitor[facing=west,level=3,lit=true]"),
+            Some((Direction::West, true))
+        );
+        assert_eq!(
+            parse_monitor_state("rftoolspower:power_monitor[facing=east,level=0,lit=false]"),
+            Some((Direction::East, false))
+        );
+        assert_eq!(
+            parse_monitor_state("minecraft:furnace[facing=west,lit=true]"),
+            None,
+            "another block's state is not a monitor"
+        );
+        assert_eq!(parse_monitor_state("rftoolspower:power_monitor"), None);
+    }
+
+    #[test]
+    fn the_commands_are_the_three_the_harness_types() {
+        let mut commands = Vec::new();
+        declare_commands(&mut commands);
+        assert_eq!(commands.len(), 3);
+        assert_eq!(
+            commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
+            "the generator readout stays as it was"
+        );
+        assert_eq!(
+            commands[1].usage,
+            "rftoolspower monitor <pos:block_pos> [nonce:word]"
+        );
+        assert_eq!(
+            commands[2].usage,
+            "rftoolspower band <pos:block_pos> <minimum:integer> <maximum:integer>",
+            "the band is set the way upstream's GUI sliders set it"
+        );
+        for command in &commands {
+            assert_eq!(command.level, OPERATOR_LEVEL);
+        }
+    }
+
+    #[test]
+    fn a_broken_monitors_band_rides_on_its_item_tagged_with_the_monitor_type() {
+        let mut saved = compound();
+        let state = Monitor::restored(3, 40, 60, false, 11);
+        write_monitor(&mut saved, &state);
+        let Tag::Compound(saved) = saved else {
+            panic!("write_monitor keeps the compound");
+        };
+        let patch = Tag::Compound(entity_data_patch(&saved, MONITOR_TYPE_ID));
+        let Some(Tag::Compound(payload)) = patch.get(BLOCK_ENTITY_DATA) else {
+            panic!("the patch names the vanilla component");
+        };
+        let payload = Tag::Compound(payload.clone());
+        assert_eq!(
+            payload.get("id"),
+            Some(&Tag::String(MONITOR_TYPE_ID.into()))
+        );
+        assert_eq!(read_monitor(&payload), state);
     }
 }

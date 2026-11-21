@@ -171,6 +171,144 @@ pub const fn carried(state: &Generator) -> bool {
     state.energy > 0 || state.burn > 0
 }
 
+// ---------------------------------------------------------------------------
+// The power monitor (`PowerMonitorTileEntity`)
+// ---------------------------------------------------------------------------
+
+/// The steps the monitor's level adds above an empty store (upstream's `stored * 5 / max`).
+pub const LEVEL_STEPS: u32 = 5;
+/// The highest level a monitor shows; upstream clamps the ratio to 1..=5.
+pub const MAX_LEVEL: i32 = 5;
+/// Ticks between two observations (upstream's `counter = 20`).
+pub const OBSERVE_TICKS: u32 = 20;
+/// The band's scale: percentages, as upstream's GUI reads them (`stored * 100 / max`).
+pub const PERCENT: u32 = 100;
+
+/// The monitor's saved state: the level it shows, its alarm band and the tick counter.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Monitor {
+    /// The level the `level` block state mirrors, 0…[`MAX_LEVEL`].
+    pub level: i32,
+    /// The band's lower percentage; both 0 is upstream's unconfigured default.
+    pub minimum: i32,
+    /// The band's upper percentage.
+    pub maximum: i32,
+    /// Whether the band held at the last observation (the `lit` state and the signal).
+    pub alarm: bool,
+    /// Ticks left until the next observation.
+    pub counter: u32,
+}
+
+impl Monitor {
+    /// A fresh monitor: level 0, band 0..0 (unset), no alarm, an observation due in 20 ticks.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            level: 0,
+            minimum: 0,
+            maximum: 0,
+            alarm: false,
+            counter: OBSERVE_TICKS,
+        }
+    }
+
+    /// The level upstream's tick sets: `1 + stored * 5 / capacity`, clamped to 1…=5, and 0 when
+    /// the target has no capacity (upstream leaves the ratio at 0 when `maxEnergy <= 0`).
+    #[must_use]
+    pub fn ratio(stored: u32, capacity: u32) -> i32 {
+        if capacity == 0 {
+            return 0;
+        }
+        // u64: `stored * 5` overflows a u32 for a doctored store above ~859 million FE.
+        let steps = u64::from(stored) * u64::from(LEVEL_STEPS) / u64::from(capacity);
+        i32::try_from(1 + steps)
+            .unwrap_or(MAX_LEVEL)
+            .clamp(1, MAX_LEVEL)
+    }
+
+    /// The percentage upstream's alarm compares: `stored * 100 / capacity`, 0 with no capacity.
+    #[must_use]
+    pub fn percentage(stored: u32, capacity: u32) -> i32 {
+        if capacity == 0 {
+            return 0;
+        }
+        i32::try_from(u64::from(stored) * u64::from(PERCENT) / u64::from(capacity))
+            .unwrap_or(i32::MAX)
+    }
+
+    /// Whether a band is configured. A band of 0..0 is upstream's unconfigured default; with no
+    /// GUI in this slice the port reads it as "no alarm" rather than "alarm at exactly 0 %".
+    #[must_use]
+    pub const fn band_set(minimum: i32, maximum: i32) -> bool {
+        !(minimum == 0 && maximum == 0)
+    }
+
+    /// Whether `stored` of `capacity` is inside the band.
+    #[must_use]
+    pub fn alarm(stored: u32, capacity: u32, minimum: i32, maximum: i32) -> bool {
+        if capacity == 0 || !Self::band_set(minimum, maximum) {
+            return false;
+        }
+        let percentage = Self::percentage(stored, capacity);
+        percentage >= minimum && percentage <= maximum
+    }
+
+    /// A monitor a saved compound describes, with every doctored value clamped.
+    #[must_use]
+    pub fn restored(level: i32, minimum: i32, maximum: i32, alarm: bool, counter: u32) -> Self {
+        let level = level.clamp(0, MAX_LEVEL);
+        let minimum = minimum.clamp(0, PERCENT as i32);
+        let maximum = maximum.clamp(0, PERCENT as i32);
+        let (minimum, maximum) = if minimum <= maximum {
+            (minimum, maximum)
+        } else {
+            (maximum, minimum)
+        };
+        Self {
+            // A saved alarm flag under no level describes nothing; the next observation sets it.
+            alarm: alarm && level > 0,
+            level,
+            minimum,
+            maximum,
+            counter: counter.clamp(1, OBSERVE_TICKS),
+        }
+    }
+
+    /// One server tick: count down; true when this tick is an observation and the counter reset.
+    pub fn tick(&mut self) -> bool {
+        self.counter = self.counter.saturating_sub(1);
+        if self.counter == 0 {
+            self.counter = OBSERVE_TICKS;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply one observation: `None` when the facing block has no energy capability (upstream's
+    /// `setInvalid`), else its store and capacity. Returns whether the level or the alarm changed.
+    pub fn observe(&mut self, target: Option<(u32, u32)>) -> bool {
+        let before = (self.level, self.alarm);
+        match target {
+            None => {
+                self.level = 0;
+                self.alarm = false;
+            }
+            Some((stored, capacity)) => {
+                self.level = Self::ratio(stored, capacity);
+                self.alarm = Self::alarm(stored, capacity, self.minimum, self.maximum);
+            }
+        }
+        (self.level, self.alarm) != before
+    }
+}
+
+/// What one neighbour of the generator is offered this tick: `min(stored, send)`.
+#[must_use]
+pub fn send_amount(stored: i32, send_per_tick: i32) -> u32 {
+    u32::try_from(stored.max(0).min(send_per_tick.max(0))).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +477,181 @@ mod tests {
         assert_eq!(
             Fuel::CoalBlock.burn_ticks() * u32::try_from(FE_PER_TICK).unwrap(),
             324_000
+        );
+    }
+
+    // --- the power monitor -------------------------------------------------
+
+    #[test]
+    fn the_ratio_is_one_plus_five_steps_of_charge() {
+        assert_eq!(Monitor::ratio(0, 500_000), 1, "an empty battery is level 1");
+        assert_eq!(Monitor::ratio(100_000, 500_000), 2, "a fifth is level 2");
+        assert_eq!(
+            Monitor::ratio(250_000, 500_000),
+            3,
+            "half is level 3 — the leg's 250,000 FE"
+        );
+        assert_eq!(
+            Monitor::ratio(400_000, 500_000),
+            5,
+            "four fifths is level 5"
+        );
+        assert_eq!(
+            Monitor::ratio(500_000, 500_000),
+            5,
+            "a full battery clamps at 5, never 6"
+        );
+        assert_eq!(
+            Monitor::ratio(900_000, 500_000),
+            5,
+            "a doctored store above the capacity still clamps"
+        );
+        assert_eq!(
+            Monitor::ratio(0, 0),
+            0,
+            "no capacity is no reading — upstream's maxEnergy > 0 guard"
+        );
+        assert_eq!(Monitor::ratio(5, 0), 0);
+    }
+
+    #[test]
+    fn the_percentage_is_upstreams_integer_percentage() {
+        assert_eq!(Monitor::percentage(250_000, 500_000), 50);
+        assert_eq!(Monitor::percentage(100_000, 500_000), 20);
+        assert_eq!(
+            Monitor::percentage(1, 3),
+            33,
+            "integer division, as upstream"
+        );
+        assert_eq!(Monitor::percentage(0, 500_000), 0);
+        assert_eq!(Monitor::percentage(5, 0), 0, "no capacity is no percentage");
+    }
+
+    #[test]
+    fn an_unconfigured_band_never_alarms() {
+        assert!(!Monitor::band_set(0, 0), "upstream's default is 0..0");
+        assert!(Monitor::band_set(0, 100));
+        assert!(Monitor::band_set(40, 60));
+        for stored in [0, 1, 250_000, 500_000] {
+            assert!(
+                !Monitor::alarm(stored, 500_000, 0, 0),
+                "{stored} FE: the unset band is silent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_band_alarms_inside_it_and_not_at_its_edges_outside() {
+        assert!(
+            Monitor::alarm(250_000, 500_000, 40, 60),
+            "50 % is inside 40..60"
+        );
+        assert!(
+            !Monitor::alarm(100_000, 500_000, 40, 60),
+            "20 % is below the band"
+        );
+        assert!(
+            !Monitor::alarm(400_000, 500_000, 40, 60),
+            "80 % is above the band"
+        );
+        assert!(
+            Monitor::alarm(200_000, 500_000, 40, 60),
+            "40 % is inclusive, as upstream's >= minimum"
+        );
+        assert!(
+            Monitor::alarm(300_000, 500_000, 40, 60),
+            "60 % is inclusive, as upstream's <= maximum"
+        );
+        assert!(
+            !Monitor::alarm(0, 0, 40, 60),
+            "a capacity of 0 has no percentage"
+        );
+    }
+
+    #[test]
+    fn the_observation_runs_every_twenty_ticks() {
+        let mut monitor = Monitor::new();
+        assert_eq!(monitor.counter, OBSERVE_TICKS);
+        for tick in 1..OBSERVE_TICKS {
+            assert!(!monitor.tick(), "tick {tick} is not the observation");
+        }
+        assert!(monitor.tick(), "the twentieth tick observes");
+        assert_eq!(monitor.counter, OBSERVE_TICKS, "the counter resets");
+        for _ in 1..OBSERVE_TICKS {
+            assert!(!monitor.tick());
+        }
+        assert!(monitor.tick(), "and the next window observes again");
+    }
+
+    #[test]
+    fn an_observation_only_says_changed_when_the_state_moved() {
+        let mut monitor = Monitor::new();
+        assert!(
+            monitor.observe(Some((250_000, 500_000))),
+            "level 0 -> 3 is a change"
+        );
+        assert_eq!(monitor.level, 3);
+        assert!(!monitor.alarm, "an unset band stays silent");
+        assert!(
+            !monitor.observe(Some((250_000, 500_000))),
+            "the same store changes nothing"
+        );
+        assert!(
+            monitor.observe(None),
+            "a target that is not an energy block is a change"
+        );
+        assert_eq!(monitor.level, 0, "upstream's setInvalid sets level 0");
+        assert!(!monitor.alarm);
+        assert!(
+            !monitor.observe(None),
+            "and staying invalid changes nothing"
+        );
+        assert!(monitor.observe(Some((0, 500_000))));
+        assert_eq!(monitor.level, 1, "an empty battery is level 1");
+    }
+
+    #[test]
+    fn a_band_reaches_the_alarm_on_the_next_observation() {
+        let mut monitor = Monitor::restored(3, 40, 60, false, 1);
+        assert!(
+            monitor.observe(Some((250_000, 500_000))),
+            "50 % is in the band"
+        );
+        assert!(monitor.alarm);
+        assert!(
+            monitor.observe(Some((100_000, 500_000))),
+            "leaving the band is a change"
+        );
+        assert!(!monitor.alarm, "20 % is out of the band");
+        assert_eq!(monitor.level, 2, "and the level followed the store");
+    }
+
+    #[test]
+    fn a_doctored_monitor_is_clamped() {
+        let high = Monitor::restored(9, -10, 500, true, 0);
+        assert_eq!(high.level, MAX_LEVEL, "no level above 5");
+        assert_eq!(high.minimum, 0, "no percentage below 0");
+        assert_eq!(high.maximum, PERCENT as i32, "no percentage above 100");
+        assert_eq!(high.counter, 1, "a zero counter is due on the next tick");
+        let low = Monitor::restored(-4, 0, 0, false, 999);
+        assert_eq!(low.level, 0);
+        assert_eq!(low.counter, OBSERVE_TICKS, "no counter beyond one window");
+        let swapped = Monitor::restored(3, 80, 20, false, 5);
+        assert!(
+            swapped.minimum <= swapped.maximum,
+            "a reversed band is ordered, not left impossible"
+        );
+    }
+
+    #[test]
+    fn the_generator_offers_at_most_its_send_and_never_more_than_it_holds() {
+        assert_eq!(send_amount(10_000, EXTRACT_PER_TICK), 2_000);
+        assert_eq!(send_amount(500, EXTRACT_PER_TICK), 500);
+        assert_eq!(send_amount(0, EXTRACT_PER_TICK), 0);
+        assert_eq!(
+            send_amount(-5, EXTRACT_PER_TICK),
+            0,
+            "a negative store is empty"
         );
     }
 }

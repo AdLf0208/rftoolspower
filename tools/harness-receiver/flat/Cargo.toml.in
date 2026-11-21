@@ -1,0 +1,12 @@
+[package]
+# The e2e's energy receiver: a bare block with a `ModEnergyBuffer`, so the coal generator's
+# `handleSendingEnergy` can be proven against something that remembers what it took. Not shipped
+# in `rftoolspower.hmod`; the leg builds it beside the package.
+name = "rfpowerharness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }

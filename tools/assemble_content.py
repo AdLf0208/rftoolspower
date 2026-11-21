@@ -44,6 +44,7 @@ POWER = JARS / "rftoolspower-1.21-7.0.6.jar"
 BASE = JARS / "rftoolsbase-1.21-6.0.11.jar"
 
 BLOCK = "coalgenerator"
+MONITOR = "power_monitor"
 PLAIN_CUBE = {
     "parent": "minecraft:block/cube",
     "textures": {
@@ -55,6 +56,95 @@ PLAIN_CUBE = {
         "north": "rftoolspower:block/coalgenerator",
         "south": "rftoolspower:block/base/machineside",
     },
+}
+
+
+def monitor_cube(level: int) -> dict:
+    """The monitor's cube for one level: the screen is the model's `north` face."""
+    return {
+        "parent": "minecraft:block/cube",
+        "textures": {
+            "particle": "rftoolspower:block/base/machineside",
+            "down": "rftoolspower:block/base/machinebottom",
+            "up": "rftoolspower:block/base/machinetop",
+            "east": "rftoolspower:block/base/machineside",
+            "west": "rftoolspower:block/base/machineside",
+            "north": f"rftoolspower:block/monitor/{MONITOR}{level}",
+            "south": "rftoolspower:block/base/machineside",
+        },
+    }
+
+
+# `facing` is the monitor's **read side** (the block it monitors, set from the placer's look);
+# the model's `north` face is the screen, so it is rotated onto the opposite side. `y=90` turns
+# the model's north face east, as vanilla's furnace blockstate does.
+MONITOR_ROTATION = {"south": 0, "west": 90, "north": 180, "east": 270}
+
+MONITOR_DECL = {
+    "template": "minecraft:furnace",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "state_properties": {
+        "level": {"type": "enum", "values": ["0", "1", "2", "3", "4", "5"]},
+    },
+    "default_state": {"level": "0"},
+    "item": True,
+}
+
+# `MonitorModule.initDatagen`: " P " / "rAr" / " R " — comparator, machine base, redstone and a
+# redstone block (McJtyLib's recipe builder defines `r` as redstone and `R` as a redstone block).
+MONITOR_RECIPE = {
+    "type": "minecraft:crafting_shaped",
+    "category": "misc",
+    "key": {
+        "P": "minecraft:comparator",
+        "A": "rftoolsbase:machine_base",
+        "r": "minecraft:redstone",
+        "R": "minecraft:redstone_block",
+    },
+    "pattern": [" P ", "rAr", " R "],
+    "result": {"count": 1, "id": "rftoolspower:power_monitor"},
+}
+
+MONITOR_LOOT = {
+    "type": "minecraft:block",
+    "pools": [
+        {
+            "bonus_rolls": 0.0,
+            "entries": [
+                {
+                    "type": "minecraft:item",
+                    "functions": [
+                        {"function": "minecraft:copy_name", "source": "block_entity"}
+                    ],
+                    "name": "rftoolspower:power_monitor",
+                }
+            ],
+            "name": "power_monitor",
+            "rolls": 1.0,
+        }
+    ],
+    "random_sequence": "rftoolspower:blocks/power_monitor",
+}
+
+MONITOR_ADVANCEMENT = {
+    "parent": "minecraft:recipes/root",
+    "criteria": {
+        "base": {
+            "conditions": {"items": [{"items": "rftoolsbase:machine_base"}]},
+            "trigger": "minecraft:inventory_changed",
+        },
+        "has_the_recipe": {
+            "conditions": {"recipe": "rftoolspower:power_monitor"},
+            "trigger": "minecraft:recipe_unlocked",
+        },
+    },
+    "requirements": [["has_the_recipe", "base"]],
+    "rewards": {"recipes": ["rftoolspower:power_monitor"]},
 }
 
 # The block, as `mcjty.lib.builder.BlockBuilder` + McJtyLib's STANDARD_IRON describe it: a full cube
@@ -123,19 +213,26 @@ ADVANCEMENT = {
 
 LANG = {
     "block.rftoolspower.coalgenerator": "Coal Generator",
+    "block.rftoolspower.power_monitor": "Power Monitor",
     "itemGroup.rftoolspower": "RFTools Power",
     "message.rftoolspower.shiftmessage": "<Press Shift>",
 }
 
 CREATIVE_TAB = {
     "icon": "rftoolspower:coalgenerator",
-    "items": ["rftoolspower:coalgenerator"],
+    "items": ["rftoolspower:coalgenerator", "rftoolspower:power_monitor"],
     "title": "itemGroup.rftoolspower",
 }
 
 TAGS = {
-    "data/minecraft/tags/block/mineable/pickaxe.json": ["rftoolspower:coalgenerator"],
-    "data/minecraft/tags/block/needs_iron_tool.json": ["rftoolspower:coalgenerator"],
+    "data/minecraft/tags/block/mineable/pickaxe.json": [
+        "rftoolspower:coalgenerator",
+        "rftoolspower:power_monitor",
+    ],
+    "data/minecraft/tags/block/needs_iron_tool.json": [
+        "rftoolspower:coalgenerator",
+        "rftoolspower:power_monitor",
+    ],
 }
 
 
@@ -180,6 +277,37 @@ def build(out: Path) -> None:
     write(out / f"data/rftoolspower/advancement/recipes/misc/{BLOCK}.json", ADVANCEMENT)
     for path, values in TAGS.items():
         write(out / path, {"values": values})
+
+    # --- the power monitor: one cube per level, a facing/level/lit blockstate, its item
+    variants = {}
+    for facing, rotation in MONITOR_ROTATION.items():
+        for level in range(6):
+            for lit in ("false", "true"):
+                variants[f"facing={facing},level={level},lit={lit}"] = {
+                    "model": f"rftoolspower:block/{MONITOR}{level}",
+                    "y": rotation,
+                }
+    write(out / f"assets/rftoolspower/blockstates/{MONITOR}.json", {"variants": variants})
+    for level in range(6):
+        write(out / f"assets/rftoolspower/models/block/{MONITOR}{level}.json", monitor_cube(level))
+    write(
+        out / f"assets/rftoolspower/models/item/{MONITOR}.json",
+        {"parent": f"rftoolspower:block/{MONITOR}5"},
+    )
+    write(
+        out / f"assets/rftoolspower/items/{MONITOR}.json",
+        {"model": {"model": f"rftoolspower:item/{MONITOR}", "type": "minecraft:model"}},
+    )
+    for level in range(6):
+        binary(
+            out / f"assets/rftoolspower/textures/block/monitor/{MONITOR}{level}.png",
+            read_jar(POWER, f"assets/rftoolspower/textures/block/monitor/{MONITOR}{level}.png"),
+        )
+
+    write(out / f"data/rftoolspower/horizon/block/{MONITOR}.json", MONITOR_DECL)
+    write(out / f"data/rftoolspower/loot_table/blocks/{MONITOR}.json", MONITOR_LOOT)
+    write(out / f"data/rftoolspower/recipe/{MONITOR}.json", MONITOR_RECIPE)
+    write(out / f"data/rftoolspower/advancement/recipes/misc/{MONITOR}.json", MONITOR_ADVANCEMENT)
 
 
 def write(path: Path, value: object) -> None:

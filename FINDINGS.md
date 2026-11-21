@@ -38,6 +38,18 @@ the store survives a break through the loot table's `copy_components` (`mcjtylib
 `mcjtylib:item_inventory`, `mcjtylib:infusable`), which this port expresses as the vanilla
 `minecraft:block_entity_data` component.
 
+## Slice 2: the power monitor and `handleSendingEnergy` (read for the same commits)
+
+| File | What it gave |
+|---|---|
+| `modules/monitor/blocks/PowerMonitorTileEntity.java` | the 20-tick counter; the `LEVEL` property (0–5); `getFacing(...).getInputSide()`; the energy read through `EnergyTools`; `ratio = 1 + stored * 5 / maxEnergy` clamped 1..5; `percentage = stored * 100 / maxEnergy` and the alarm inside `[minimum, maximum]`; `setInvalid()` (level 0, redstone 0); `support.setRedstoneState(this, 15/0)`; the item component `ITEM_POWER_MONITOR_DATA` |
+| `modules/monitor/data/PowerMonitorData.java` | the saved trio `rflevel`, `minimum`, `maximum` (minimum/maximum are bytes; the module's default is `0, 0`) |
+| `modules/monitor/MonitorModule.java` | the recipe (`" P "`, `"rAr"`, `" R "` with McJtyLib's default `r` = redstone, `R` = redstone block) and the six level textures |
+| `mcjtylib/.../LogicSupport.java` | `getRedstoneOutput` answers only on `getInputSide()`, while `setRedstoneState` notifies `getInputSide().getOpposite()` — the disagreement the port resolves towards the display face (see `notes.md`, "Upstream defect fixed") |
+| `mcjtylib/.../LogicSlabBlock.java`, `varia/LogicFacing.java` | the logic slab's 24-way placement and the input side; the port uses a full cube with a four-way display front (a recorded simplification) |
+| `modules/generator/blocks/CoalGeneratorTileEntity.java` (`tickServer`, `handleSendingEnergy`) + `mcjtylib/.../EnergyTools.java` | the push: for each of six directions, `min(SENDPERTICK, stored)` into the neighbour's energy handler on the face toward the generator, the store consumed by what was received; per neighbour, not shared; before generation |
+| `modules/monitor/blocks/PowerLevelTileEntity.java` | the sibling display (ratio 0..9 straight to redstone); **not** ported, left in gap 10 |
+
 ## Family inventory (the rest of the mod)
 
 From `unzip -l` of the jar plus the module classes: coal generator; powercell `cell1/2/3` with the

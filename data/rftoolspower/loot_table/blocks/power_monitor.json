@@ -1,0 +1,23 @@
+{
+  "pools": [
+    {
+      "bonus_rolls": 0.0,
+      "entries": [
+        {
+          "functions": [
+            {
+              "function": "minecraft:copy_name",
+              "source": "block_entity"
+            }
+          ],
+          "name": "rftoolspower:power_monitor",
+          "type": "minecraft:item"
+        }
+      ],
+      "name": "power_monitor",
+      "rolls": 1.0
+    }
+  ],
+  "random_sequence": "rftoolspower:blocks/power_monitor",
+  "type": "minecraft:block"
+}

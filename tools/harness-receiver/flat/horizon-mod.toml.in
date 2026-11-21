@@ -1,0 +1,19 @@
+# An e2e-only block: a bare energy buffer for the rftoolspower leg to push into.
+#
+# This package is NOT part of the delivered `rftoolspower.hmod`. It exists because the mod's own
+# receiver, the powercell, is blocked on the smart wrench, and a power monitor is a display with
+# no buffer — so the only way to prove `handleSendingEnergy` in game is to give the generator a
+# neighbour that answers the energy capability and remembers what it took.
+id = "rfpowerharness"
+name = "RFTools Power e2e receiver"
+version = "0.1.0"
+description = "A 100,000 FE test receiver for the rftoolspower e2e only. Never shipped."
+authors = ["Horizon native mod contributors"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

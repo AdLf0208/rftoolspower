@@ -1,12 +1,10 @@
-# RFTools Power — port notes (slice 1: the coal generator)
+# RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor)
 
-> **Current state (2026-11-21): slice 1, package 0.1.0 at pin
-> `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** This is the port's
-> **first** slice, not a continuation: `ports/rftoolspower/` did not exist when the wave-1121 brief
-> was written, so the brief's "next slice after `pending`" had no gap list to read. The slice is
-> therefore chosen from the jar's own inventory and the upstream repository, the way
-> `refinedtypes` (§0ak) and `rftoolsbuilder` (wave 5) were dispatched — and it is one family, not
-> the whole mod.
+> **Current state (2026-11-21): slice 2, package 0.1.1 at pin
+> `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
+> generator; slice 2 adds the **Power Monitor** and the generator's **energy push**
+> (`handleSendingEnergy`), from the port's own gap list (gaps 1 and 10). The 0.1.0 package is in
+> review upstream; 0.1.1 is the same entry's next version.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -28,8 +26,9 @@ MIT (`5195ba53…4b00`), and the provenance is in [`LICENSE-NOTICE.md`](LICENSE-
 [`CONTENT.md`](CONTENT.md). Publishable as a first publication under MIT with this source, subject
 to the campaign's maintainer approval (ARCHITECTURE.md §8).
 
-Status: **ported-partial** — the coal generator family is implemented and verified in game at the
-current pin; A–M of the e2e are green. The gap list below is the rest of the mod.
+Status: **ported-partial** — the coal generator (A–M) and the power monitor plus the generator's
+energy push (N–T) are implemented and verified in game at the current pin. The gap list below is
+the rest of the mod.
 
 ## Class + tier and the approach
 
@@ -91,6 +90,18 @@ current pin; A–M of the e2e are green. The gap list below is the rest of the m
 | block properties | 2.0 / 2.0, pickaxe, iron sound | McJtyLib `BlockBuilder.STANDARD_IRON` (`CoalGeneratorTileEntity.createBlock`) |
 | recipe | 4 coals / 2 redstone torches / a machine frame | `CoalGeneratorModule.initDatagen` `"cTc"/"cFc"/"cTc"` |
 
+Slice 2 adds:
+
+| Number | Value | Source |
+|---|---:|---|
+| monitor observation | every 20 ticks | `PowerMonitorTileEntity.tickServer` (`counter = 20`) |
+| monitor levels | 0..=5 | `IntegerProperty.create("level", 0, 5)`; `1 + stored*5/max` clamped to 1..=5 |
+| alarm band | percentages 0..100, default 0..0 | `PowerMonitorData(minimum, maximum)` and `stored * 100 / maxEnergy` |
+| alarm signal | 15 | `support.setRedstoneState(this, inAlarm ? 15 : 0)` |
+| monitor durability | 2.0 / 2.0, pickaxe, iron sound | McJtyLib `BlockBuilder` default (`PowerMonitorTileEntity.createBlock`) |
+| monitor recipe | comparator / redstone / machine base / redstone block (`" P "`, `"rAr"`, `" R "`) | `MonitorModule.initDatagen` with McJtyLib's `r`/`R` defaults |
+| push budget | 2,000 FE a tick **a neighbour** | `CoalGeneratorConfig.SENDPERTICK`, `EnergyTools.handleSendingEnergy` |
+
 ## Red → green (unit, verbatim)
 
 The six rules were stubbed `todo!()` behind their tests first; the failing run is
@@ -144,6 +155,121 @@ The parsed assertions, each from a `ctl` reply:
 Counterfactual: `SELFTEST=1` inverts C and the leg fails as designed, so C can fail. D is the
 differential for C (no fuel → no FE), and the control leg proves A is not vacuous.
 
+## Slice 2 — the power monitor and the generator's energy push (package 0.1.1)
+
+Gap lines it comes from (`## Gaps` below): **gap 1** — *"the generator itself does not push yet"* —
+and **gap 10** — *"the power monitor and power level"* (the monitor taken; the power level stays).
+Tier: still **machines**; a block entity with a 20-tick server tick, one block state property and a
+redstone output. No GUI, no renderer, no linking item, no side modes.
+
+### What it does (upstream `PowerMonitorTileEntity`, 1.21-7.0.6, and `handleSendingEnergy`)
+
+- **Read**: every 20 ticks (`counter = 20`) read the block **behind the monitor's display front**
+  through the energy capability. The display front (`facing`) is set facing the placer on
+  placement, as a furnace's is; the monitored block is the one the monitor is mounted on, which is
+  upstream's logic-slab **input side**. The energy capability is asked with no side (`null`
+  upstream).
+- **Level**: `ratio = 1 + stored * 5 / capacity` in integer arithmetic, clamped to 1..=5, mirrored
+  into the block state's `level` (0..=5). **0** when the block has no energy capability or a
+  capacity of 0 — upstream's `if (maxEnergy > 0)` guard, which is why stone reads level 0 and an
+  empty generator reads 1.
+- **Alarm**: `percentage = stored * 100 / capacity`; the alarm is true when it is inside
+  `[minimum, maximum]`. Mirrored into the furnace template's `lit` state. A band of **0..0** is
+  upstream's unconfigured default and is read as *unset*: with no GUI in this slice, 0..0 as "alarm
+  at exactly 0 %" would silently make every fresh monitor signal on an empty battery. The band is
+  read and set by `/rftoolspower monitor` and `/rftoolspower band`, the harness's stand-in for the
+  GUI's two sliders.
+- **Redstone**: 15 on the **display face** (opposite the monitored block) while the alarm holds,
+  0 elsewhere; only `getSignal` (weak), as upstream leaves `getDirectSignal` at 0. The state change
+  notifies the neighbours, so a lamp beside it lights on the next observation.
+- **The item**: a broken monitor carries its configured band in its own item's
+  `minecraft:block_entity_data` (upstream's `ITEM_POWER_MONITOR_DATA`), clamped when placed.
+- **The push** (`CoalGeneratorTileEntity.tickServer` → `handleSendingEnergy`, gap 1): each tick,
+  **before** generation and from the store the tick started with, offer `min(2,000, stored)` to
+  each of the six neighbours that answers the energy capability and take out what it accepted.
+  Upstream's budget is **per neighbour**, not shared between faces.
+
+### Red → green
+
+The monitor's rules and the send clamp were stubbed `todo!()` behind their tests; the failing run
+is `ports/_shared/evidence/rftoolspower/red-monitor.log`:
+
+```
+test result: FAILED. 18 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+not yet implemented
+```
+
+Green: **33 passed; 0 failed** (`sdk-test.log`). The nine new tests pin the ratio (`250,000 of
+500,000 → 3`, full → 5, no capacity → 0), the percentage, the unset band, a configured band's
+inclusive edges, the 20-tick window, "changed only when the state moved", a doctored restore, and
+the send clamp.
+
+### In game (same evidence directory)
+
+| log | verdict |
+|---|---|
+| `e2e-power-monitor.log` | **PASS**, `EXIT:0` — phases A–T |
+| `e2e-selftest.log` | `FAIL: selftest: the empty generator reads level 1, not the charged 3, so the assertion is alive`, `EXIT:1` |
+| `e2e-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=4 ok=4 missing-exit=0 bad-exit=0`
+(the slice-1 logs stay beside the new ones).
+
+The parsed assertions, each from a `ctl` reply:
+
+| phase | what it asserts (observed) |
+|---|---|
+| N | a monitor mounted against a 250,000/500,000 generator reads **level 3** (the ratio the unit test pins), band `0..0 (unset)`, alarm false, and a redstone lamp on its display face stays dark |
+| O | an empty generator reads **level 1**, alarm false, lamp dark — the differential for N; `SELFTEST=1` inverts it and fails |
+| P | a monitor mounted on `minecraft:stone` reads **level 0** and `target=minecraft:stone (not an energy block)` |
+| Q | band `40..60` at 50 %: alarm true, monitor `lit=true`, lamp `lit=true`; band `90..100`: alarm false, both dark |
+| R | the generator pushes its 100,000 FE into an adjacent energy block: the receiver ends full (100,000), the generator empty (0), the receiver's gain a multiple of the 2,000 a push moves, and the monitor facing the receiver reads **level 5** |
+| S | a monitor item carrying band `80..90` is placed and the monitor reads `80..90` |
+| T | the monitor's carried recipe with a stone where `rftoolsbase:machine_base` belongs crafts nothing |
+
+Counterfactual: phase C's slice-1 inversion stays available as `SELFTEST_GENERATOR=1`; this
+slice's `SELFTEST=1` is phase O. Phase R's differential is the generator's own store: it falls from
+100,000 to 0 only because a receiver with room stands beside it.
+
+### The receiver the push is proven against
+
+The mod's own receiver, the powercell, is `blocked(smartwrench-not-carried)` (gap 9), and a monitor
+is a display with **no buffer** (upstream has no energy capability on it), so the leg cannot push
+into the monitor. The push is proven against `tools/harness-receiver/`, a **harness-only** native
+mod: one block, `rfpowerharness:receiver`, with a 100,000 FE buffer (10,000 in a face an insert,
+nothing out). It is built beside the package by `tools/build-e2e-game.sh`, lives outside the
+`.hmod` (the launcher refuses nested package paths, so its source is stored as `.in` files), and is
+listed in `native-mods.json` in `native-build-modset.log`.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **The placement context's yaw is not the player's look.** `ctl place` reported the opposite of
+   the player's yaw, and changed between runs, so the direction-sensitive phases let the monitor
+   place and then set its display face with `/setblock … [facing=east,…]` (`aim_monitor`). The
+   `state_for_placement` hook is still exercised (the block places); the read side the assertions
+   use is then explicit.
+2. **A mob in the target blocks a placement** ("the block did not change (blocked by an entity)").
+   The End spawns endermen while the slice-1 phases run; every placement now clears non-player
+   entities first and retries once.
+3. **`/data get block X Y Z energy` answers a bare number**, not `{energy: N}` — the parser takes
+   both shapes.
+4. **Sequential `/data get` reads are several ticks apart**, so a conservation check across the
+   generator and the receiver read earlier/later values (110,000 of a seeded 100,000). The leg
+   asserts what is skew-free instead: the receiver ends full, the generator empty, and the gain is
+   a multiple of the push size.
+5. **`ctl messages` is newest-first and a new command's chat reply can arrive a few ticks late**;
+   `await_line` waits up to ~3 s for the exact nonce.
+
+### Upstream defect fixed (slice 2)
+
+**The monitor's redstone face.** `PowerMonitorTileEntity.getRedstoneOutput` answers only when
+`side == getFacing(state).getInputSide()` (the side attached to the machine), while
+`LogicSupport.setRedstoneState` notifies `pos.relative(getInputSide().getOpposite())` — the display
+side. The two disagree, so a lamp or wire on the output face is never told to re-read and the
+signal never leaves the free face. The port follows the notify side (the display face, opposite the
+monitored block) for both the answer and the update; a user notices: the alarm reaches a lamp beside
+the monitor. The band's unset default is documented as the port's reading, not a defect.
+
 ## Engines traps this slice cost (measured, not read)
 
 1. **Creative keeps the container stack.** `ItemPlace::PlayerHand.extract` follows vanilla's
@@ -174,10 +300,9 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
 
 ## Gaps (the rest of the mod)
 
-1. **The FE push into a neighbour** (`handleSendingEnergy`, 2,000 FE a tick into adjacent energy
-   handlers). The buffer is declared and every face extracts, so a neighbour that pulls works; the
-   generator itself does not push yet, because **no receiver family ships in this slice** and an
-   unproven push would be a claim. Next slice: the powercell.
+1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
+   2,000 FE a tick to every adjacent energy handler and is proven in game (phase R, against the
+   harness receiver). The powercell, the mod's own receiver, is still gap 9.
 2. **The charge-item slot** (`SLOT_CHARGEITEM`, 1,000 FE a tick into an energy item). Needs the item
    energy capability and an item that carries FE; not carried here.
 3. **The infusable upgrade factor** (`getRfPerTick`'s `factor`, and the burn's `+burning*factor/2`).
@@ -199,9 +324,11 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
    mode, and a fresh cell's six faces are all `NONE`, so a cell cannot be filled without
    `rftoolsbase:smartwrench`, which the parent port does not carry (`ports/rftoolsbase/notes.md`
    gap 12).
-10. **The rest of the mod:** the power monitor and power level, the dimensional cell (with its
-    card-linked networks), the endergenic generator with the pearl injector and ender monitor, and
-    the blazing generator/agitator/infuser with blazing rods.
+10. **The rest of the mod:** the **power level** display (`PowerLevelTileEntity`, the monitor's
+    sibling — same tick, but a 0..9 ratio written straight to the redstone output and no level
+    state), the dimensional cell (with its card-linked networks), the endergenic generator with the
+    pearl injector and ender monitor, and the blazing generator/agitator/infuser with blazing rods.
+    The power monitor itself is ported in slice 2.
 
 ## Coverage of the coal generator family
 
@@ -219,9 +346,24 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
 | comparator output, TOP/Jade | not ported (gaps 4, 6) |
 | the GUI, the redstone toggle, the glow layer | not ported (gaps 4, 5) |
 | the charge-item slot, the infusable factor | not ported (gaps 2, 3) |
-| the FE push into a neighbour, the charge item | blocked (gap 1: next slice, the powercell) |
+| the FE push into an adjacent energy handler, 2,000 a tick a neighbour | tested (R, against the harness receiver) |
+| the charge item | not ported (gap 2) |
 | the recipe's craft | `blocked(rftoolsbase:machine_frame-absent)` (gap 7) |
 | the other nine blocks | not ported (gaps 9, 10) |
+
+## Coverage of the power monitor family (slice 2)
+
+| family | state |
+|---|---|
+| block, item, blockstate (facing×level×lit), six level models, textures, tags, creative tab, lang | tested (N: placed, read the state back; S: a monitor item placed) |
+| the 20-tick read of the block behind the display front through the energy capability | tested (N, O, P, R) |
+| the level ratio `1 + stored*5/capacity`, 0 for no energy block | tested (N=3, O=1, P=0, R=5; unit tests pin the numbers) |
+| the band and its alarm, mirrored into `lit` | tested (Q: 40..60 lit at 50 %, 90..100 dark) |
+| the redstone output on the display face | tested (Q: a redstone lamp lights and goes out) |
+| the band on the broken monitor's item | tested (S) |
+| the recipe's craft | `blocked(rftoolsbase:machine_base-absent)` (phase T proves the pattern crafts nothing) |
+| the GUI, its two sliders and the redstone input mode | not ported (gap 4; `/rftoolspower band` is the harness stand-in) |
+| TOP/Jade and the comparator output | not ported (gap 6) |
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
 
@@ -229,20 +371,21 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **18 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **33 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
 | two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `native-mod, format native-1/0a875da…/e59da909…, for 26.3` (`sdk-check.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.1 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
-| `verify-sdk-package.py rftoolspower` | see `VALIDATION.md` |
-| the leg | `PASS` + `EXIT:0`; selftest `EXIT:1`; control `EXIT:1`; `--strict` 3/3 |
+| `verify-sdk-package.py rftoolspower` | **1/1** |
+| the leg | `PASS` + `EXIT:0`; selftest `EXIT:1`; control `EXIT:1`; `--strict` 4/4 |
 
-## Artifact
+## Artifact (0.1.1)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 30,509 B | `33a0c6c0961bf39a86d1ef9ac613dd8a16050b4fd5ca18f4e7588f09450ecf99` | 24 |
+| `rftoolspower.hmod` (port root) | 73,339 B | `6df52b7421749bc7fea622dd3359e84ce3ff847ea2454d2ce9ef3ef79c2d15f5` | 45 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
-`check` green, both `fits` green.
+`check` green, both `fits` green, `verify-sdk-package.py` 1/1, `src/runtime.rs` byte-identical in
+the archive.

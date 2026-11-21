@@ -1,0 +1,196 @@
+{
+  "variants": {
+    "facing=east,level=0,lit=false": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 270
+    },
+    "facing=east,level=0,lit=true": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 270
+    },
+    "facing=east,level=1,lit=false": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 270
+    },
+    "facing=east,level=1,lit=true": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 270
+    },
+    "facing=east,level=2,lit=false": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 270
+    },
+    "facing=east,level=2,lit=true": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 270
+    },
+    "facing=east,level=3,lit=false": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 270
+    },
+    "facing=east,level=3,lit=true": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 270
+    },
+    "facing=east,level=4,lit=false": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 270
+    },
+    "facing=east,level=4,lit=true": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 270
+    },
+    "facing=east,level=5,lit=false": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 270
+    },
+    "facing=east,level=5,lit=true": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 270
+    },
+    "facing=north,level=0,lit=false": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 180
+    },
+    "facing=north,level=0,lit=true": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 180
+    },
+    "facing=north,level=1,lit=false": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 180
+    },
+    "facing=north,level=1,lit=true": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 180
+    },
+    "facing=north,level=2,lit=false": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 180
+    },
+    "facing=north,level=2,lit=true": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 180
+    },
+    "facing=north,level=3,lit=false": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 180
+    },
+    "facing=north,level=3,lit=true": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 180
+    },
+    "facing=north,level=4,lit=false": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 180
+    },
+    "facing=north,level=4,lit=true": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 180
+    },
+    "facing=north,level=5,lit=false": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 180
+    },
+    "facing=north,level=5,lit=true": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 180
+    },
+    "facing=south,level=0,lit=false": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 0
+    },
+    "facing=south,level=0,lit=true": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 0
+    },
+    "facing=south,level=1,lit=false": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 0
+    },
+    "facing=south,level=1,lit=true": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 0
+    },
+    "facing=south,level=2,lit=false": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 0
+    },
+    "facing=south,level=2,lit=true": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 0
+    },
+    "facing=south,level=3,lit=false": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 0
+    },
+    "facing=south,level=3,lit=true": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 0
+    },
+    "facing=south,level=4,lit=false": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 0
+    },
+    "facing=south,level=4,lit=true": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 0
+    },
+    "facing=south,level=5,lit=false": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 0
+    },
+    "facing=south,level=5,lit=true": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 0
+    },
+    "facing=west,level=0,lit=false": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 90
+    },
+    "facing=west,level=0,lit=true": {
+      "model": "rftoolspower:block/power_monitor0",
+      "y": 90
+    },
+    "facing=west,level=1,lit=false": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 90
+    },
+    "facing=west,level=1,lit=true": {
+      "model": "rftoolspower:block/power_monitor1",
+      "y": 90
+    },
+    "facing=west,level=2,lit=false": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 90
+    },
+    "facing=west,level=2,lit=true": {
+      "model": "rftoolspower:block/power_monitor2",
+      "y": 90
+    },
+    "facing=west,level=3,lit=false": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 90
+    },
+    "facing=west,level=3,lit=true": {
+      "model": "rftoolspower:block/power_monitor3",
+      "y": 90
+    },
+    "facing=west,level=4,lit=false": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 90
+    },
+    "facing=west,level=4,lit=true": {
+      "model": "rftoolspower:block/power_monitor4",
+      "y": 90
+    },
+    "facing=west,level=5,lit=false": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 90
+    },
+    "facing=west,level=5,lit=true": {
+      "model": "rftoolspower:block/power_monitor5",
+      "y": 90
+    }
+  }
+}

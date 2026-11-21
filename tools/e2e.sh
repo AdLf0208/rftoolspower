@@ -37,9 +37,19 @@
 #  M  the carried recipe cannot be crafted in this build: its centre cell names
 #     `rftoolsbase:machine_frame`, and the same pattern with any other block crafts nothing
 #     (upstream's recipe, blocked on the parent — the `rftoolsstorage` precedent)
+#  N  a monitor placed with its read side against a 250,000 FE generator shows level 3 and no
+#     alarm; a redstone lamp on its display side stays dark
+#  O  the same against an empty generator: level 1, no alarm, lamp dark (the differential)
+#  P  the same against `minecraft:stone`: level 0, "not an energy block"
+#  Q  the alarm band: 40..60 at 50 % lights the lamp, 90..100 puts it out
+#  R  the generator pushes its store into an adjacent energy block (the harness receiver): the
+#     receiver ends full and the generator empty, and the monitor facing the receiver reads 5
+#  S  a monitor item's `block_entity_data` band is restored when it is placed
+#  T  the monitor's carried recipe needs `rftoolsbase:machine_base`; without it, nothing crafts
 #
-# SELFTEST=1 flips C (the generator must make no FE while burning) and exits non-zero, proving
-# the assertion can fail.
+# SELFTEST=1 inverts phase O (the empty generator must read the charged level 3) and exits
+# non-zero, proving the monitor's level assertion can fail; SELFTEST_GENERATOR=1 keeps slice 1's
+# inversion of C (the generator must make no FE while burning).
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -50,7 +60,8 @@ PORT=$CLONE/ports/rftoolspower
 CTL=${CTL:-}
 GAME=${GAME:-}
 RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}}
-SOCK=${SOCK:-/tmp/opencode/rftoolspower-e2e.sock}
+TMP=${E2E_TMP:-/tmp/opencode}
+SOCK=${SOCK:-$TMP/rftoolspower-e2e.sock}
 SELFTEST=${SELFTEST:-0}
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
@@ -62,6 +73,8 @@ PER_TICK=60
 TICKS_PER_COAL=600
 TICKS_PER_COAL_BLOCK=5400
 BLOCK=rftoolspower:coalgenerator
+MONITOR=rftoolspower:power_monitor
+RECEIVER=rfpowerharness:receiver
 COAL=minecraft:coal
 CHARCOAL=minecraft:charcoal
 COAL_BLOCK=minecraft:coal_block
@@ -77,13 +90,13 @@ fi
 [ -x "$GAME" ] || { echo "missing horizon-client: $GAME" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
 
-SCRATCH=$(mktemp -d /tmp/opencode/rftoolspower-home.XXXXXX)
+SCRATCH=$(mktemp -d "$TMP/rftoolspower-home.XXXXXX")
 export HORIZON_HOME=$SCRATCH/game
 export HORIZON_LAUNCHER_HOME=$SCRATCH/launcher
 export XDG_DATA_HOME=$SCRATCH/data
 export XDG_CONFIG_HOME=$SCRATCH/config
 export HORIZON_NO_AUDIO=1
-mkdir -p "$(dirname "$SOCK")" "$XDG_CONFIG_HOME"
+mkdir -p "$(dirname "$SOCK")" "$XDG_CONFIG_HOME" "$HORIZON_HOME" "$HORIZON_LAUNCHER_HOME"
 rm -f "$SOCK"
 
 ctl() { "$CTL" --socket "$SOCK" "$@"; }
@@ -132,15 +145,28 @@ arena() {
         fi
     done
     [ "$loaded" = true ] || fail "the End arena chunk never loaded"
-    ctl command "execute in minecraft:the_end run fill $((X0 - 4)) 100 -24 $((X0 + 6)) 100 24 minecraft:stone" >/dev/null
+    ctl command "execute in minecraft:the_end run fill $((X0 - 4)) 100 -24 $((X0 + 6)) 100 48 minecraft:stone" >/dev/null
     ctl wait 6 >/dev/null
-    ctl command "execute in minecraft:the_end run fill $((X0 - 4)) 101 -24 $((X0 + 6)) 108 24 minecraft:air" >/dev/null
+    ctl command "execute in minecraft:the_end run fill $((X0 - 4)) 101 -24 $((X0 + 6)) 108 48 minecraft:air" >/dev/null
     ctl wait 6 >/dev/null
     ctl command "execute in minecraft:the_end run kill @e[type=!player]" >/dev/null
     ctl command "execute in minecraft:the_end run tp @s $X0.5 101 0.5" >/dev/null
     ctl wait 20
     [ "$(block_name "$X0" 100 0)" = "minecraft:stone" ] || fail "the arena floor is not stone"
     [ "$(block_name "$X0" 101 0)" = "minecraft:air" ] || fail "the arena air above the floor is not air"
+}
+
+# The newest chat line matching PATTERN, waiting up to ~3 s for it to arrive. A command's reply
+# comes back on the chat path, so it can miss the first read under load; this is a bounded wait
+# on a message, never a build-slot poll.
+await_line() { # await_line PATTERN
+    local line=""
+    for _ in 1 2 3 4 5 6; do
+        line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 "$1" || true)
+        [ -n "$line" ] && break
+        ctl wait 5 >/dev/null
+    done
+    printf '%s\n' "$line"
 }
 
 # `/rftoolspower info X Y Z`: the line, then the parsed fields.
@@ -150,8 +176,7 @@ info() { # info X Y Z
     NONCE_TAG=$NONCE
     local line
     say "rftoolspower info $1 $2 $3 $NONCE"
-    ctl wait 12 >/dev/null
-    line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 "nonce=$NONCE)" || true)
+    line=$(await_line "nonce=$NONCE")
     [ -n "$line" ] || fail "no fresh /rftoolspower info reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
     ev=$(python3 "$PORT/tools/parse_info.py" "$line")
     eval "$ev"
@@ -186,6 +211,22 @@ held_count() { # held_count ITEM -> how many of ITEM the inventory holds
     ctl inventory | jq -r --arg i "$1" '[.hotbar[], .main[] | select(.item == $i) | .count] | add // 0'
 }
 
+# A mob standing in a position blocks a placement (the End spawns endermen while the earlier
+# phases run), so clear every non-player entity before one and retry once after clearing again.
+clear_mobs() {
+    ctl command "execute in minecraft:the_end run kill @e[type=!player]" >/dev/null 2>&1 || true
+    ctl wait 2 >/dev/null
+}
+
+place_block() { # place_block X Y Z ITEM
+    local x=$1 y=$2 z=$3 item=$4
+    clear_mobs
+    PLACE_REPLY=$(ctl place "$x" "$y" "$z" --item "$item" 2>&1) && return 0
+    clear_mobs
+    PLACE_REPLY=$(ctl place "$x" "$y" "$z" --item "$item" 2>&1) && return 0
+    return 1
+}
+
 place_generator() { # place_generator X Y Z
     local x=$1 y=$2 z=$3
     ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 $y $z.5" >/dev/null
@@ -194,8 +235,8 @@ place_generator() { # place_generator X Y Z
     local aim reply
     aim=$(ctl look-at-block "$x" $((y - 1)) "$z" up 2>&1) \
         || fail "cannot aim at the floor under $x,$y,$z: $aim"
-    reply=$(ctl place "$x" "$y" "$z" --item "$BLOCK" 2>&1) \
-        || fail "ctl place at $x,$y,$z failed: $(tr -d '\n' <<<"$reply" | cut -c1-300)"
+    place_block "$x" "$y" "$z" "$BLOCK" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
     ctl wait 6 >/dev/null
     [ "$(block_name "$x" "$y" "$z")" = "$BLOCK" ] || fail "the generator did not place at $x,$y,$z"
 }
@@ -249,10 +290,92 @@ place_kept() { # place_kept X Y Z — place the generator item the player alread
     ctl select "$BLOCK" >/dev/null
     ctl wait 2 >/dev/null
     ctl look-at-block "$x" $((y - 1)) "$z" up >/dev/null
-    ctl place "$x" "$y" "$z" --item "$BLOCK" >/dev/null \
-        || fail "ctl place at $x,$y,$z failed: $(ctl inventory | jq -c '{hotbar,main}')"
+    place_block "$x" "$y" "$z" "$BLOCK" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
     ctl wait 6 >/dev/null
     [ "$(block_name "$x" "$y" "$z")" = "$BLOCK" ] || fail "the carried generator did not place at $x,$y,$z"
+}
+
+# `/rftoolspower monitor X Y Z`: the line, then the parsed fields.
+monitor() { # monitor X Y Z
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower monitor $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower monitor reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_monitor.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the monitor line did not parse: $line"
+    echo "  $line" >&2
+    echo "  parsed: level=$LEVEL band=$MIN..$MAX unset=$UNSET target=$TARGET energy=$IS_ENERGY stored=$STORED/$MAXE alarm=$ALARM" >&2
+}
+
+expect_level() { [ "$LEVEL" = "$1" ] || fail "the monitor reads level $LEVEL, expected $1"; }
+expect_alarm() { [ "$ALARM" = "$1" ] || fail "the monitor's alarm is $ALARM, expected $1"; }
+expect_monitor_band() {
+    [ "$MIN" = "$1" ] && [ "$MAX" = "$2" ] \
+        || fail "the monitor's band is $MIN..$MAX, expected $1..$2"
+}
+expect_target() {
+    [ "$TARGET" = "$1" ] || fail "the monitor faces $TARGET, expected $1"
+}
+expect_stored() { [ "$STORED" = "$1" ] || fail "the monitor reads $STORED FE, expected $1"; }
+
+# The `level` and `lit` properties of a monitor's block state.
+block_level() { ctl block "$1" "$2" "$3" | jq -r '.state // empty' | sed -n 's/.*level=\([0-9]*\).*/\1/p'; }
+block_lit() { ctl block "$1" "$2" "$3" | jq -r '.state // empty' | sed -n 's/.*lit=\(true\|false\).*/\1/p'; }
+expect_block_level() { # expect_block_level X Y Z N
+    local got; got=$(block_level "$1" "$2" "$3")
+    [ "$got" = "$4" ] || fail "the monitor block at $1,$2,$3 has level='$got', expected $4"
+}
+expect_lamp() { # expect_lamp X Y Z true|false
+    local got; got=$(block_lit "$1" "$2" "$3")
+    [ "$got" = "$4" ] || fail "the redstone lamp at $1,$2,$3 has lit='$got', expected $4 (state $(ctl block "$1" "$2" "$3" | jq -r '.state'))"
+}
+
+# The `energy` int in a block entity's saved compound (`/data get block`).
+energy_of() { # energy_of X Y Z -> the amount
+    ctl command "data get block $1 $2 $3 energy" >/dev/null
+    ctl wait 4 >/dev/null
+    local line
+    line=$(await_line 'has the following block data')
+    [ -n "$line" ] || fail "no /data get block reply for $1,$2,$3: $(ctl messages 8 | jq -c '.chat')"
+    echo "  data get $1,$2,$3: $line" >&2
+    eval "$(python3 "$PORT/tools/parse_data_energy.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the data reply at $1,$2,$3 carries no energy: $line"
+    echo "$ENERGY"
+}
+
+# Place a block from the hotbar with the player east of it. A monitor's `facing` is its display
+# front, set facing the placer (as a furnace's is); it reads the block behind it, so a monitor
+# placed this way watches the block to its west.
+place_facing_player() { # place_facing_player X Y Z ITEM
+    local x=$1 y=$2 z=$3 item=$4
+    ctl command "execute in minecraft:the_end run tp @s $((x + 3)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select "$item" >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at "$x.5" "$y.5" "$z.5" >/dev/null || fail "cannot aim at $x,$y,$z"
+    place_block "$x" "$y" "$z" "$item" \
+        || fail "ctl place $item at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$item" ] || fail "$item did not place at $x,$y,$z"
+    echo "  placed: $(ctl block "$x" "$y" "$z" | jq -r '.state')" >&2
+}
+
+# The harness cannot drive the placer's yaw `ctl place` reports (it is the game's placement
+# context, not the player's look), so the direction-sensitive phases set the monitor's display
+# face explicitly once it is placed. `facing` is the display front; the monitor reads the block
+# behind it, so `facing=east` reads the block to its west.
+aim_monitor() { # aim_monitor X Y Z FACE
+    ctl command "execute in minecraft:the_end run setblock $1 $2 $3 $MONITOR[facing=$4,level=0,lit=false]" >/dev/null \
+        || fail "cannot set the monitor's facing at $1,$2,$3"
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$1" "$2" "$3")" = "$MONITOR" ] || fail "the monitor vanished from $1,$2,$3"
+}
+
+place_monitor() { # place_monitor X Y Z — a fresh monitor from the hotbar, watching the block west
+    hold "$MONITOR"
+    place_facing_player "$1" "$2" "$3" "$MONITOR"
 }
 
 echo "== launch (The End arena, the package's own content and code) =="
@@ -294,7 +417,7 @@ E1=$ENERGY; B1=$BURN
 dE=$((E1 - E0)); dB=$((B0 - B1))
 echo "  over $dB burn ticks: $E0 -> $E1 FE (+$dE)"
 [ "$dB" -ge 20 ] || fail "only $dB burn ticks passed; the window is too small to assert"
-if [ "$SELFTEST" = 1 ]; then
+if [ "${SELFTEST_GENERATOR:-0}" = 1 ]; then
     echo "(selftest: asserting the generator made no FE while burning)"
     [ "$dE" = 0 ] || fail "selftest: the generator made $dE FE in $dB ticks, so the assertion is alive"
 fi
@@ -473,4 +596,165 @@ ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  the frame is what the recipe needs and RFToolsBase is not in this build (blocked, not dead data)"
 
-echo "PASS: a placed generator is empty and dark; one coal in its slot starts a 600-tick burn, spends it from the hand and lights the block; FE rises by exactly 60 a tick while it burns; the burn ends, the block goes dark and FE stops (no fuel, no FE); a stone is refused; charcoal is fuel and a coal block burns 5,400 ticks; the buffer clamps at 500,000 FE while the generator keeps burning; a hopper over it feeds the slot; the store survives save and relaunch; a broken generator's item carries its store and placing it restores it, while an item doctored to 999,999 FE is clamped to 500,000; an unknown id is refused; and the carried recipe's machine-frame cell crafts nothing without RFToolsBase"
+# --- the power monitor ---------------------------------------------------
+# The unit test pins the ratio: 1 + stored * 5 / capacity, integer, clamped to 1..=5. A
+# generator doctored to 250,000 of 500,000 FE must therefore show level 3 before the leg runs.
+echo "== N: a monitor facing a 250,000 FE generator reads level 3 =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+for z in 18 24 30 36 42; do
+    ctl command "execute in minecraft:the_end run fill $((SX - 1)) 101 $z $((SX + 4)) 101 $z minecraft:air" >/dev/null
+done
+ctl wait 6 >/dev/null
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",burn:0,burn_max:0,energy:250000}]" >/dev/null
+ctl wait 8 >/dev/null
+place_kept "$SX" 101 18
+info "$SX" 101 18
+expect_energy 250000
+place_monitor "$((SX + 1))" 101 18
+aim_monitor "$((SX + 1))" 101 18 east
+ctl command "execute in minecraft:the_end run setblock $((SX + 2)) 101 18 minecraft:redstone_lamp" >/dev/null
+ctl wait 40 >/dev/null
+monitor "$((SX + 1))" 101 18
+expect_level 3
+expect_monitor_band 0 0
+expect_alarm 0
+expect_target "$BLOCK"
+expect_stored 250000
+[ "$MAXE" = "$CAPACITY" ] || fail "the monitor reads capacity $MAXE, expected $CAPACITY"
+expect_block_level "$((SX + 1))" 101 18 3
+expect_block_lit "$((SX + 1))" 101 18 false
+expect_lamp "$((SX + 2))" 101 18 false
+echo "  250,000/500,000 FE reads level 3, the unset band is silent and the lamp is dark"
+
+echo "== O: an empty generator reads level 1 and still no alarm (the differential) =="
+place_generator "$SX" 101 24
+place_monitor "$((SX + 1))" 101 24
+aim_monitor "$((SX + 1))" 101 24 east
+ctl command "execute in minecraft:the_end run setblock $((SX + 2)) 101 24 minecraft:redstone_lamp" >/dev/null
+ctl wait 40 >/dev/null
+info "$SX" 101 24
+expect_energy 0
+monitor "$((SX + 1))" 101 24
+expect_target "$BLOCK"
+expect_stored 0
+expect_level 1
+expect_alarm 0
+expect_block_level "$((SX + 1))" 101 24 1
+expect_lamp "$((SX + 2))" 101 24 false
+if [ "$SELFTEST" = 1 ]; then
+    echo "(selftest: asserting the empty generator reads the charged level)"
+    [ "$LEVEL" = 3 ] || fail "selftest: the empty generator reads level $LEVEL, not the charged 3, so the assertion is alive"
+fi
+echo "  an empty generator is level 1, not 3: the level follows the store"
+
+echo "== P: a monitor facing stone reads level 0, not an energy block =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 30 minecraft:stone" >/dev/null
+ctl wait 4 >/dev/null
+place_monitor "$((SX + 1))" 101 30
+aim_monitor "$((SX + 1))" 101 30 east
+ctl wait 40 >/dev/null
+monitor "$((SX + 1))" 101 30
+expect_level 0
+expect_target minecraft:stone
+[ "$IS_ENERGY" = 0 ] || fail "a stone answered the energy capability"
+expect_alarm 0
+expect_block_level "$((SX + 1))" 101 30 0
+echo "  stone: level 0 and 'not an energy block' — the monitor is not reading a phantom battery"
+
+echo "== Q: the alarm band lights the lamp at 50 % and puts it out above it =="
+say "rftoolspower band $((SX + 1)) 101 18 40 60"
+ctl wait 8 >/dev/null
+ctl wait 40 >/dev/null
+monitor "$((SX + 1))" 101 18
+expect_monitor_band 40 60
+[ "$UNSET" = 0 ] || fail "the band 40..60 reads as unset"
+expect_alarm 1
+expect_block_lit "$((SX + 1))" 101 18 true
+expect_lamp "$((SX + 2))" 101 18 true
+echo "  50 % inside 40..60: alarm true, the monitor's display face gives 15 and the lamp is lit"
+say "rftoolspower band $((SX + 1)) 101 18 90 100"
+ctl wait 8 >/dev/null
+ctl wait 40 >/dev/null
+monitor "$((SX + 1))" 101 18
+expect_monitor_band 90 100
+expect_alarm 0
+expect_block_lit "$((SX + 1))" 101 18 false
+expect_lamp "$((SX + 2))" 101 18 false
+echo "  50 % outside 90..100: the alarm and the lamp go out (the signal is not stuck)"
+
+echo "== R: the generator pushes 2,000 FE a tick into an adjacent energy block =="
+ctl command "clear @s" >/dev/null
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",burn:0,burn_max:0,energy:100000}]" >/dev/null
+ctl wait 8 >/dev/null
+place_kept "$((SX - 1))" 101 36
+info "$((SX - 1))" 101 36
+expect_energy 100000
+ctl command "execute in minecraft:the_end run setblock $SX 101 36 $RECEIVER" >/dev/null
+ctl wait 4 >/dev/null
+[ "$(block_name "$SX" 101 36)" = "$RECEIVER" ] || fail "the harness receiver did not place at $SX,101,36"
+place_monitor "$((SX + 1))" 101 36
+aim_monitor "$((SX + 1))" 101 36 east
+G0=$(energy_of "$((SX - 1))" 101 36); R0=$(energy_of "$SX" 101 36)
+echo "  before: generator $G0 FE, receiver $R0 FE"
+ctl wait 100 >/dev/null
+G1=$(energy_of "$((SX - 1))" 101 36); R1=$(energy_of "$SX" 101 36)
+echo "  after 100 ticks: generator $G1 FE, receiver $R1 FE"
+[ "$R1" -gt "$R0" ] || fail "the generator never pushed: the receiver still holds $R1 FE"
+[ "$G1" = 0 ] || fail "the generator still holds $G1 FE after pushing into a receiver with room"
+[ "$R1" = 100000 ] || fail "the receiver holds $R1 FE, expected its full 100,000"
+[ "$G0" -lt 100000 ] || fail "the generator still holds all 100,000 FE: it is not pushing"
+[ $(((R1 - R0) % 2000)) = 0 ] \
+    || fail "the receiver gained $((R1 - R0)) FE, not a multiple of the 2,000 a tick a push moves"
+echo "  the generator's 100,000 FE moved into the receiver in 2,000-FE pushes (it ends full, the generator empty)"
+ctl command "execute in minecraft:the_end run setblock $((SX - 1)) 101 36 minecraft:air" >/dev/null
+ctl wait 30 >/dev/null
+monitor "$((SX + 1))" 101 36
+expect_target "$RECEIVER"
+expect_stored 100000
+[ "$MAXE" = 100000 ] || fail "the monitor reads the receiver's capacity as $MAXE, expected 100,000"
+expect_level 5
+expect_block_level "$((SX + 1))" 101 36 5
+echo "  the monitor facing the receiver reads its full store: level 5"
+
+echo "== S: a monitor item's band is restored when it is placed =="
+ctl command "clear @s" >/dev/null
+ctl command "give @s $MONITOR[minecraft:block_entity_data={id:\"rftoolspower:power_monitor_block_entity\",level:0,minimum:80,maximum:90,alarm:0b,counter:20}]" >/dev/null
+ctl wait 8 >/dev/null
+place_facing_player "$((SX + 1))" 101 42 "$MONITOR"
+ctl wait 8 >/dev/null
+monitor "$((SX + 1))" 101 42
+expect_monitor_band 80 90
+[ "$UNSET" = 0 ] || fail "the item's 80..90 band read as unset"
+echo "  the placed monitor kept the item's 80..90 band"
+
+echo "== T: the monitor's carried recipe needs the parent's machine base =="
+ctl command "clear @s" >/dev/null
+for item in minecraft:comparator minecraft:redstone minecraft:redstone_block "$STONE"; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 8 >/dev/null
+TX=$((SX + 4)); TY=101; TZ=42
+ctl setblock "$TX" "$TY" "$TZ" minecraft:air >/dev/null
+ctl setblock "$TX" "$TY" "$TZ" minecraft:crafting_table >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $((TX - 1)).5 $TY $((TZ)).5" >/dev/null
+ctl wait 4 >/dev/null
+ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the click"
+ctl wait 6 >/dev/null
+GRID=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
+[ "$GRID" = 10 ] || fail "the crafting table did not open its grid ($GRID grid slots)"
+# " P " / "rAr" / " R " with a stone where `rftoolsbase:machine_base` belongs.
+place_one minecraft:comparator 101
+place_one minecraft:redstone 103
+place_one "$STONE" 104
+place_one minecraft:redstone 105
+place_one minecraft:redstone_block 107
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the monitor recipe with a stone where rftoolsbase:machine_base belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "a stone in the machine base's cell crafted $RESULT"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  the machine base is what the monitor's recipe needs and RFToolsBase is not in this build"
+
+echo "PASS: a placed generator is empty and dark; one coal in its slot starts a 600-tick burn, spends it from the hand and lights the block; FE rises by exactly 60 a tick while it burns; the burn ends, the block goes dark and FE stops (no fuel, no FE); a stone is refused; charcoal is fuel and a coal block burns 5,400 ticks; the buffer clamps at 500,000 FE while the generator keeps burning; a hopper over it feeds the slot; the store survives save and relaunch; a broken generator's item carries its store and placing it restores it, while an item doctored to 999,999 FE is clamped to 500,000; an unknown id is refused; the generator's recipe's machine-frame cell crafts nothing without RFToolsBase; a monitor facing a 250,000 FE generator reads level 3 with its unset band silent, an empty generator reads level 1, stone reads level 0 as not an energy block, a 40..60 band lights the lamp at 50 % and 90..100 puts it out, the generator pushes 100,000 FE into an adjacent receiver (2,000 a tick) whose monitor then reads level 5, a monitor item keeps its band, and the monitor's own recipe crafts nothing without the parent's machine base"
