@@ -625,6 +625,421 @@ pub fn take(cells: &mut [Cell], amount: u32) -> u32 {
     taken
 }
 
+// ---------------------------------------------------------------------------
+// The endergenic generator (`EndergenicTileEntity`, `EndergenicConfiguration`)
+// ---------------------------------------------------------------------------
+
+/// `EndergenicConfiguration.MAXENERGY` (`endergenicMaxPower`).
+pub const ENDERGENIC_CAPACITY: i32 = 5_000_000;
+/// `rfToHoldPearl` (`endergenicRfHolding`): the FE one held pearl costs every tick.
+pub const RF_TO_HOLD: i32 = 500;
+/// `ENDERGENIC_KEEPRF` (`endergenicKeepRf`): the reserve the generator never sends out.
+pub const KEEP_RF: i32 = 2_000;
+/// `ENDERGENIC_SENDPERTICK` (`endergenicSendPerTick`): the most one tick offers its neighbours.
+pub const SEND_PER_TICK: i32 = 20_000;
+/// `powergenFactor` (default 2.0), as an integer multiplier: every hit is worth twice its table.
+pub const POWERGEN_FACTOR: i32 = 2;
+/// `chanceLost` (`endergenicChanceLost`): in thousandths, so 5 is upstream's 0.6 %.
+pub const CHANCE_LOST: u32 = 5;
+/// `EndergenicTileEntity.rfPerHit`: what a pearl that arrives at each charging mode is worth,
+/// before `powergenFactor` and the age bonus. Index 0 (idle) pays nothing.
+pub const RF_PER_HIT: [i32; 16] = [
+    0, 100, 150, 200, 400, 800, 1_600, 3_200, 6_400, 8_000, 12_800, 8_000, 6_400, 2_500, 1_000, 100,
+];
+/// The last charging mode a pearl can arrive at: a generator charges 1…=15 and then goes idle
+/// (`chargingMode >= 16`). This window is the mechanic — an arrival outside it is a lost pearl.
+pub const MAX_CHARGE: i32 = 15;
+/// `CHARGE_IDLE`: nothing is happening.
+pub const IDLE: i32 = 0;
+/// `CHARGE_HOLDING`: a pearl is held and paid for every tick.
+pub const HOLDING: i32 = -1;
+/// The longest link upstream accepts: `distance >= 5` is refused ("maximum 4").
+pub const MAX_DISTANCE: i32 = 4;
+/// The age bonus per pearl age step, in percent (`age * 5`).
+pub const AGE_STEP: i32 = 5;
+/// The age bonus's ceiling, in percent (200 % at most: `a` is clamped to 100).
+pub const AGE_CAP: i32 = 100;
+/// The only item a pearl injector loads (`Items.ENDER_PEARL`).
+pub const PEARL: &str = "minecraft:ender_pearl";
+/// The injector's buffer (`PearlInjectorTileEntity.BUFFER_SIZE`, a 9×2 grid of pearls).
+pub const INJECTOR_SLOTS: usize = 9 * 2;
+/// A doctored saved pearl list is clamped to this many travelling pearls (upstream's list is
+/// unbounded; a broken item must not make the tick loop unbounded).
+pub const MAX_PEARLS: usize = 64;
+
+/// One pearl in flight (`data/EndergenicPearl.java`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pearl {
+    /// Ticks left before it arrives; the pearl arrives on the tick it reaches 0.
+    pub ticks_left: i32,
+    /// The generator it was fired at.
+    pub destination: [i32; 3],
+    /// How many generators it has already powered (upstream's age bonus).
+    pub age: i32,
+}
+
+impl Pearl {
+    /// A pearl `distance` ticks from `destination`, aged `age`.
+    #[must_use]
+    pub const fn new(distance: i32, destination: [i32; 3], age: i32) -> Self {
+        Self {
+            ticks_left: distance,
+            destination,
+            age,
+        }
+    }
+
+    /// One tick of flight; true when it arrived.
+    #[must_use]
+    pub fn tick(mut self) -> (Self, bool) {
+        self.ticks_left -= 1;
+        (self, self.ticks_left <= 0)
+    }
+}
+
+/// Why a pearl was dropped (`discardPearl`'s reasons).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loss {
+    /// Fired from a generator with no destination (`"Missing destination"`).
+    MissingDestination,
+    /// `"Pearl arrived while holding"`.
+    WhileHolding,
+    /// `"Pearl arrived while idle"`.
+    WhileIdle,
+    /// `"Not enough energy to hold pearl"`.
+    NotEnoughEnergy,
+    /// `"Random pearl discard"` — the configured chance.
+    Chance,
+}
+
+impl Loss {
+    /// The reason as the readout spells it.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::MissingDestination => "Missing destination",
+            Self::WhileHolding => "Pearl arrived while holding",
+            Self::WhileIdle => "Pearl arrived while idle",
+            Self::NotEnoughEnergy => "Not enough energy to hold pearl",
+            Self::Chance => "Random pearl discard",
+        }
+    }
+
+    /// The reason a saved string spells, for the readout of a generator that was saved after a drop.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        [
+            Self::MissingDestination,
+            Self::WhileHolding,
+            Self::WhileIdle,
+            Self::NotEnoughEnergy,
+            Self::Chance,
+        ]
+        .into_iter()
+        .find(|loss| loss.text() == text)
+    }
+}
+
+/// What a tick's redstone edge asks the generator to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pulse {
+    /// No rising edge.
+    None,
+    /// A rising edge while idle: begin charging.
+    Start,
+    /// A rising edge while holding: fire the held pearl.
+    Fire,
+}
+
+/// Whether a tick is a rising edge, and the input state to keep (`prevIn`).
+///
+/// Upstream reads `powerLevel > 0 && !prevIn`; the signal is `Level.getBestNeighborSignal`.
+#[must_use]
+pub const fn rising_edge(prev: bool, power: i32) -> (bool, bool) {
+    (power > 0 && !prev, power > 0)
+}
+
+/// The saved state of one endergenic generator (`EndergenicTileEntity`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Endergenic {
+    /// Stored FE, 0…[`ENDERGENIC_CAPACITY`].
+    pub energy: i32,
+    /// [`IDLE`], [`HOLDING`], or a charging mode 1…=[`MAX_CHARGE`].
+    pub charging: i32,
+    /// The age the held pearl arrived with (upstream's `currentAge`).
+    pub age: i32,
+    /// Where the next fired pearl goes (upstream's `destination`; a wrench link).
+    pub destination: Option<[i32; 3]>,
+    /// The link's flight time in ticks (upstream's `distance`).
+    pub distance: i32,
+    /// The redstone input at the last tick (`prevIn`).
+    pub prev_in: bool,
+    /// Pearls in flight.
+    pub pearls: Vec<Pearl>,
+    /// Every FE a pearl has ever paid this generator.
+    pub gained: i64,
+    /// Every FE spent holding pearls.
+    pub spent: i64,
+    /// Pearls fired.
+    pub launched: u32,
+    /// Pearls dropped.
+    pub dropped: u32,
+    /// The charging mode the last pearl arrived at (upstream's `pearlArrivedAt`; −2 = none).
+    pub arrived_at: i32,
+    /// Why the last pearl was dropped.
+    pub last_loss: Option<Loss>,
+}
+
+impl Endergenic {
+    /// A fresh generator: idle, empty, no link, no pearls.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            energy: 0,
+            charging: IDLE,
+            age: 0,
+            destination: None,
+            distance: 0,
+            prev_in: false,
+            pearls: Vec::new(),
+            gained: 0,
+            spent: 0,
+            launched: 0,
+            dropped: 0,
+            arrived_at: -2,
+            last_loss: None,
+        }
+    }
+
+    /// Whether it is in the charging window right now.
+    #[must_use]
+    pub const fn charging_window(&self) -> bool {
+        self.charging >= 1 && self.charging <= MAX_CHARGE
+    }
+
+    /// Whether it holds a pearl.
+    #[must_use]
+    pub const fn holding(&self) -> bool {
+        self.charging == HOLDING
+    }
+
+    /// One tick's redstone edge, keeping `prev_in`.
+    pub fn pulse(&mut self, power: i32) -> Pulse {
+        let (edge, prev) = rising_edge(self.prev_in, power);
+        self.prev_in = prev;
+        if !edge {
+            return Pulse::None;
+        }
+        match self.charging {
+            IDLE => Pulse::Start,
+            HOLDING => Pulse::Fire,
+            _ => Pulse::None,
+        }
+    }
+
+    /// `startCharging`: enter the window at mode 1.
+    pub fn start_charging(&mut self) {
+        self.charging = 1;
+    }
+
+    /// One tick of charging: mode + 1, idle once past the window.
+    pub fn charge_step(&mut self) {
+        self.charging += 1;
+        if self.charging > MAX_CHARGE {
+            self.charging = IDLE;
+        }
+    }
+
+    /// Pay [`RF_TO_HOLD`]; false when the store cannot, which loses the pearl.
+    pub fn hold(&mut self) -> bool {
+        if self.energy < RF_TO_HOLD {
+            return false;
+        }
+        self.energy -= RF_TO_HOLD;
+        self.spent += i64::from(RF_TO_HOLD);
+        true
+    }
+
+    /// Drop the held pearl, counting it and keeping the reason.
+    pub fn discard(&mut self, why: Loss) {
+        self.charging = IDLE;
+        self.dropped += 1;
+        self.last_loss = Some(why);
+    }
+
+    /// Fire the held pearl (or an injected one) at the destination.
+    ///
+    /// A generator with no destination loses the pearl (`"Missing destination"`). `from_injector`
+    /// launches an age-0 pearl and does not need a held one, as upstream's
+    /// `firePearlFromInjector` does; a held pearl keeps its age + 1.
+    pub fn fire(&mut self, from_injector: bool) -> bool {
+        let Some(destination) = self.destination else {
+            self.charging = IDLE;
+            self.discard(Loss::MissingDestination);
+            return false;
+        };
+        let age = if from_injector { 0 } else { self.age + 1 };
+        self.charging = IDLE;
+        self.launched += 1;
+        self.pearls
+            .push(Pearl::new(self.distance.max(1), destination, age));
+        true
+    }
+
+    /// The FE a pearl arriving at `mode` with `age` is worth: the table times the powergen
+    /// factor, plus up to a doubling for the pearl's age (upstream's `receivePearl`).
+    #[must_use]
+    pub fn gain(mode: i32, age: i32) -> i32 {
+        if mode <= IDLE || mode > MAX_CHARGE {
+            return 0;
+        }
+        let index = usize::try_from(mode).unwrap_or(0);
+        let base = RF_PER_HIT.get(index).copied().unwrap_or(0) * POWERGEN_FACTOR;
+        let bonus = (age.max(0) * AGE_STEP).min(AGE_CAP);
+        base + base * bonus / 100
+    }
+
+    /// A pearl arrives (`receivePearl`): inside the window it pays and the generator starts
+    /// holding; at idle or while already holding both pearls are lost and nothing is paid.
+    pub fn receive(&mut self, age: i32) -> Option<i32> {
+        match self.charging {
+            HOLDING => {
+                self.discard(Loss::WhileHolding);
+                None
+            }
+            IDLE => {
+                self.discard(Loss::WhileIdle);
+                None
+            }
+            mode => {
+                self.arrived_at = mode;
+                let gained = Self::gain(mode, age);
+                self.gained += i64::from(gained);
+                self.energy = clamp_endergenic(self.energy.saturating_add(gained));
+                self.charging = HOLDING;
+                self.age = age;
+                Some(gained)
+            }
+        }
+    }
+
+    /// One tick of flight for every pearl in the air; the arrivals as `(destination, age)`.
+    pub fn tick_pearls(&mut self) -> Vec<([i32; 3], i32)> {
+        let mut arrivals = Vec::new();
+        self.pearls.retain_mut(|pearl| {
+            let (next, arrived) = pearl.tick();
+            *pearl = next;
+            if arrived {
+                arrivals.push((pearl.destination, pearl.age));
+                false
+            } else {
+                true
+            }
+        });
+        arrivals
+    }
+
+    /// `calculateDistance`: the flight time between two blocks, `(int)(distance / 3) + 1`.
+    #[must_use]
+    pub fn distance_between(from: [i32; 3], to: [i32; 3]) -> i32 {
+        let square: f64 = (0..3)
+            .map(|axis| {
+                let delta = f64::from(to[axis] - from[axis]);
+                delta * delta
+            })
+            .sum();
+        (square.sqrt() / 3.0) as i32 + 1
+    }
+
+    /// What one tick may offer each neighbour: the store above [`KEEP_RF`], at most
+    /// [`SEND_PER_TICK`] (upstream's `storedPower = energy - ENDERGENIC_KEEPRF`).
+    #[must_use]
+    pub fn send_amount(&self) -> u32 {
+        u32::try_from((self.energy - KEEP_RF).clamp(0, SEND_PER_TICK)).unwrap_or(0)
+    }
+
+    /// The state a saved compound describes, with every doctored value clamped the way upstream's
+    /// `GenericEnergyStorage.load` and the field ranges do.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one saved field per argument: the compound's own shape"
+    )]
+    pub fn restored(
+        energy: i32,
+        charging: i32,
+        age: i32,
+        destination: Option<[i32; 3]>,
+        distance: i32,
+        prev_in: bool,
+        pearls: Vec<Pearl>,
+        gained: i64,
+        spent: i64,
+        launched: i32,
+        dropped: i32,
+        arrived_at: i32,
+    ) -> Self {
+        let charging = if charging == HOLDING {
+            HOLDING
+        } else {
+            charging.clamp(IDLE, MAX_CHARGE)
+        };
+        let mut pearls: Vec<Pearl> = pearls
+            .into_iter()
+            .filter(|pearl| pearl.ticks_left >= 1)
+            .map(|pearl| Pearl {
+                ticks_left: pearl.ticks_left.min(MAX_DISTANCE * 8),
+                destination: pearl.destination,
+                age: pearl.age.max(0),
+            })
+            .take(MAX_PEARLS)
+            .collect();
+        pearls.shrink_to_fit();
+        Self {
+            energy: clamp_endergenic(energy),
+            charging,
+            age: age.max(0),
+            destination,
+            distance: destination.map_or(0, |_| distance.clamp(0, MAX_DISTANCE)),
+            prev_in,
+            pearls,
+            gained: gained.max(0),
+            spent: spent.max(0),
+            launched: u32::try_from(launched).unwrap_or(0),
+            dropped: u32::try_from(dropped).unwrap_or(0),
+            arrived_at: arrived_at.clamp(-2, MAX_CHARGE),
+            // The reason is a readout of the last drop, not saved state; a fresh load has none.
+            last_loss: None,
+        }
+    }
+}
+
+/// An amount clamped into the endergenic buffer.
+#[must_use]
+pub fn clamp_endergenic(energy: i32) -> i32 {
+    energy.clamp(0, ENDERGENIC_CAPACITY)
+}
+
+/// A deterministic draw in 0…999 for the pearl-loss chance (splitmix64).
+///
+/// Upstream uses `java.util.Random`; a fixed hash of the generator's position and the world time
+/// is the same 6-in-1000 chance and makes a run reproducible, so a lost pearl can be replayed
+/// instead of appearing once in a test run.
+#[must_use]
+pub const fn chance_roll(seed: u64) -> u32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z % 1000) as u32
+}
+
+/// Whether this draw loses the held pearl: upstream's `random.nextInt(1000) <= chanceLost`.
+#[must_use]
+pub const fn pearl_lost(seed: u64) -> bool {
+    chance_roll(seed) <= CHANCE_LOST
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,5 +1628,301 @@ mod tests {
             "a tier-2 cell holds more than a tier-1 one"
         );
         assert_eq!(clamped_energy(Tier::Three, 25_000_000), 20_000_000);
+    }
+
+    // --- the endergenic generator -------------------------------------------------------------
+
+    #[test]
+    fn the_hit_table_is_upstreams_own() {
+        assert_eq!(RF_PER_HIT[0], 0, "an idle generator pays nothing");
+        assert_eq!(RF_PER_HIT[1], 100);
+        assert_eq!(RF_PER_HIT[10], 12_800, "the peak is the eleventh mode");
+        assert_eq!(
+            RF_PER_HIT[15], 100,
+            "the window's last mode is the weakest again"
+        );
+        // The table times the powergen factor: a pearl at mode 1 is 200 FE, at mode 10 25,600.
+        assert_eq!(Endergenic::gain(1, 0), 200);
+        assert_eq!(Endergenic::gain(10, 0), 25_600);
+        assert_eq!(Endergenic::gain(15, 0), 200);
+        for outside in [IDLE, HOLDING, 16, 100] {
+            assert_eq!(
+                Endergenic::gain(outside, 0),
+                0,
+                "mode {outside} is outside the window"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pearl_that_arrives_inside_the_window_is_worth_its_table_slot() {
+        let mut generator = Endergenic::new();
+        generator.start_charging();
+        generator.charge_step();
+        generator.charge_step();
+        generator.charge_step();
+        generator.charge_step();
+        assert_eq!(generator.charging, 5, "five ticks into the window");
+        let gained = generator.receive(0);
+        assert_eq!(gained, Some(1_600), "mode 5's 800 FE times two");
+        assert_eq!(
+            generator.energy, 1_600,
+            "the store rose by the per-pearl amount"
+        );
+        assert_eq!(generator.gained, 1_600);
+        assert_eq!(generator.arrived_at, 5);
+        assert!(generator.holding(), "the generator now holds the pearl");
+        assert_eq!(generator.dropped, 0);
+    }
+
+    #[test]
+    fn the_age_bonus_caps_at_doubling() {
+        assert_eq!(Endergenic::gain(10, 0), 25_600, "age 0: no bonus");
+        assert_eq!(Endergenic::gain(10, 10), 38_400, "age 10: +50 %");
+        assert_eq!(Endergenic::gain(10, 20), 51_200, "age 20: +100 %");
+        assert_eq!(
+            Endergenic::gain(10, 100),
+            51_200,
+            "the bonus stops at 200 %"
+        );
+        assert_eq!(
+            Endergenic::gain(10, -5),
+            25_600,
+            "a doctored age is no bonus"
+        );
+    }
+
+    #[test]
+    fn a_pearl_arriving_at_idle_or_while_holding_pays_nothing_and_is_lost() {
+        let mut idle = Endergenic::new();
+        assert_eq!(idle.receive(0), None, "an idle generator loses the pearl");
+        assert_eq!(idle.energy, 0, "and pays nothing — the differential");
+        assert_eq!(idle.dropped, 1);
+        assert_eq!(idle.last_loss, Some(Loss::WhileIdle));
+        assert_eq!(idle.charging, IDLE);
+
+        let mut holding = Endergenic::new();
+        holding.start_charging();
+        holding.receive(0);
+        let energy = holding.energy;
+        assert_eq!(holding.receive(0), None, "a held pearl means both are lost");
+        assert_eq!(holding.energy, energy, "the second pearl pays nothing");
+        assert_eq!(holding.dropped, 1);
+        assert_eq!(holding.last_loss, Some(Loss::WhileHolding));
+        assert_eq!(holding.charging, IDLE);
+    }
+
+    #[test]
+    fn charging_runs_fifteen_modes_and_then_goes_idle() {
+        let mut generator = Endergenic::new();
+        generator.start_charging();
+        assert_eq!(generator.charging, 1);
+        for _ in 0..14 {
+            generator.charge_step();
+        }
+        assert_eq!(
+            generator.charging, MAX_CHARGE,
+            "fifteen ticks in the window"
+        );
+        generator.charge_step();
+        assert_eq!(
+            generator.charging, IDLE,
+            "past the window the generator is idle"
+        );
+        assert!(!generator.charging_window());
+    }
+
+    #[test]
+    fn a_rising_edge_starts_charging_and_another_fires_the_held_pearl() {
+        let mut generator = Endergenic::new();
+        assert_eq!(generator.pulse(0), Pulse::None);
+        assert_eq!(generator.pulse(15), Pulse::Start, "0 -> 15 starts a charge");
+        generator.start_charging();
+        assert_eq!(
+            generator.pulse(15),
+            Pulse::None,
+            "a held signal is not an edge"
+        );
+        assert_eq!(generator.pulse(0), Pulse::None, "falling is not an edge");
+        generator.charging = HOLDING;
+        assert_eq!(generator.pulse(15), Pulse::Fire, "a new edge fires");
+    }
+
+    #[test]
+    fn holding_costs_500_a_tick_and_an_empty_buffer_drops_the_pearl() {
+        let mut generator = Endergenic::new();
+        generator.energy = 1_200;
+        generator.charging = HOLDING;
+        assert!(generator.hold());
+        assert_eq!(generator.energy, 700);
+        assert_eq!(generator.spent, 500);
+        assert!(generator.hold());
+        assert_eq!(generator.energy, 200);
+        assert!(!generator.hold(), "200 FE cannot pay the 500 a tick");
+        assert_eq!(generator.energy, 200, "a failed hold spends nothing");
+        assert_eq!(generator.spent, 1_000);
+    }
+
+    #[test]
+    fn a_pearl_flies_for_the_links_distance_and_arrives_at_its_destination() {
+        assert_eq!(Endergenic::distance_between([0, 0, 0], [1, 0, 0]), 1);
+        assert_eq!(Endergenic::distance_between([0, 0, 0], [3, 0, 0]), 2);
+        assert_eq!(Endergenic::distance_between([0, 0, 0], [9, 0, 0]), 4);
+        assert_eq!(
+            Endergenic::distance_between([0, 0, 0], [12, 0, 0]),
+            5,
+            "twelve blocks is the first distance upstream refuses"
+        );
+
+        let mut generator = Endergenic::new();
+        generator.destination = Some([3, 0, 0]);
+        generator.distance = 2;
+        assert!(generator.fire(true));
+        assert_eq!(generator.pearls.len(), 1);
+        let mut arrivals = generator.tick_pearls();
+        assert!(
+            arrivals.is_empty(),
+            "the first tick of a two-tick flight is in the air"
+        );
+        assert_eq!(generator.pearls.len(), 1);
+        arrivals = generator.tick_pearls();
+        assert_eq!(arrivals, vec![([3, 0, 0], 0)]);
+        assert!(
+            generator.pearls.is_empty(),
+            "an arrived pearl leaves the list"
+        );
+        assert_eq!(generator.launched, 1);
+    }
+
+    #[test]
+    fn a_loss_reason_survives_its_text() {
+        for loss in [
+            Loss::MissingDestination,
+            Loss::WhileHolding,
+            Loss::WhileIdle,
+            Loss::NotEnoughEnergy,
+            Loss::Chance,
+        ] {
+            assert_eq!(Loss::parse(loss.text()), Some(loss), "{}", loss.text());
+        }
+        assert_eq!(Loss::parse("none"), None);
+        assert_eq!(Loss::parse("Pearl arrived"), None);
+    }
+
+    #[test]
+    fn a_pearl_fired_with_no_destination_is_dropped() {
+        let mut generator = Endergenic::new();
+        generator.charging = HOLDING;
+        assert!(!generator.fire(false));
+        assert_eq!(generator.dropped, 1);
+        assert_eq!(generator.last_loss, Some(Loss::MissingDestination));
+        assert_eq!(generator.charging, IDLE);
+        assert!(generator.pearls.is_empty(), "nothing is launched");
+        assert_eq!(generator.launched, 0);
+    }
+
+    #[test]
+    fn a_held_pearl_is_fired_aged_and_an_injected_one_at_age_zero() {
+        let mut generator = Endergenic::new();
+        generator.destination = Some([0, 0, 1]);
+        generator.distance = 1;
+        generator.age = 3;
+        generator.charging = HOLDING;
+        assert!(generator.fire(false));
+        assert_eq!(
+            generator.pearls[0].age, 4,
+            "a held pearl is fired aged one more"
+        );
+        generator.age = 7;
+        assert!(generator.fire(true));
+        assert_eq!(
+            generator.pearls[1].age, 0,
+            "an injected pearl starts at age 0"
+        );
+    }
+
+    #[test]
+    fn the_loss_chance_is_six_in_a_thousand_and_reproducible() {
+        assert_eq!(chance_roll(7), chance_roll(7), "the draw is deterministic");
+        let lost = (0..100_000).filter(|seed| pearl_lost(*seed)).count();
+        // 6 draws in 1000 (roll <= 5) is 0.6 %; a hash may drift a little over 100,000 seeds.
+        assert!(
+            (450..=750).contains(&lost),
+            "the loss chance over 100,000 ticks was {lost}, expected about 600"
+        );
+    }
+
+    #[test]
+    fn the_buffer_clamps_at_five_million_and_the_send_keeps_two_thousand() {
+        assert_eq!(clamp_endergenic(9_000_000), ENDERGENIC_CAPACITY);
+        assert_eq!(clamp_endergenic(-1), 0);
+        let mut generator = Endergenic::new();
+        generator.energy = 2_000;
+        assert_eq!(generator.send_amount(), 0, "the reserve is never sent");
+        generator.energy = 2_001;
+        assert_eq!(generator.send_amount(), 1);
+        generator.energy = 100_000;
+        assert_eq!(
+            generator.send_amount(),
+            SEND_PER_TICK as u32,
+            "at most 20,000 a tick"
+        );
+    }
+
+    #[test]
+    fn a_doctored_generator_reads_back_clamped() {
+        let state = Endergenic::restored(
+            9_999_999,
+            40,
+            -3,
+            Some([1, 2, 3]),
+            9,
+            true,
+            vec![Pearl::new(0, [1, 2, 3], -4), Pearl::new(3, [1, 2, 3], 2)],
+            -5,
+            -5,
+            -1,
+            -1,
+            99,
+        );
+        assert_eq!(state.energy, ENDERGENIC_CAPACITY, "the store is clamped");
+        assert_eq!(state.charging, MAX_CHARGE, "40 is past the window");
+        assert_eq!(state.age, 0);
+        assert_eq!(
+            state.distance, MAX_DISTANCE,
+            "a doctored distance is clamped"
+        );
+        assert_eq!(
+            state.pearls.len(),
+            1,
+            "a pearl with no flight left is dropped"
+        );
+        assert_eq!(state.pearls[0].age, 2);
+        assert_eq!(state.gained, 0);
+        assert_eq!(state.launched, 0);
+        assert_eq!(state.dropped, 0);
+        assert_eq!(state.arrived_at, MAX_CHARGE);
+    }
+
+    #[test]
+    fn a_window_pearl_pays_and_the_store_can_then_hold_it() {
+        // The whole mechanic in one place: pulse -> charge -> a pearl lands at mode 4 (400 x 2),
+        // and the generator then pays 500 a tick to keep it.
+        let mut generator = Endergenic::new();
+        generator.destination = Some([0, 0, 1]);
+        generator.distance = 1;
+        assert_eq!(generator.pulse(15), Pulse::Start);
+        generator.start_charging();
+        for _ in 0..3 {
+            generator.charge_step();
+        }
+        assert_eq!(generator.charging, 4);
+        assert_eq!(generator.receive(0), Some(800));
+        assert!(generator.hold());
+        assert_eq!(generator.energy, 300, "800 gained, 500 spent holding");
+        assert_eq!(
+            generator.gained - generator.spent,
+            i64::from(generator.energy)
+        );
     }
 }

@@ -60,10 +60,22 @@
 #  AC the power core crafts and is consumed; cell1's recipe crafts nothing without the parent's
 #     machine frame
 #  AD the `side` command's refusals are parsed replies, not the command's (always 0) status
+#  AE a generator, a destination three blocks away and the injector that feeds the link all place
+#     and read back; the link is 2 ticks ((int)(3/3)+1) and both generators start empty
+#  AF a pearl fired inside the destination's 1..15 charging window pays rfPerHit[mode] x 2, and
+#     the store is exactly what the generator gained minus what holding spent
+#  AG the same shot with the destination left idle: the pearl is lost and nothing is paid (the
+#     differential for AF)
+#  AH a generator with no injector charges through the window and stays at 0 FE
+#  AI the generator pushes its store into a neighbour and keeps exactly its 2,000 FE reserve
+#  AJ a broken endergenic carries its store (and only its store) on its item
+#  AK both carried recipes need the parent's machine frame, so neither crafts here
+#  AL the enderlink command's refusals are parsed replies (a stone, a 5-tick link, no generator)
+#  AM the store and the link survive save + relaunch
 #
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
-# of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C.
+# of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF.
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -1150,4 +1162,424 @@ eval "$(python3 "$PORT/tools/parse_side.py" "$LINE")"
 echo "  $LINE"
 echo "  a bad face, a bad mode and a position with no cell are three parsed refusals"
 
-echo "PASS: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+# --- the endergenic generator and the pearl injector ---------------------
+# Upstream's `EndergenicTileEntity` (1.21-7.0.6): a generator charges through modes 1..15 on a
+# redstone pulse, and a pearl fired at it from another generator pays `RF_PER_HIT[mode] *
+# powergenFactor` when it lands inside that window — and nothing when it lands at idle, where the
+# pearl is lost. A pearl that lands starts a hold that costs 500 FE a tick. The pearl injector
+# fires one pearl into the generator it is mounted on, on its own redstone pulse.
+#
+# The rows below z=92 are this slice's; the earlier slices' arena ends at z=90. Two generators are
+# the minimum upstream's own tooltip names ("you need at least two generators for this to work"),
+# and the link is the wrench's, set here by `/rftoolspower enderlink` — the harness's stand-in for
+# the smart wrench the parent port does not carry.
+ENDER=rftoolspower:endergenic
+INJECTOR=rftoolspower:pearl_injector
+ENDERGENIC_ENTITY=rftoolspower:endergenic_block_entity
+# `EndergenicTileEntity.rfPerHit` and `powergenFactor`: the gain the leg checks against the mode it
+# reads from the reply.
+RF_PER_HIT=(0 100 150 200 400 800 1600 3200 6400 8000 12800 8000 6400 2500 1000 100)
+POWERGEN_FACTOR=2
+
+ender_arena() {
+    ctl command "execute in minecraft:the_end run tp @s $((SX)).5 101 106.5" >/dev/null
+    ctl wait 40 >/dev/null
+    local attempt
+    for attempt in 1 2 3; do
+        ctl command "execute in minecraft:the_end run fill $((SX - 6)) 100 92 $((SX + 8)) 100 124 minecraft:stone" >/dev/null
+        ctl wait 6 >/dev/null
+        [ "$(block_name "$SX" 100 106)" = "minecraft:stone" ] && break
+        echo "  the endergenic arena floor fill did not land (attempt $attempt); waiting" >&2
+        ctl wait 40 >/dev/null
+    done
+    [ "$(block_name "$SX" 100 106)" = "minecraft:stone" ] || fail "the endergenic arena floor is not stone"
+    ctl command "execute in minecraft:the_end run fill $((SX - 6)) 101 92 $((SX + 8)) 108 124 minecraft:air" >/dev/null
+    ctl wait 8 >/dev/null
+    [ "$(block_name "$SX" 101 106)" = "minecraft:air" ] || fail "the endergenic arena air fill did not land"
+    ctl command "gamemode creative" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl wait 4 >/dev/null
+}
+
+ender_state() { # ender_state X Y Z — the `/rftoolspower endergenic` line, parsed
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower endergenic $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower endergenic reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_ender.py" "$line" --nonce "$NONCE")"
+    [ "${ok:-0}" = 1 ] || fail "the endergenic line did not parse: $line"
+    echo "  $line" >&2
+    echo "  parsed: energy=$ENERGY/$ECAP charging=$CHARGING gained=$GAINED spent=$SPENT arrived=$ARRIVED reason=$REASON dest=$DEST" >&2
+}
+
+injector_state() { # injector_state X Y Z — the `/rftoolspower injector` line, parsed
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower injector $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower injector reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_injector.py" "$line" --nonce "$NONCE")"
+    [ "${ok:-0}" = 1 ] || fail "the injector line did not parse: $line"
+    echo "  $line" >&2
+    echo "  parsed: pearls=$PEARLS generator=$GENERATOR" >&2
+}
+
+give_ender() { # give_ender [ENERGY] — a generator item, optionally carrying a store
+    ctl command "clear @s" >/dev/null
+    if [ -n "${1:-}" ]; then
+        ctl command "give @s $ENDER[minecraft:block_entity_data={id:\"$ENDERGENIC_ENTITY\",energy:$1}]" >/dev/null
+    else
+        ctl command "give @s $ENDER" >/dev/null
+    fi
+    ctl wait 8 >/dev/null
+}
+
+give_injector() {
+    ctl command "clear @s" >/dev/null
+    ctl command "give @s $INJECTOR" >/dev/null
+    ctl wait 8 >/dev/null
+}
+
+# The injector sits on top of its generator; its front is pinned up so the generator behind it is
+# the block below. `ctl place` exercises `state_for_placement` first (the block is placed from its
+# item), then the state is set explicitly — the `aim_monitor` precedent: the placement context's
+# face is the game's, not the harness's, and the direction is what the phase needs.
+# The injector stands on the floor beside its generator, its front away from it (upstream's
+# `getFacingFromEntity`: the front faces the placer, so the generator is behind it). It is placed
+# from its item — `state_for_placement` runs — and then the front is pinned: `ctl place`'s
+# placement yaw is the game's, not the player's (the monitor phases found this on 2026-11-21).
+place_injector() { # place_injector X Y Z FACE
+    local x=$1 y=$2 z=$3 face=${4:-east}
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    # Approach from the generator's far side: the block being aimed at must not be shadowed.
+    ctl command "execute in minecraft:the_end run tp @s $((x + 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select "$INJECTOR" >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at-block "$x" $((y - 1)) "$z" up >/dev/null \
+        || fail "cannot aim at the floor under $x,$y,$z: $(ctl block "$x" $((y - 1)) "$z" | jq -c '.')"
+    place_block "$x" "$y" "$z" "$INJECTOR" \
+        || fail "ctl place $INJECTOR at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$INJECTOR" ] || fail "the injector is not at $x,$y,$z"
+    echo "  injector: $(ctl block "$x" "$y" "$z" | jq -r '.state')" >&2
+    local state
+    state=$(ctl block "$x" "$y" "$z" | jq -r '.state')
+    case "$state" in
+        *facing="$face"*) ;;
+        *)
+            ctl command "execute in minecraft:the_end run setblock $x $y $z $INJECTOR[facing=$face]" >/dev/null
+            ctl wait 4 >/dev/null
+            state=$(ctl block "$x" "$y" "$z" | jq -r '.state')
+            echo "  (the placement's front was '$state'; pinned to facing=$face)" >&2
+            ;;
+    esac
+    case "$state" in
+        *facing="$face"*) ;;
+        *) fail "the injector's front is '$state', expected facing=$face" ;;
+    esac
+}
+
+# One atomic redstone pulse: a fill places every cell in the same tick, so two blocks see the same
+# rising edge (one command per block would let them fire on different ticks).
+pulse_fill() { # pulse_fill X1 Y1 Z1 X2 Y2 Z2
+    ctl command "execute in minecraft:the_end run fill $1 $2 $3 $4 $5 $6 minecraft:redstone_block" >/dev/null
+    ctl wait 3 >/dev/null
+    ctl command "execute in minecraft:the_end run fill $1 $2 $3 $4 $5 $6 minecraft:air" >/dev/null
+    ctl wait 3 >/dev/null
+}
+
+link() { # link X Y Z DX DY DZ
+    local line
+    say "rftoolspower enderlink $1 $2 $3 $4 $5 $6"
+    line=$(await_line "Endergenic link at $1,$2,$3")
+    [ -n "$line" ] || fail "no link reply for $1,$2,$3 -> $4,$5,$6: $(ctl messages 8 | jq -c '.chat')"
+    echo "  $line" >&2
+}
+
+# One ender pearl into the injector from a survival click, so it leaves the hand.
+pearl_into_injector() { # pearl_into_injector X Y Z
+    local x=$1 y=$2 z=$3
+    ctl command "gamemode survival" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl command "give @s minecraft:ender_pearl 1" >/dev/null
+    ctl wait 8 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x + 2)).5 $y $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+    ctl interact "$x" "$y" "$z" >/dev/null
+    ctl wait 8 >/dev/null
+    injector_state "$x" "$y" "$z"
+    [ "$PEARLS" = 1 ] || fail "the pearl click left $PEARLS pearls in the injector at $x,$y,$z"
+    [ "$(held_count minecraft:ender_pearl)" = 0 ] || fail "the pearl stayed in the hand after the click"
+    ctl command "gamemode creative" >/dev/null
+    ctl wait 4 >/dev/null
+}
+
+expect_ender_energy() { [ "$ENERGY" = "$1" ] || fail "the endergenic holds $ENERGY FE, expected $1"; }
+expect_charging() { [ "$CHARGING" = "$1" ] || fail "the endergenic's charging mode is $CHARGING, expected $1"; }
+
+echo "== AE: a generator, its destination and the injector that feeds the link =="
+ender_arena
+for z in 94 97; do
+    ctl command "execute in minecraft:the_end run setblock $SX 101 $z minecraft:air" >/dev/null
+    ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 $z minecraft:air" >/dev/null
+done
+ctl wait 4 >/dev/null
+# The injector first (placed with nothing to its east), then the source west of it, then the
+# destination three blocks south: A -> B is a 2-tick flight, ((int)(3/3)+1).
+give_injector
+place_injector "$((SX + 1))" 101 94 east
+give_ender
+place_held "$SX" 101 94 "$ENDER"
+give_ender
+place_held "$SX" 101 97 "$ENDER"
+injector_state "$((SX + 1))" 101 94
+[ "$GENERATOR" = "$SX,101,94" ] || fail "the injector points at generator '$GENERATOR', expected $SX,101,94"
+[ "$PEARLS" = 0 ] || fail "a fresh injector holds $PEARLS pearls"
+link "$SX" 101 94 "$SX" 101 97
+ender_state "$SX" 101 94
+[ "$DEST" = "$SX,101,97" ] || fail "the source's link is $DEST, expected $SX,101,97"
+[ "$DISTANCE" = 2 ] || fail "a three-block link is $DISTANCE ticks, expected 2 ((int)(3/3)+1)"
+expect_ender_energy 0
+ender_state "$SX" 101 97
+expect_ender_energy 0
+expect_charging 0
+echo "  A links to B three blocks away (a 2-tick flight); both are empty and idle"
+
+echo "== AF: a pearl that lands inside the window pays the hit table's amount =="
+pearl_into_injector "$((SX + 1))" 101 94
+# One fill pulses the injector and B on the same tick, through their top faces. It also covers the
+# air above A, so A sees an edge too: A is idle, and it starts a charge the injector's fire resets.
+pulse_fill $SX 102 94 $((SX + 1)) 102 97
+ctl wait 20 >/dev/null
+injector_state "$((SX + 1))" 101 94
+[ "$PEARLS" = 0 ] || fail "the injector still holds $PEARLS pearls after its pulse"
+ender_state "$SX" 101 94
+[ "$FIRED" = 1 ] || fail "the source fired $FIRED pearls, expected 1"
+ender_state "$SX" 101 97
+[ "$ARRIVED" -ge 1 ] && [ "$ARRIVED" -le 15 ] \
+    || fail "the pearl arrived at charging=$ARRIVED, outside the 1..15 window"
+EXPECT=$(( RF_PER_HIT[ARRIVED] * POWERGEN_FACTOR ))
+[ "$GAINED" = "$EXPECT" ] \
+    || fail "the pearl paid $GAINED FE at mode $ARRIVED, expected $EXPECT (rfPerHit ${RF_PER_HIT[ARRIVED]} x $POWERGEN_FACTOR)"
+[ "$ENERGY" = $(( GAINED - SPENT )) ] \
+    || fail "the store is $ENERGY but the generator gained $GAINED and spent $SPENT holding"
+[ $(( SPENT % 500 )) = 0 ] || fail "the hold cost $SPENT is not a multiple of the 500 a tick"
+if [ "${SELFTEST_ENDER:-0}" = 1 ]; then
+    echo "(selftest: asserting the pearl paid nothing)"
+    [ "$GAINED" = 0 ] || fail "selftest: the pearl paid $GAINED FE at mode $ARRIVED, so the assertion is alive"
+fi
+echo "  the pearl landed at mode $ARRIVED and paid $GAINED FE (rfPerHit ${RF_PER_HIT[ARRIVED]} x $POWERGEN_FACTOR); holding spent $SPENT"
+# Let the hold end (a big gain pays 500 a tick until the store cannot) so the monitor below reads a
+# store at rest: two reads a few ticks apart of a moving store are not comparable.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    [ "$CHARGING" = -1 ] || break
+    ctl wait 10 >/dev/null
+    ender_state "$SX" 101 97
+done
+[ "$CHARGING" != -1 ] || fail "the generator is still holding a pearl after 120 ticks"
+# The endergenic's buffer is a real energy capability: a monitor facing B reads the same store.
+place_monitor "$((SX + 1))" 101 97
+aim_monitor "$((SX + 1))" 101 97 east
+ctl wait 30 >/dev/null
+ender_state "$SX" 101 97
+monitor "$((SX + 1))" 101 97
+expect_target "$ENDER"
+[ "$STORED" = "$ENERGY" ] || fail "the monitor reads $STORED FE but the generator holds $ENERGY"
+[ "$MAXE" = "$ECAP" ] || fail "the monitor reads capacity $MAXE, expected $ECAP"
+[ "$IS_ENERGY" = 1 ] || fail "the endergenic did not answer the energy capability"
+echo "  the monitor facing the generator reads its $ENERGY/$ECAP FE through the capability"
+
+echo "== AG: a pearl that lands while the destination is idle is lost and pays nothing =="
+for z in 108 111; do
+    ctl command "execute in minecraft:the_end run setblock $SX 101 $z minecraft:air" >/dev/null
+    ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 $z minecraft:air" >/dev/null
+done
+ctl wait 4 >/dev/null
+give_injector
+place_injector "$((SX + 1))" 101 108 east
+give_ender
+place_held "$SX" 101 108 "$ENDER"
+give_ender
+place_held "$SX" 101 111 "$ENDER"
+link "$SX" 101 108 "$SX" 101 111
+pearl_into_injector "$((SX + 1))" 101 108
+# Only the injector is pulsed: the destination never leaves idle, so the pearl has nowhere to land.
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 102 108 minecraft:redstone_block" >/dev/null
+ctl wait 3 >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 102 108 minecraft:air" >/dev/null
+ctl wait 24 >/dev/null
+ender_state "$SX" 101 111
+expect_ender_energy 0
+[ "$GAINED" = 0 ] || fail "an idle destination paid $GAINED FE for a pearl it should have lost"
+[ "$DROPPED" = 1 ] || fail "the destination dropped $DROPPED pearls, expected the one it lost"
+[ "$REASON" = "Pearl arrived while idle" ] || fail "the drop reason is '$REASON', expected 'Pearl arrived while idle'"
+[ "$ARRIVED" = -2 ] || fail "the destination records an arrival at mode $ARRIVED but paid nothing"
+injector_state "$((SX + 1))" 101 108
+[ "$PEARLS" = 0 ] || fail "the injector kept its pearl after the pulse"
+ender_state "$SX" 101 108
+[ "$FIRED" = 1 ] || fail "the source fired $FIRED pearls, expected 1"
+echo "  the same shot outside the window: the pearl is lost, the destination gains 0 FE"
+
+echo "== AH: a generator with no injector stays empty even while it charges =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 114 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+give_ender
+place_held "$SX" 101 114 "$ENDER"
+ender_state "$SX" 101 114
+expect_ender_energy 0
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 114 minecraft:redstone_block" >/dev/null
+ctl wait 3 >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 114 minecraft:air" >/dev/null
+ctl wait 2 >/dev/null
+ender_state "$SX" 101 114
+[ "$CHARGING" -ge 1 ] && [ "$CHARGING" -le 15 ] \
+    || fail "the pulse left the generator at charging=$CHARGING, expected a mode inside 1..15"
+ctl wait 30 >/dev/null
+ender_state "$SX" 101 114
+expect_charging 0
+expect_ender_energy 0
+[ "$GAINED" = 0 ] || fail "a generator with no injector gained $GAINED FE"
+[ "$FIRED" = 0 ] || fail "a generator with no injector fired $FIRED pearls"
+echo "  a charge runs 1..15 and expires with no pearl: 0 FE, nothing fired"
+
+echo "== AI: the endergenic pushes out and keeps its 2,000 FE reserve =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 117 minecraft:air" >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 117 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+give_ender 100000
+place_held "$SX" 101 117 "$ENDER"
+ender_state "$SX" 101 117
+expect_ender_energy 100000
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 117 $RECEIVER" >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$((SX + 1))" 101 117)" = "$RECEIVER" ] || fail "the harness receiver did not place beside the generator"
+ctl wait 40 >/dev/null
+ender_state "$SX" 101 117
+expect_ender_energy 2000
+R_ENDER=$(energy_of "$((SX + 1))" 101 117)
+[ "$R_ENDER" = 98000 ] \
+    || fail "the receiver holds $R_ENDER FE, expected 98,000: the generator pushes all but its 2,000 FE reserve"
+echo "  the 100,000 FE store moved into the receiver and the generator kept exactly $ENERGY FE"
+
+echo "== AJ: a broken endergenic carries its store on its item =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 120 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+give_ender 3000
+place_held "$SX" 101 120 "$ENDER"
+ender_state "$SX" 101 120
+expect_ender_energy 3000
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 6 >/dev/null
+break_block "$SX" 101 120 minecraft:iron_pickaxe
+pick_up_item "$SX" 101 120 "$ENDER"
+DROP_LINE=$(held_item_line_for "$ENDER")
+[ -n "$DROP_LINE" ] || fail "no /data get reply for the picked-up endergenic: $(ctl messages 8 | jq -c '.chat')"
+echo "  $DROP_LINE" >&2
+DROP=$(python3 "$PORT/tools/parse_drop.py" "$DROP_LINE" 3000 "$ENDERGENIC_ENTITY") || true
+eval "$DROP"
+[ "${ok:-0}" = 1 ] || fail "the dropped endergenic does not carry 3,000 FE: $DROP_LINE"
+echo "  the item carries $carried FE"
+place_held "$SX" 101 120 "$ENDER"
+ender_state "$SX" 101 120
+[ "$ENERGY" -ge 3000 ] || fail "the placed-back generator holds $ENERGY FE, expected at least 3,000"
+[ "$DEST" = none ] || fail "the store's item carried the link ($DEST) as well; upstream copies the store only"
+echo "  placed back at $ENERGY FE, with no link carried over"
+
+echo "== AK: both endergenic recipes need the parent's machine frame, so neither crafts here =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+for item in minecraft:diamond minecraft:ender_pearl minecraft:stone; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 8 >/dev/null
+TX=$((SX + 4)); TY=101; TZ=94
+ctl setblock "$TX" "$TY" "$TZ" minecraft:air >/dev/null
+ctl setblock "$TX" "$TY" "$TZ" minecraft:crafting_table >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $((TX - 1)).5 $TY $((TZ)).5" >/dev/null
+ctl wait 4 >/dev/null
+ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the click"
+ctl wait 6 >/dev/null
+GRID=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
+[ "$GRID" = 10 ] || fail "the crafting table did not open its grid ($GRID grid slots)"
+# "dod" / "ZFZ" / "dod": diamonds and ender pearls in the outer cells, stones where
+# `rftoolsbase:infused_enderpearl` (Z) and `rftoolsbase:machine_frame` (F) belong.
+for cell in 100 102 106 108; do place_one minecraft:diamond "$cell"; done
+for cell in 101 107; do place_one minecraft:ender_pearl "$cell"; done
+place_one "$STONE" 103
+place_one "$STONE" 104
+place_one "$STONE" 105
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the endergenic recipe with stones where the parent's items belong: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the endergenic recipe crafted $RESULT without the parent"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+# " C " / "rFr" / " H " with a chest for C, a stone for the machine frame, and a hopper for H.
+ctl command "clear @s" >/dev/null
+for item in minecraft:chest minecraft:redstone minecraft:hopper minecraft:stone; do
+    ctl command "give @s $item 4" >/dev/null
+done
+ctl wait 8 >/dev/null
+ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the second click"
+ctl wait 6 >/dev/null
+place_one minecraft:chest 101
+place_one minecraft:redstone 103
+place_one "$STONE" 104
+place_one minecraft:redstone 105
+place_one minecraft:hopper 107
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the pearl injector's recipe with a stone where rftoolsbase:machine_frame belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the injector's recipe crafted $RESULT without the parent"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  the machine frame is what both recipes need and RFToolsBase is not in this build"
+
+echo "== AL: the enderlink command's refusals are parsed replies =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 105 minecraft:stone" >/dev/null
+ctl wait 4 >/dev/null
+say "rftoolspower enderlink $SX 101 94 $SX 101 105"
+LINE=$(await_line "is not an endergenic generator")
+[ -n "$LINE" ] || fail "no refusal for a stone destination: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE"
+ctl command "execute in minecraft:the_end run setblock $SX 101 106 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+give_ender
+place_held "$SX" 101 106 "$ENDER"
+say "rftoolspower enderlink $SX 101 94 $SX 101 106"
+LINE=$(await_line "is too far")
+[ -n "$LINE" ] || fail "no 'too far' refusal for a twelve-block link: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE"
+say "rftoolspower enderlink $SX 101 105 $SX 101 94"
+LINE=$(await_line "endergenic generator there")
+[ -n "$LINE" ] || fail "no refusal for a source that is not a generator: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE"
+echo "  12 blocks is a 5-tick flight, upstream's maximum is 4; a stone is not a generator either way"
+
+echo "== AM: the store and the link survive save + relaunch =="
+ctl save >/dev/null
+ctl wait 10 >/dev/null
+ender_state "$SX" 101 97
+SAVED_ENERGY=$ENERGY
+SAVED_ARRIVED=$ARRIVED
+ctl quit >/dev/null 2>&1 || true
+sleep 2
+launch
+ctl command "execute in minecraft:the_end run tp @s $((SX - 2)).5 101 97.5" >/dev/null
+ctl wait 40 >/dev/null
+[ "$(block_name "$SX" 101 97)" = "$ENDER" ] || fail "the endergenic did not survive the relaunch"
+ender_state "$SX" 101 97
+[ "$ENERGY" = "$SAVED_ENERGY" ] || fail "after the relaunch the store is $ENERGY, was $SAVED_ENERGY"
+[ "$ARRIVED" = "$SAVED_ARRIVED" ] || fail "after the relaunch the arrival mode is $ARRIVED, was $SAVED_ARRIVED"
+KEPT_ENERGY=$ENERGY
+KEPT_ARRIVED=$ARRIVED
+ender_state "$SX" 101 94
+[ "$DEST" = "$SX,101,97" ] || fail "after the relaunch the source's link is $DEST, expected $SX,101,97"
+echo "  after save + relaunch: B holds $KEPT_ENERGY FE (its mode-$KEPT_ARRIVED arrival) and A still links to B"
+
+echo "PASS: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

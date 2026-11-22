@@ -1,14 +1,18 @@
-# RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the powercell)
+# RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
+# powercell; slice 4: the endergenic generator and the pearl injector)
 
-> **Current state (2026-11-22): slice 3, package 0.1.2 at pin
+> **Current state (2026-11-22): slice 4, package 0.1.3 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
 > generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
 > (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
 > entity with a 500,000 / 4,000,000 FE buffer, six face modes that default to `NONE`, an adjacency
 > **network** that shares one store and capacity across cells of any tier, and the output push out
-> of an `OUTPUT` face. Gap 9 said `blocked(smartwrench-not-carried)`; the missing carrier is
-> replaced by the **`/rftoolspower side <pos> <face> NONE|INPUT|OUTPUT`** command, exactly as
-> `/rftoolspower band` stands in for the monitor's GUI sliders.
+> of an `OUTPUT` face; slice 4 adds the mod's signature mechanic, the **endergenic generator** with
+> its **pearl injector**: two linked generators, a redstone pulse that starts a 15-mode charge and
+> one that fires the held pearl, and the `rfPerHit` table that pays 200…25,600 FE for a pearl that
+> lands inside the window (and nothing for one that lands outside it). Where upstream's smart
+> wrench is needed (the link, the cell's face modes), the harness uses commands —
+> `/rftoolspower enderlink`, `/rftoolspower side` — and never a fake item.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -31,8 +35,8 @@ MIT (`5195ba53…4b00`), and the provenance is in [`LICENSE-NOTICE.md`](LICENSE-
 to the campaign's maintainer approval (ARCHITECTURE.md §8).
 
 Status: **ported-partial** — the coal generator (A–M), the power monitor plus the generator's
-energy push (N–T) and the powercell (U–AD) are implemented and verified in game at the current pin.
-The gap list below is the rest of the mod.
+energy push (N–T), the powercell (U–AD) and the endergenic pair (AE–AM) are implemented and
+verified in game at the current pin. The gap list below is the rest of the mod.
 
 ## What the powercell binds to (the 2026-11-21 parent-surface ruling)
 
@@ -257,7 +261,7 @@ nothing out). It is built beside the package by `tools/build-e2e-game.sh`, lives
 `.hmod` (the launcher refuses nested package paths, so its source is stored as `.in` files), and is
 listed in `native-mods.json` in `native-build-modset.log`.
 
-### Engines traps this slice cost (measured, not read)
+## Engines traps this slice cost (measured, not read)
 
 1. **The placement context's yaw is not the player's look.** `ctl place` reported the opposite of
    the player's yaw, and changed between runs, so the direction-sensitive phases let the monitor
@@ -456,6 +460,166 @@ upstream's `PowerCellNetwork` object. A cell in an unloaded chunk is therefore n
 chunk loads; nothing is lost (each cell saves its own store), but a network straddling an unloaded
 chunk reads a smaller total for that moment.
 
+### Slice 4 — the endergenic generator and the pearl injector (package 0.1.3)
+
+Gap line it comes from (`## Gaps` below): **gap 10** — *"the endergenic generator with the pearl
+injector and ender monitor"* (the generator and injector taken; the **ender monitor is phase 2**,
+together with the `fireMonitors` notifications the two now leave as a no-op). Tier: still
+**machines** — block entities with a server tick, a capability, saved state and a flight model. No
+GUI, no renderer, no linking item.
+
+### What it does (upstream `EndergenicTileEntity`, `PearlInjectorTileEntity`,
+`EndergenicConfiguration`, `data/EndergenicPearl.java`, 1.21-7.0.6)
+
+- **The blocks.** `rftoolspower:endergenic` on a plain full cube (upstream's
+  `Properties.of().strength(2.0f).sound(METAL).noOcclusion()`, `RotationType.NONE`) and
+  `rftoolspower:pearl_injector` on McJtyLib's STANDARD_IRON with a six-way `facing`
+  (`RotationType.ROTATION`; the front faces the placer, so the generator it feeds is behind it).
+- **The charge.** A **rising** redstone edge (`getBestNeighborSignal > 0 && !prevIn`) while idle
+  starts a charge at mode **1**; each tick then adds a mode, and past **15** the generator is idle
+  again. A rising edge while **holding** fires the held pearl.
+- **The hit table.** A pearl that arrives at mode *N* while charging pays
+  `rfPerHit[N] × powergenFactor` (2.0), plus up to **100 %** more for the pearl's age
+  (`age × 5 %`, capped at 100 — a pearl that has already powered five generators is worth double).
+  The table is `{0, 100, 150, 200, 400, 800, 1600, 3200, 6400, 8000, 12800, 8000, 6400, 2500,
+  1000, 100}`: **200 FE** at mode 1, **25,600 FE** at mode 10, 200 again at mode 15.
+- **The misses.** A pearl that arrives while idle is **lost** (`"Pearl arrived while idle"`); one
+  that arrives while already holding loses **both** (`"Pearl arrived while holding"`). Nothing is
+  paid — the differential this slice is proven against.
+- **The hold.** A landed pearl starts a hold that costs **500 FE a tick**; when the store cannot
+  pay it the pearl is dropped (`"Not enough energy to hold pearl"`). While holding there is also
+  upstream's **0.6 %** chance a tick that the pearl is simply lost (`nextInt(1000) <= 5`).
+- **The flight.** A fired pearl travels `(int)(3-D distance / 3) + 1` ticks (a three-block link is
+  2 ticks) to its **destination**, the generator a wrench link named; a link of **5 ticks or more**
+  is refused ("maximum 4"). A generator with no destination loses the pearl it fires
+  (`"Missing destination"`).
+- **The buffer.** **5,000,000 FE** (`endergenicMaxPower`), stored as the int `energy` in the saved
+  compound and declared through `Registrar::block_energy`: readable (a monitor facing it shows the
+  store) and **not** insertable/extractable — the generator pushes on its own tick, as upstream's
+  `handleSendingEnergy` does: up to **20,000 FE a tick** to every neighbour that answers the
+  capability, and it **keeps 2,000 FE** (`endergenicKeepRf`) as the reserve a held pearl needs.
+- **The injector.** **18 pearl slots** (a 9×2 buffer), insert-only through every face; a rising
+  redstone edge takes **one ender pearl** and fires it from the generator it is mounted on
+  (`findEndergenicTileEntity`: behind its front, else above). A pearl injected into a generator
+  that is already holding is consumed and dropped — upstream's own comment says "this one is lost".
+- **The item.** A broken endergenic carries its **store** (upstream's loot copies
+  `mcjtylib:item_energy` only), clamped to the capacity when placed; the charge, the link and the
+  pearls do not travel. The injector's pearls do not travel either (upstream's `item_inventory`
+  component is not registered here — gap 8's shape).
+- **The readouts.** `/rftoolspower endergenic <pos>` prints energy/charging/age/pearls/fired/
+  dropped/gained/spent/arrived/reason/dest/distance in one line; `/rftoolspower injector <pos>`
+  prints its pearl count and the generator it feeds; `/rftoolspower enderlink <pos> <dest>` is the
+  smart wrench's link. All three are the harness's stand-ins for upstream's GUI and wrench.
+
+### Numbers and where they came from
+
+| Number | Value | Source |
+|---|---:|---|
+| capacity | 5,000,000 FE | `EndergenicConfiguration.MAXENERGY` (`endergenicMaxPower`) |
+| a held pearl costs | 500 FE a tick | `rfToHoldPearl` (`endergenicRfHolding`) |
+| the reserve | 2,000 FE | `ENDERGENIC_KEEPRF` (`endergenicKeepRf`) |
+| the push | 20,000 FE a tick a neighbour | `ENDERGENIC_SENDPERTICK` |
+| the powergen factor | ×2 | `powergenFactor` (default 2.0) |
+| the loss chance | 5 in 1,000 (0.6 %) | `chanceLost` (`nextInt(1000) <= 5`) |
+| the hit table | 0…12,800 by mode | `EndergenicTileEntity.rfPerHit` |
+| the window | modes 1…15 | `chargingMode >= 16` → idle |
+| the age bonus | +5 % an age, capped +100 % | `age * 5`, `a > 100` → 100 |
+| a link's flight | `(int)(d/3)+1` ticks, ≤ 4 | `calculateDistance`, `distance >= 5` refused |
+| the injector's buffer | 18 pearls | `PearlInjectorTileEntity.BUFFER_SIZE` (9×2) |
+| endergenic hardness | 2.0 / 2.0, pickaxe, iron sound | the block's own `Properties` / STANDARD_IRON |
+| endergenic recipe | diamond, obsidian-tag, infused pearl, machine frame (`"dod"/"ZFZ"/"dod"`) | `EndergenicModule.initDatagen` |
+| pearl injector recipe | chest tag / redstone / machine frame / hopper (`" C "/"rFr"/" H "`) | `EndergenicModule.initDatagen` |
+
+### Red → green
+
+The generator's and the injector's rules were stubbed `todo!()` behind their tests; the failing run
+is `ports/_shared/evidence/rftoolspower/red-endergenic.log`:
+
+```
+test result: FAILED. 50 passed; 14 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+not yet implemented: Endergenic::gain is not written yet
+not yet implemented: chance_roll is not written yet
+```
+
+Green: **74 passed; 0 failed** (`sdk-test.log`, which prints the package sha). The fourteen tests
+pin: the hit table and the window's edges; a mode-5 arrival paying 1,600 and starting the hold; the
+age bonus's cap at a doubling; an idle and a holding arrival paying nothing; the fifteen charging
+modes; rising-edge-only pulses; the 500-a-tick hold and an empty buffer dropping the pearl; the
+flight time and its arrival; a fired pearl with no destination; the held-versus-injected age; the
+loss chance (6 in 1,000, deterministic); the 5,000,000 clamp and the 2,000 reserve; a doctored save
+read back clamped; and one whole pulse → charge → hit → hold cycle.
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `native-build` reported `Compiling rftoolspower (1 of 1)` and
+installed `native-0a875da-88daa563f37b`; the two-mod e2e build is `native-0a875da-26adda5b2fc9`
+(`rfpowerharness`, `rftoolspower`), and its `native-mods.json` names version **0.1.3**.
+
+| log | verdict |
+|---|---|
+| `e2e-endergenic.log` | **PASS**, `EXIT:0` — phases A–AM (the whole port) |
+| `e2e-endergenic-selftest.log` | `FAIL: selftest: the pearl paid 200 FE at mode 1, so the assertion is alive`, `EXIT:1` |
+| `e2e-endergenic-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` (the unmodded Nightly) |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=11 ok=11 missing-exit=0 bad-exit=0`.
+
+The parsed assertions, each from a `ctl` reply:
+
+| phase | what it asserts (observed) |
+|---|---|
+| AE | an injector placed from its item at `303,101,94` reads `pearls=0 generator=302,101,94`, faces `east`; the source's link reads `dest=302,101,97 distance=2`; both generators are `0/5000000` and idle |
+| AF | a pearl clicked into the injector (`pearls=1`, hand empty) and fired by one `fill` that pulses the injector and the destination **on the same tick**: the source reads `fired=1`, the destination `arrived=1 gained=200` = `rfPerHit[1] × 2`, `energy == gained − spent`; the monitor beside it reads `stored=200 max=5000000 level=1` |
+| AG | the same shot with the destination left idle: `energy=0 gained=0 dropped=1 arrived=-2 reason="Pearl arrived while idle"` — the differential for AF, and `SELFTEST_ENDER=1` inverts AF and fails |
+| AH | a generator with no injector: the pulse leaves `charging=5` (inside 1…15), 30 ticks later `charging=0`, `energy=0`, `fired=0` |
+| AI | a doctored 100,000 FE generator beside the harness receiver ends at **2,000 FE** with the receiver at **98,000** — the push and the `endergenicKeepRf` reserve |
+| AJ | a survival break of a 3,000 FE generator drops one whose `SelectedItem` carries `block_entity_data {id: "rftoolspower:endergenic_block_entity", energy: 3000}`; placing it restores `3000 FE` and **no link** |
+| AK | the endergenic's and the injector's carried recipes with a stone where the parent's items belong craft nothing |
+| AL | `/rftoolspower enderlink` refusals are parsed replies: "destination … is not an endergenic generator", "distance 5 is too far (maximum 4)", "No RFTools Power endergenic generator there." |
+| AM | after save + quit + relaunch: the destination still holds `200 FE` with `arrived=1`, and the source still links to it |
+
+Counterfactual: `SELFTEST_ENDER=1` asserts AF's `gained == 0` and the leg fails as designed, so AF
+can fail; AG is AF's differential (the same shot outside the window pays nothing) and AH is the
+"no injector at all" case. The control leg proves AE is not vacuous.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **`ctl look-at-block … up` cannot see a face above the eye.** Aiming at a block's top face from
+   the floor answers *"no face of block … is visible from here"*, and the placement then refuses
+   with *"no visible face to place … against; it needs a solid neighbour in reach"*. The injector
+   therefore stands **beside** its generator on the floor (where `place_held`'s floor-level
+   placement works) and its front is pinned to the side the generator is not on.
+2. **The placement's yaw is the game's, not the player's** (the monitor's trap again): the injector
+   placed with `state_for_placement` running reported `facing=east` in this run, but the leg pins
+   the state anyway, so a change in the placement context cannot silently repoint the injector.
+3. **One `fill` is the only atomic multi-block pulse.** Two `setblock`s land on different ticks, so
+   the destination and the injector must be pulsed by **one** fill (through their top faces) or the
+   arrival mode drifts with the command latency.
+4. **A generator whose store cannot pay the 500-a-tick hold drops the pearl on the next tick**, so
+   a 200 FE hit ends at `charging=0 dropped=1 reason="Not enough energy to hold pearl"` — the leg
+   reads `arrived`/`gained` for the payment, not the hold.
+5. **The drop reason is saved state here.** Upstream keeps `lastPearlsLostReason` as a live field;
+   this port prints the readout from the saved compound, so the reason is written with the rest of
+   the state (otherwise a reply a tick later says `none`).
+
+### Upstream defects fixed (slice 4)
+
+None adopted. Three *documented* deviations:
+
+- **The loss chance is a position-and-tick hash** (splitmix64, `chance_roll`) instead of
+  `java.util.Random`: the same 6-in-1,000 rate, but reproducible, so a lost pearl in a run can be
+  replayed instead of appearing once.
+- **The statistics window is not ported**: upstream averages `rfGained`/`rfLost` over 100 ticks for
+  its HUD; this port prints the totals since placement and the last arrival mode, which is the same
+  data without the average.
+- **The injector has no per-slot item filter** (a `ModContainer` declaration has no slot predicate
+  at this pin): automation can insert any item into its 18 slots, but the injector only ever
+  consumes ender pearls (upstream refuses non-pearls at the face). A hand click refuses them with a
+  line.
+- Also not expressible: upstream's `getFacingFromEntity` vertical branches (placer above → UP,
+  block above the eye → DOWN) — the placement event carries the view angles, not the placer's
+  height, so the injector's front is horizontal; the `findEndergenicTileEntity` UP fallback still
+  works for a generator above it.
+
 ## Engines traps this slice cost (measured, not read)
 
 1. **Creative keeps the container stack.** `ItemPlace::PlayerHand.extract` follows vanilla's
@@ -511,11 +675,44 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
    (20,000,000 FE, 4,000 FE a side — the same code with a third content block and recipe), the
    **smart-wrench item** itself (`rftoolsbase:smartwrench`, `ports/rftoolsbase` gap 12), the
    **powercell GUI** and the **powercell card**'s dimensional-cell linking.
-10. **The rest of the mod:** the **power level** display (`PowerLevelTileEntity`, the monitor's
+10. ~~**The endergenic generator with the pearl injector**~~ — **ported in slice 4** (the charge
+    window, the hit table, the flight, the hold, the link, the push with its 2,000 FE reserve, and
+    the injector's 18-slot buffer; the wrench's link is the `/rftoolspower enderlink` command).
+    Still open in this family: the **ender monitor** (`EnderMonitorTileEntity`: three modes —
+    `MODE_LOSTPEARL`/`MODE_PEARLFIRED`/`MODE_PEARLARRIVED` — where `fireFromEndergenic` sets
+    `needpulse` when the mode it watches just happened and the tick puts **15** on its redstone
+    output for that one tick, plus the `fireMonitors` notice the generator owes its neighbours), the
+    **endergenic GUI** (`GuiEndergenic`: the stats list, the destination display) and its
+    **renderer** (the floating pearl, the good/bad flash), the **infusable factors** in the hold and
+    the gain (no upgrade slot in this port), and the **5-second statistics window** the HUD averages.
+11. **The rest of the mod:** the **power level** display (`PowerLevelTileEntity`, the monitor's
     sibling — same tick, but a 0..9 ratio written straight to the redstone output and no level
-    state), the dimensional cell (with its card-linked networks), the endergenic generator with the
-    pearl injector and ender monitor, and the blazing generator/agitator/infuser with blazing rods.
-    The power monitor itself is ported in slice 2.
+    state), the dimensional cell (with its card-linked networks), and the blazing
+    generator/agitator/infuser with blazing rods. The power monitor is ported in slice 2 and the
+    endergenic pair in slice 4.
+
+## Coverage of the endergenic family (slice 4)
+
+| family | state |
+|---|---|
+| `endergenic` and `pearl_injector`: block, item, blockstates (the injector's six `facing` variants), models, textures, tags, creative tab, lang | tested (AE: the injector placed from its item and read back facing east; the two generators placed, drawn from the tab) |
+| the charge: a rising edge starts mode 1, fifteen modes, idle again | tested (AH: `charging=5` right after a pulse, `0` thirty ticks later; unit test pins 1…15) |
+| the hit table: `rfPerHit[mode] × 2` (plus the age bonus) | tested (AF: the arrival mode is read from the reply and `gained` must equal `rfPerHit[mode] × 2` — 200 at mode 1; unit tests pin the table and the age cap) |
+| the miss: a pearl arriving at idle is lost and pays nothing | tested (AG: `energy=0 gained=0 dropped=1 arrived=-2 reason="Pearl arrived while idle"`; `SELFTEST_ENDER=1` inverts AF) |
+| the hold: 500 FE a tick, dropped when the store cannot pay | tested (AF: `energy == gained − spent`, `spent` a multiple of 500; unit test pins the drop) |
+| the flight: `(int)(d/3)+1` ticks, the link's 5-tick refusal | tested (AE: a three-block link is 2 ticks; AL: a twelve-block link is refused) |
+| the push: 20,000 a tick, keeping the 2,000 FE reserve | tested (AI: 100,000 FE seeded, the generator ends at exactly 2,000 and the receiver at 98,000; the 20,000 cap is a unit test because the harness receiver takes 10,000 an insert) |
+| the buffer through the energy capability | tested (AF: a monitor facing the generator reads `stored=200 max=5000000`) |
+| the injector: 18 pearls, a rising edge injects one | tested (AF/AG: `pearls=1` before the pulse, `0` after; the hand gave its pearl; unit test pins the container) |
+| a generator with no injector makes no FE | tested (AH) |
+| the store on the broken generator's item, and the clamp | tested (AJ: 3,000 carried and restored; the clamp is a unit test) |
+| persistence of the store, the arrival mode and the link | tested (AM: save + quit + relaunch) |
+| the `endergenic`, `injector` and `enderlink` commands and their refusals | tested (AE–AM every line parsed by `tools/parse_ender.py`/`parse_injector.py`; AL the three refusals) |
+| the two recipes | `blocked(rftoolsbase:machine_frame-absent)`: the endergenic's also needs `rftoolsbase:infused_enderpearl` and an empty `#c:ender_pearls`, the injector's an empty `#c:chests` — AK proves both patterns craft nothing here |
+| the ender monitor, its three modes and the `fireMonitors` notice | not ported (gap 10, phase 2 of this family) |
+| the endergenic GUI, the stats window and the renderer (the floating pearl, the good/bad flash) | not ported (gap 10; no GUI and no renderer in a `machines` slice) |
+| the infusable factors on the hold and the gain | not ported (gap 3) |
+| the comparator output and TOP/Jade | not ported (gap 6) |
 
 ## Coverage of the coal generator family
 
@@ -576,26 +773,26 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
 
-## Verification (this run)
+## Verification (slice 4 run)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **50 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **74 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 100,317 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.2 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 122,516 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.3 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
 | `verify-sdk-package.py rftoolspower` | **1/1** |
-| the leg | `PASS` + `EXIT:0`; selftest `EXIT:1`; control `EXIT:1`; `--strict` 4/4 |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST_ENDER=1` `EXIT:1`; control `EXIT:1`; `--strict` 11/11 |
 
-## Artifact (0.1.2)
+## Artifact (0.1.3)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 100,317 B | `989543d73da03afec9117d28ef3c4bf9175d55c03e2e5ce387461815622f6ebb` | 69 |
+| `rftoolspower.hmod` (port root) | 122,516 B | `ab452bd8913d68820359293365a983d30d8c47bfa729bb2053c1039276c45af0` | 87 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1, `src/runtime.rs` byte-identical in
-the archive. The 0.1.1 artifact (73,339 B, `6df52b74…`, 45 entries) is the slice-2 record; its
+the archive. The 0.1.2 artifact (100,317 B, `989543d7…`, 69 entries) is the slice-3 record; its
 gates are kept as `sdk-*-0.1.1.log` beside this run's.

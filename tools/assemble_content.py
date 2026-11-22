@@ -216,6 +216,8 @@ LANG = {
     "block.rftoolspower.power_monitor": "Power Monitor",
     "block.rftoolspower.cell1": "Powercell (Low)",
     "block.rftoolspower.cell2": "Powercell (Medium)",
+    "block.rftoolspower.endergenic": "Endergenic",
+    "block.rftoolspower.pearl_injector": "Pearl Injector",
     "item.rftoolspower.power_core1": "Power Core (Low)",
     "itemGroup.rftoolspower": "RFTools Power",
     "message.rftoolspower.shiftmessage": "<Press Shift>",
@@ -228,6 +230,8 @@ CREATIVE_TAB = {
         "rftoolspower:power_monitor",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
+        "rftoolspower:endergenic",
+        "rftoolspower:pearl_injector",
         "rftoolspower:power_core1",
     ],
     "title": "itemGroup.rftoolspower",
@@ -239,12 +243,16 @@ TAGS = {
         "rftoolspower:power_monitor",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
+        "rftoolspower:endergenic",
+        "rftoolspower:pearl_injector",
     ],
     "data/minecraft/tags/block/needs_iron_tool.json": [
         "rftoolspower:coalgenerator",
         "rftoolspower:power_monitor",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
+        "rftoolspower:endergenic",
+        "rftoolspower:pearl_injector",
     ],
 }
 
@@ -261,6 +269,84 @@ CELL_DECL = {
     },
     "item": True,
 }
+
+# `EndergenicModule.ENDERGENIC`: `Properties.of().strength(2.0f).sound(METAL).noOcclusion()` with
+# `RotationType.NONE` — a full cube, no facing. `PEARL_INJECTOR` takes BlockBuilder's default
+# STANDARD_IRON and `RotationType.ROTATION`, so it has a six-way `facing` the placer sets.
+ENDERGENIC_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "item": True,
+}
+
+INJECTOR_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "state_properties": {
+        "facing": {
+            "type": "enum",
+            "values": ["north", "south", "east", "west", "up", "down"],
+        },
+    },
+    "default_state": {"facing": "north"},
+    "item": True,
+}
+
+ENDERGENIC_CUBE = {
+    "parent": "minecraft:block/cube_all",
+    # The jar's model asks for `render_type: translucent`; 26.3's models have no such field (checked
+    # against the prepared vanilla models), so the cube is opaque — recorded in notes.md.
+    "textures": {"all": "rftoolspower:block/endergenic/endergenic"},
+}
+
+INJECTOR_CUBE = {
+    "parent": "minecraft:block/cube",
+    "textures": {
+        "down": "rftoolspower:block/base/machinebottom",
+        "east": "rftoolspower:block/base/machineside",
+        "north": "rftoolspower:block/endergenic/pearl_injector",
+        "particle": "rftoolspower:block/endergenic/pearl_injector",
+        "south": "rftoolspower:block/base/machineside",
+        "up": "rftoolspower:block/base/machinetop",
+        "west": "rftoolspower:block/base/machineside",
+    },
+}
+
+
+def plain_loot(name: str) -> dict:
+    """McJtyLib's standard loot with only `copy_name`: the `copy_components` function names
+    mcjtylib's own components, which this port does not register (the store travels through
+    `minecraft:block_entity_data`, written by `Hooks::block_drops`)."""
+    return {
+        "type": "minecraft:block",
+        "pools": [
+            {
+                "bonus_rolls": 0.0,
+                "entries": [
+                    {
+                        "type": "minecraft:item",
+                        "functions": [
+                            {"function": "minecraft:copy_name", "source": "block_entity"}
+                        ],
+                        "name": f"rftoolspower:{name}",
+                    }
+                ],
+                "name": name,
+                "rolls": 1.0,
+            }
+        ],
+        "random_sequence": f"rftoolspower:blocks/{name}",
+    }
 
 # `McJtyLib`'s standard loot with the `copy_components` function dropped (it names mcjtylib's
 # `item_energy`, which this port does not register); the store travels through
@@ -424,6 +510,48 @@ def build(out: Path) -> None:
         out / "assets/rftoolspower/textures/item/power_core1.png",
         read_jar(POWER, "assets/rftoolspower/textures/item/power_core1.png"),
     )
+
+    # --- the endergenic generator and the pearl injector: the two blocks of the endergenic
+    # mechanic. `endergenic` is a plain cube with its own translucent texture (drawn opaque at this
+    # pin); the injector is a front-based cube with a six-way `facing`, carried unchanged from the
+    # jar. Their recipes need the parent's `machine_frame` (and, for the generator, its
+    # `infused_enderpearl`), so both craft nothing in a build without RFToolsBase — recorded in
+    # notes.md with the phase that proves it.
+    for name, decl, model, texture in (
+        (
+            "endergenic",
+            ENDERGENIC_DECL,
+            ENDERGENIC_CUBE,
+            "assets/rftoolspower/textures/block/endergenic/endergenic.png",
+        ),
+        (
+            "pearl_injector",
+            INJECTOR_DECL,
+            INJECTOR_CUBE,
+            "assets/rftoolspower/textures/block/endergenic/pearl_injector.png",
+        ),
+    ):
+        write(
+            out / f"assets/rftoolspower/blockstates/{name}.json",
+            json.loads(read_jar(POWER, f"assets/rftoolspower/blockstates/{name}.json")),
+        )
+        write(out / f"assets/rftoolspower/models/block/{name}.json", model)
+        write(
+            out / f"assets/rftoolspower/models/item/{name}.json",
+            {"parent": f"rftoolspower:block/{name}"},
+        )
+        write(
+            out / f"assets/rftoolspower/items/{name}.json",
+            {"model": {"model": f"rftoolspower:item/{name}", "type": "minecraft:model"}},
+        )
+        binary(out / texture, read_jar(POWER, texture))
+        write(out / f"data/rftoolspower/horizon/block/{name}.json", decl)
+        write(out / f"data/rftoolspower/loot_table/blocks/{name}.json", plain_loot(name))
+        write(out / f"data/rftoolspower/recipe/{name}.json", patched_recipe(name))
+        write(
+            out / f"data/rftoolspower/advancement/recipes/misc/{name}.json",
+            json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{name}.json")),
+        )
 
 
 def ingredient(value: object) -> object:

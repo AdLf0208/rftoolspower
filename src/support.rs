@@ -20,10 +20,11 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    CAPACITY, Cell, EXTRACT_PER_TICK, Fuel, Generator, Monitor, NETWORK_MAX, OBSERVE_TICKS,
-    SideMode, Sides, Tier, as_capability, capacity as network_capacity, clamped_energy,
-    network_valid, receive as network_receive, restored, rf_per_tick, send_amount,
-    stored as network_stored, take as network_take,
+    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, Endergenic, Fuel, Generator, HOLDING,
+    IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE, Monitor, NETWORK_MAX, OBSERVE_TICKS, PEARL, Pulse,
+    SideMode, Sides, Tier, as_capability, capacity as network_capacity, clamp_endergenic,
+    clamped_energy, network_valid, pearl_lost, receive as network_receive, restored, rf_per_tick,
+    rising_edge, send_amount, stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -145,6 +146,36 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     // plain buffer, so the handler is this port's.
     declare_cell(r, context, CELL1_TYPE, "cell1", CELL1, Tier::One);
     declare_cell(r, context, CELL2_TYPE, "cell2", CELL2, Tier::Two);
+
+    // The endergenic generator: a type, the buffer the monitor reads (5,000,000 FE, nothing in or
+    // out through the capability — it pushes on its own tick), its Part and its item's Part.
+    let kind = r
+        .block_entity_type(ENDERGENIC_TYPE)
+        .blocks(&["endergenic"])
+        .build();
+    let block = r.block_key(ENDERGENIC);
+    r.block_energy(&block, endergenic_battery());
+    let item = r.item_key(ENDERGENIC);
+    r.item_part(item, EndergenicItemPart);
+    if let Err(error) = r.block_entity_part(&kind, EndergenicPart) {
+        context.refuse(&format!(
+            "rftoolspower: the endergenic generator part was refused: {error}"
+        ));
+    }
+
+    // The pearl injector: a type, its eighteen pearl slots, its Part and its item's Part (the
+    // placed item's saved pearls are not carried — recorded in notes.md).
+    let kind = r
+        .block_entity_type(INJECTOR_TYPE)
+        .blocks(&["pearl_injector"])
+        .build();
+    let block = r.block_key(INJECTOR);
+    r.block_container(&block, injector_container());
+    if let Err(error) = r.block_entity_part(&kind, InjectorPart) {
+        context.refuse(&format!(
+            "rftoolspower: the pearl injector part was refused: {error}"
+        ));
+    }
 }
 
 /// Declare one powercell: its block entity type, its energy capability and its Part.
@@ -205,6 +236,14 @@ fn int(saved: &Tag, key: &str) -> i32 {
     match saved.get(key) {
         Some(Tag::Int(value)) => *value,
         _ => 0,
+    }
+}
+
+/// A saved int, `default` when absent or of another type.
+fn int_or(saved: &Tag, key: &str, default: i32) -> i32 {
+    match saved.get(key) {
+        Some(Tag::Int(value)) => *value,
+        _ => default,
     }
 }
 
@@ -1398,6 +1437,16 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
             return Flow::Continue;
         }
         entity_data_patch(&saved, MONITOR_TYPE_ID)
+    } else if block == ENDERGENIC {
+        // Upstream's loot copies `mcjtylib:item_energy` only: the store travels, the charging
+        // state and the link do not.
+        let energy = int(&Tag::Compound(saved.clone()), KEY_ENERGY);
+        if energy == 0 {
+            return Flow::Continue;
+        }
+        let mut payload = Compound::new();
+        payload.insert(KEY_ENERGY.into(), Tag::Int(energy));
+        entity_data_patch(&payload, ENDERGENIC_TYPE_ID)
     } else {
         return Flow::Continue;
     };
@@ -1591,6 +1640,9 @@ pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
         "rftoolspower band <pos:block_pos> <minimum:integer> <maximum:integer>",
         "rftoolspower cell <pos:block_pos> [nonce:word]",
         "rftoolspower side <pos:block_pos> <face:word> <mode:word>",
+        "rftoolspower endergenic <pos:block_pos> [nonce:word]",
+        "rftoolspower injector <pos:block_pos> [nonce:word]",
+        "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
     ] {
         commands.push(Command::op(usage, OPERATOR_LEVEL));
     }
@@ -1664,14 +1716,18 @@ fn word_of<'a>(event: &'a RunModCommandEvent<'_>, name: &str) -> Option<&'a str>
     }
 }
 
-/// Run `/rftoolspower info|monitor|band|cell|side …`; `Flow::Cancel` when it was ours.
+/// Run `/rftoolspower info|monitor|band|cell|side|endergenic|injector|enderlink …`;
+/// `Flow::Cancel` when it was ours.
 pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
     let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
     let subcommand = match literals.as_slice() {
         ["rftoolspower", name] => *name,
         _ => return Flow::Continue,
     };
-    if !matches!(subcommand, "info" | "monitor" | "band" | "cell" | "side") {
+    if !matches!(
+        subcommand,
+        "info" | "monitor" | "band" | "cell" | "side" | "endergenic" | "injector" | "enderlink"
+    ) {
         return Flow::Continue;
     }
     if !may_read(event.source.permission()) {
@@ -1688,6 +1744,8 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         let _ = host.commands().feedback(Text::literal(match subcommand {
             "monitor" | "band" => NO_MONITOR,
             "cell" | "side" => NO_CELL,
+            "endergenic" | "enderlink" => NO_ENDERGENIC,
+            "injector" => NO_INJECTOR,
             _ => NO_GENERATOR,
         }));
         return Flow::Cancel;
@@ -1706,6 +1764,17 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             word_of(event, "face").unwrap_or_default(),
             word_of(event, "mode").unwrap_or_default(),
         ),
+        "endergenic" => endergenic_status_line(host, level, *pos, nonce_of(event)),
+        "injector" => injector_status_line(host, level, *pos, nonce_of(event)),
+        "enderlink" => match event.command.argument("destination") {
+            Some(CommandArgumentValue::BlockPos(destination)) => {
+                set_link(host, level, *pos, *destination)
+            }
+            _ => format!(
+                "Endergenic at {},{},{}: no destination given",
+                pos[0], pos[1], pos[2]
+            ),
+        },
         _ => set_band(
             host,
             level,
@@ -1770,6 +1839,808 @@ impl BlockEntityPart for GeneratorPart {
         let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
         let items = &mut event.entity.items;
         let changed = tick_generator(host, level, pos, &mut saved, items);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The endergenic generator and the pearl injector
+// ---------------------------------------------------------------------------
+
+/// `rftoolspower:endergenic` (`EndergenicModule.ENDERGENIC`).
+pub(crate) const ENDERGENIC: &str = "rftoolspower:endergenic";
+/// Its block entity type, named apart from its block for the reason [`GENERATOR_TYPE`] is.
+const ENDERGENIC_TYPE: &str = "endergenic_block_entity";
+/// That type's registry id, which the endergenic item's `block_entity_data` names.
+const ENDERGENIC_TYPE_ID: &str = "rftoolspower:endergenic_block_entity";
+/// `rftoolspower:pearl_injector` (`EndergenicModule.PEARL_INJECTOR`).
+pub(crate) const INJECTOR: &str = "rftoolspower:pearl_injector";
+const INJECTOR_TYPE: &str = "pearl_injector_block_entity";
+/// The generator's saved fields (upstream's `charging`, `age`, `dest`, `distance`, `prevIn`,
+/// `pearls`, plus the counters the readout prints).
+const KEY_CHARGING: &str = "charging";
+const KEY_AGE: &str = "age";
+const KEY_DEST: &str = "dest";
+const KEY_DISTANCE: &str = "distance";
+const KEY_PREV: &str = "prev";
+const KEY_PEARLS: &str = "pearls";
+const KEY_GAINED: &str = "gained";
+const KEY_SPENT: &str = "spent";
+const KEY_LAUNCHED: &str = "launched";
+const KEY_DROPPED: &str = "dropped";
+const KEY_ARRIVED: &str = "arrived";
+/// Why the last pearl was dropped (upstream's `lastPearlsLostReason`, kept for the readout).
+const KEY_LOSS: &str = "loss";
+/// What a read where no generator / no injector stands answers.
+const NO_ENDERGENIC: &str = "No RFTools Power endergenic generator there.";
+const NO_INJECTOR: &str = "No RFTools Power pearl injector there.";
+
+/// A saved long, 0 when absent or of another type.
+fn long(saved: &Tag, key: &str) -> i64 {
+    match saved.get(key) {
+        Some(Tag::Long(value)) => *value,
+        Some(Tag::Int(value)) => i64::from(*value),
+        _ => 0,
+    }
+}
+
+/// Write one long into a saved compound.
+fn set_long(saved: &mut Tag, key: &str, value: i64) {
+    if let Tag::Compound(nbt) = saved {
+        nbt.insert(key.into(), Tag::Long(value));
+    }
+}
+
+/// A saved position (`BlockPosTools.write`), as three ints under one key.
+fn position(saved: &Tag, key: &str) -> Option<[i32; 3]> {
+    match saved.get(key) {
+        Some(Tag::IntArray(values)) if values.len() == 3 => Some([values[0], values[1], values[2]]),
+        _ => None,
+    }
+}
+
+/// Write one position as three ints under one key.
+fn set_position(saved: &mut Tag, key: &str, pos: [i32; 3]) {
+    if let Tag::Compound(nbt) = saved {
+        nbt.insert(key.into(), Tag::IntArray(pos.to_vec()));
+    }
+}
+
+/// The pearls a saved compound holds (`loadAdditional`'s `pearls` list).
+fn read_pearls(saved: &Tag) -> Vec<crate::runtime::Pearl> {
+    let Some(Tag::List(list)) = saved.get(KEY_PEARLS) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|entry| {
+            let ticks_left = int(entry, "t");
+            let age = int(entry, "age");
+            let destination = position(entry, KEY_DEST)?;
+            Some(crate::runtime::Pearl {
+                ticks_left,
+                destination,
+                age,
+            })
+        })
+        .collect()
+}
+
+/// Write the pearls back in the same shape.
+fn write_pearls(saved: &mut Tag, pearls: &[crate::runtime::Pearl]) {
+    let list: Vec<Tag> = pearls
+        .iter()
+        .map(|pearl| {
+            let mut entry = Compound::new();
+            entry.insert("t".into(), Tag::Int(pearl.ticks_left));
+            entry.insert("age".into(), Tag::Int(pearl.age));
+            entry.insert(KEY_DEST.into(), Tag::IntArray(pearl.destination.to_vec()));
+            Tag::Compound(entry)
+        })
+        .collect();
+    if let Tag::Compound(nbt) = saved {
+        nbt.insert(KEY_PEARLS.into(), Tag::List(list));
+    }
+}
+
+/// The generator a saved compound holds, every value clamped.
+pub(crate) fn read_endergenic(saved: &Tag) -> Endergenic {
+    let mut state = Endergenic::restored(
+        int(saved, KEY_ENERGY),
+        int(saved, KEY_CHARGING),
+        int(saved, KEY_AGE),
+        position(saved, KEY_DEST),
+        int(saved, KEY_DISTANCE),
+        flag(saved, KEY_PREV),
+        read_pearls(saved),
+        long(saved, KEY_GAINED),
+        long(saved, KEY_SPENT),
+        int(saved, KEY_LAUNCHED),
+        int(saved, KEY_DROPPED),
+        int_or(saved, KEY_ARRIVED, -2),
+    );
+    state.last_loss = text(saved, KEY_LOSS).and_then(|reason| Loss::parse(&reason));
+    state
+}
+
+/// Write the generator back into a saved compound.
+pub(crate) fn write_endergenic(saved: &mut Tag, state: &Endergenic) {
+    set_int(saved, KEY_ENERGY, state.energy);
+    set_int(saved, KEY_CHARGING, state.charging);
+    set_int(saved, KEY_AGE, state.age);
+    match state.destination {
+        Some(position) => {
+            set_position(saved, KEY_DEST, position);
+            set_int(saved, KEY_DISTANCE, state.distance);
+        }
+        None => {
+            if let Tag::Compound(nbt) = &mut *saved {
+                nbt.remove(&KEY_DEST.into());
+            }
+            set_int(saved, KEY_DISTANCE, 0);
+        }
+    }
+    set_flag(saved, KEY_PREV, state.prev_in);
+    write_pearls(saved, &state.pearls);
+    set_long(saved, KEY_GAINED, state.gained);
+    set_long(saved, KEY_SPENT, state.spent);
+    set_int(
+        saved,
+        KEY_LAUNCHED,
+        i32::try_from(state.launched).unwrap_or(i32::MAX),
+    );
+    set_int(
+        saved,
+        KEY_DROPPED,
+        i32::try_from(state.dropped).unwrap_or(i32::MAX),
+    );
+    set_int(saved, KEY_ARRIVED, state.arrived_at);
+    match state.last_loss {
+        Some(loss) => set_text(saved, KEY_LOSS, loss.text()),
+        None => {
+            if let Tag::Compound(nbt) = &mut *saved {
+                nbt.remove(&KEY_LOSS.into());
+            }
+        }
+    }
+}
+
+/// The generator at `pos`, if the block there is one.
+fn endergenic_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<Endergenic> {
+    if block_id(&*host, level, pos).as_deref() != Some(ENDERGENIC) {
+        return None;
+    }
+    let entity = host.block_entity(level, pos)?;
+    let saved = entity.data(&*host)?;
+    Some(read_endergenic(&Tag::Compound(saved)))
+}
+
+/// Write a generator's state back to its block entity. True when it differs from what was there.
+fn write_endergenic_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    state: &Endergenic,
+) -> bool {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return false;
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return false;
+    };
+    let mut saved = Tag::Compound(saved);
+    if read_endergenic(&saved) == *state {
+        return false;
+    }
+    write_endergenic(&mut saved, state);
+    if let Tag::Compound(data) = saved {
+        let _ = entity.replace_data(host, data);
+    }
+    let _ = entity.set_changed(&mut *host);
+    true
+}
+
+/// One pearl arrives at the generator at `dest` (`EndergenicPearl.handleTick` →
+/// `receivePearl`). A destination that is gone or no longer a generator loses the pearl, as
+/// upstream's "where did the destination go?" does.
+pub(crate) fn deliver_pearl(host: &mut dyn ServerHost, level: LevelRef, dest: [i32; 3], age: i32) {
+    let Some(mut state) = endergenic_at(host, level, dest) else {
+        return;
+    };
+    state.receive(age);
+    write_endergenic_at(host, level, dest, &state);
+}
+
+/// A deterministic draw for the pearl-loss chance: the world time mixed with the position.
+fn loss_seed(host: &dyn Host, level: Option<LevelRef>, pos: [i32; 3]) -> u64 {
+    let time = level
+        .and_then(|level| level.game_time(host))
+        .unwrap_or(0)
+        .unsigned_abs();
+    let place = (u64::from(pos[0].unsigned_abs()) << 32)
+        ^ (u64::from(pos[1].unsigned_abs()) << 16)
+        ^ u64::from(pos[2].unsigned_abs());
+    time.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ place.rotate_left(17)
+}
+
+/// The endergenic's energy push (`handleSendingEnergy`): up to 20,000 FE a tick to every
+/// neighbour that answers the energy capability, from the store above the 2,000 FE reserve.
+pub(crate) fn push_endergenic_energy(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    state: &mut Endergenic,
+) {
+    let Some(level) = level else {
+        return;
+    };
+    for direction in Direction::ALL {
+        let offer = state.send_amount();
+        if offer == 0 {
+            break;
+        }
+        let normal = direction.normal();
+        let target = [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]];
+        let Some(handler) = level.capability(host, &ENERGY, target, Some(direction.opposite()))
+        else {
+            continue;
+        };
+        let moved = host
+            .transaction(|host, tx| -> Result<u32, ()> { Ok(handler.insert(host, tx, offer)) })
+            .unwrap_or(0);
+        state.energy -= i32::try_from(moved).unwrap_or(0);
+    }
+}
+
+/// One endergenic tick (`EndergenicTileEntity.tickOnServer`), in upstream's order: the pearls in
+/// flight, then the push, then the loss chance, then the redstone edge and the state machine.
+///
+/// True when the saved payload changed (the engine discards a tick's edits unless it says so).
+pub(crate) fn tick_endergenic(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    saved: &mut Tag,
+) -> bool {
+    let before = read_endergenic(saved);
+    let mut state = before.clone();
+    let arrivals = state.tick_pearls();
+    if let Some(level) = level {
+        for (destination, age) in arrivals {
+            deliver_pearl(host, level, destination, age);
+        }
+    }
+    push_endergenic_energy(host, level, pos, &mut state);
+    if state.holding() && pearl_lost(loss_seed(&*host, level, pos)) {
+        state.discard(Loss::Chance);
+    }
+    match state.pulse(power_at(&*host, level, pos)) {
+        Pulse::Start => state.start_charging(),
+        Pulse::Fire => {
+            state.fire(false);
+        }
+        Pulse::None => match state.charging {
+            IDLE => {}
+            HOLDING => {
+                if !state.hold() {
+                    state.discard(Loss::NotEnoughEnergy);
+                }
+            }
+            _ => state.charge_step(),
+        },
+    }
+    let changed = state != before;
+    write_endergenic(saved, &state);
+    changed
+}
+
+/// The redstone input at `pos`: `Level.getBestNeighborSignal`, upstream's `checkRedstone`.
+fn power_at(host: &dyn Host, level: Option<LevelRef>, pos: [i32; 3]) -> i32 {
+    level
+        .and_then(|level| level.best_neighbor_signal(host, pos))
+        .unwrap_or(0)
+}
+
+/// The generator a pearl injector feeds: upstream's `findEndergenicTileEntity` looks behind the
+/// injector's front and then above it.
+pub(crate) fn find_generator(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<[i32; 3]> {
+    let facing = level
+        .block_property(host, pos, KEY_FACING)
+        .and_then(|name| dir_from_name(name.as_str()))
+        .unwrap_or(Direction::North);
+    [facing.opposite(), Direction::Up]
+        .into_iter()
+        .filter_map(|direction| {
+            let normal = direction.normal();
+            let at = [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]];
+            (block_id(host, level, at).as_deref() == Some(ENDERGENIC)).then_some(at)
+        })
+        .next()
+}
+
+/// Take one ender pearl from an injector's buffer (`PearlInjectorTileEntity.takePearl`). True
+/// when one was taken.
+pub(crate) fn take_pearl(host: &dyn Host, items: &mut [Option<ItemStack>]) -> bool {
+    for slot in items.iter_mut() {
+        let Some(stack) = slot.clone() else {
+            continue;
+        };
+        if stack.count() == 0 || item_id(host, &stack) != PEARL {
+            continue;
+        }
+        *slot = stack.shrink(1);
+        return true;
+    }
+    false
+}
+
+/// Inject one pearl (`PearlInjectorTileEntity.injectPearl`): the pearl is taken first, and a
+/// generator already holding one consumes it without firing (upstream's own order).
+fn inject_pearl(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    generator: [i32; 3],
+    items: &mut [Option<ItemStack>],
+) -> bool {
+    if !take_pearl(&*host, items) {
+        return false;
+    }
+    let Some(mut state) = endergenic_at(host, level, generator) else {
+        return true;
+    };
+    if state.charging == HOLDING {
+        // Upstream's comment: "If the endergenic is already holding a pearl then this one is
+        // lost." The pearl is consumed and nothing is fired.
+        return true;
+    }
+    state.fire(true);
+    write_endergenic_at(host, level, generator, &state)
+}
+
+/// One pearl-injector tick (`PearlInjectorTileEntity.tickOnServer`): a redstone rising edge
+/// injects one pearl into the generator it points at.
+pub(crate) fn tick_injector(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    saved: &mut Tag,
+    items: &mut [Option<ItemStack>],
+) -> bool {
+    let before = flag(saved, KEY_PREV);
+    let (edge, prev) = rising_edge(before, power_at(&*host, level, pos));
+    set_flag(saved, KEY_PREV, prev);
+    let mut changed = prev != before;
+    if edge
+        && let Some(level) = level
+        && let Some(generator) = find_generator(&*host, level, pos)
+    {
+        changed |= inject_pearl(host, level, generator, items);
+    }
+    changed
+}
+
+/// An endergenic generator's report line, as `/rftoolspower endergenic` prints it.
+pub(crate) fn endergenic_line(
+    pos: [i32; 3],
+    state: &Endergenic,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let destination = match state.destination {
+        Some(dest) => format!("{},{},{}", dest[0], dest[1], dest[2]),
+        None => "none".to_owned(),
+    };
+    let reason = state.last_loss.map_or("none", |loss| loss.text());
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Endergenic at {},{},{}: energy={}/{} charging={} age={} pearls={} fired={} dropped={} \
+         gained={} spent={} arrived={} reason=\"{reason}\" dest={destination} distance={} \
+         t={t}{suffix}",
+        pos[0],
+        pos[1],
+        pos[2],
+        state.energy,
+        ENDERGENIC_CAPACITY,
+        state.charging,
+        state.age,
+        state.pearls.len(),
+        state.launched,
+        state.dropped,
+        state.gained,
+        state.spent,
+        state.arrived_at,
+        state.distance,
+    )
+}
+
+/// The generator at `pos` as `/rftoolspower endergenic` prints it, or [`NO_ENDERGENIC`].
+pub(crate) fn endergenic_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    let Some(state) = endergenic_at(host, level, pos) else {
+        return NO_ENDERGENIC.to_owned();
+    };
+    let t = level.game_time(&*host).unwrap_or(0);
+    endergenic_line(pos, &state, t, nonce)
+}
+
+/// Link a generator to its destination (`setDestination`, the wrench's link): the pearl it fires
+/// flies there in `(int)(distance / 3) + 1` ticks, and a link of 5 ticks or more is refused.
+pub(crate) fn set_link(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    destination: [i32; 3],
+) -> String {
+    let Some(mut state) = endergenic_at(host, level, pos) else {
+        return NO_ENDERGENIC.to_owned();
+    };
+    if block_id(&*host, level, destination).as_deref() != Some(ENDERGENIC) {
+        return format!(
+            "Endergenic at {},{},{}: destination {},{},{} is not an endergenic generator",
+            pos[0], pos[1], pos[2], destination[0], destination[1], destination[2]
+        );
+    }
+    let distance = Endergenic::distance_between(pos, destination);
+    if distance > MAX_DISTANCE {
+        return format!(
+            "Endergenic at {},{},{}: distance {distance} is too far (maximum {MAX_DISTANCE})",
+            pos[0], pos[1], pos[2]
+        );
+    }
+    state.destination = Some(destination);
+    state.distance = distance;
+    write_endergenic_at(host, level, pos, &state);
+    let t = level.game_time(&*host).unwrap_or(0);
+    format!(
+        "Endergenic link at {},{},{}: destination {},{},{} (distance {distance} ticks, t={t})",
+        pos[0], pos[1], pos[2], destination[0], destination[1], destination[2]
+    )
+}
+
+/// A pearl injector's report line, as `/rftoolspower injector` prints it.
+pub(crate) fn injector_line(
+    pos: [i32; 3],
+    pearls: i64,
+    attached: Option<[i32; 3]>,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let attached = match attached {
+        Some(at) => format!("{},{},{}", at[0], at[1], at[2]),
+        None => "none".to_owned(),
+    };
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Pearl Injector at {},{},{}: pearls={pearls} generator={attached} t={t}{suffix}",
+        pos[0], pos[1], pos[2]
+    )
+}
+
+/// The injector at `pos` as `/rftoolspower injector` prints it, or [`NO_INJECTOR`].
+pub(crate) fn injector_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(INJECTOR) {
+        return NO_INJECTOR.to_owned();
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_INJECTOR.to_owned();
+    };
+    let mut pearls = 0i64;
+    for slot in 0..INJECTOR_SLOTS as u32 {
+        let Some(stack) = entity.item_slot(&*host, slot).ok().flatten() else {
+            continue;
+        };
+        if item_id(&*host, &stack) == PEARL {
+            pearls += i64::from(stack.count());
+        }
+    }
+    let attached = find_generator(&*host, level, pos);
+    let t = level.game_time(&*host).unwrap_or(0);
+    injector_line(pos, pearls, attached, t, nonce)
+}
+
+/// The injector's container: eighteen pearl slots every face reaches, insert-only (upstream's
+/// 9×2 `GenericItemHandler`; the per-item filter is recorded in `notes.md` because a container
+/// declaration has no slot predicate at this pin).
+pub(crate) fn injector_container() -> ModContainer {
+    ModContainer {
+        slots: INJECTOR_SLOTS,
+        faces: std::array::from_fn(|_| (0..INJECTOR_SLOTS).collect()),
+        inputs: (0..INJECTOR_SLOTS).collect(),
+        outputs: vec![],
+        menu: None,
+    }
+}
+
+/// The endergenic's buffer: upstream's `GenericEnergyStorage(this, false, 5000000, 0)` — it
+/// stores, gives nothing out through the capability (it pushes on its own tick) and takes
+/// nothing in.
+pub(crate) fn endergenic_battery() -> ModEnergyBuffer {
+    ModEnergyBuffer {
+        capacity: ENDERGENIC_CAPACITY,
+        max_insert: 0,
+        max_extract: 0,
+        insert_faces: [false; 6],
+        extract_faces: [false; 6],
+    }
+}
+
+/// A click on the endergenic reads its status (there is no GUI in this slice).
+pub(crate) fn endergenic_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    if block_id(&*host, level, click.pos).as_deref() != Some(ENDERGENIC) {
+        return None;
+    }
+    let line = endergenic_status_line(host, level, click.pos, None);
+    if let Some(player) = host.player(click.player) {
+        let _ = player.action_bar(host, Text::literal(line));
+    }
+    Some(InteractionResult::Success)
+}
+
+/// A click on a pearl injector with an ender pearl puts it in the first free slot; anything else
+/// is refused with a line and an empty hand reads the status.
+pub(crate) fn injector_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+    held: Option<&ItemStack>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    if block_id(&*host, level, click.pos).as_deref() != Some(INJECTOR) {
+        return None;
+    }
+    match held.filter(|stack| stack.count() > 0) {
+        Some(stack) if item_id(&*host, stack) == PEARL => {
+            let hand = ItemPlace::PlayerHand {
+                player: click.player,
+                hand: click.hand,
+            };
+            insert_pearls(host, level, click.pos, stack, &hand);
+        }
+        Some(stack) => {
+            let refused = item_id(&*host, stack);
+            if let Some(player) = host.player(click.player) {
+                let _ = player.action_bar(
+                    host,
+                    Text::literal(format!("{refused} is not an ender pearl")),
+                );
+            }
+        }
+        None => {
+            let line = injector_status_line(host, level, click.pos, None);
+            if let Some(player) = host.player(click.player) {
+                let _ = player.action_bar(host, Text::literal(line));
+            }
+        }
+    }
+    Some(InteractionResult::Success)
+}
+
+/// Insert as much of the held pearls as the buffer takes, and take exactly that from the hand, in
+/// one transaction (a creative player's hand gives without losing any).
+pub(crate) fn insert_pearls(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    held: &ItemStack,
+    hand: &ItemPlace,
+) -> u32 {
+    host.transaction(|host, tx| -> Result<u32, ()> {
+        let entity = host.block_entity(level, pos).ok_or(())?;
+        let key = held.item();
+        let limit = host.max_stack_size(key).unwrap_or(DEFAULT_STACK);
+        let mut inserted = 0u32;
+        let mut left = held.count();
+        for slot in 0..INJECTOR_SLOTS as u32 {
+            if left == 0 {
+                break;
+            }
+            let existing = entity.item_slot(&*host, slot).ok().flatten();
+            let (room, after) = match existing {
+                None => {
+                    let count = left.min(limit);
+                    let mut after = held.clone();
+                    after.set_count(count).map_err(|_| ())?;
+                    (count, Some(after))
+                }
+                Some(existing) if existing.is_stackable_with(held) => {
+                    let room = limit.saturating_sub(existing.count()).min(left);
+                    let mut after = existing;
+                    after
+                        .set_count(after.count().saturating_add(room))
+                        .map_err(|_| ())?;
+                    (room, Some(after))
+                }
+                Some(_) => (0, None),
+            };
+            if room == 0 {
+                continue;
+            }
+            entity
+                .set_item_slot(&mut *host, tx, slot, after)
+                .map_err(|_| ())?;
+            inserted += room;
+            left -= room;
+        }
+        if inserted == 0 {
+            return Ok(0);
+        }
+        let taken = hand.extract(&mut *host, tx, &ItemResource::of(held), inserted);
+        if taken != inserted {
+            return Err(());
+        }
+        let _ = entity.set_changed(&mut *host);
+        Ok(inserted)
+    })
+    .unwrap_or(0)
+}
+
+/// The endergenic's item Part: clamp what a placed item's `block_entity_data` restored. Upstream's
+/// loot carries the store only (`mcjtylib:item_energy`), so only the store is kept and clamped.
+pub(crate) struct EndergenicItemPart;
+
+#[mod_api::horizon_part]
+impl ItemPart for EndergenicItemPart {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        let Some(level) = event
+            .placer
+            .and_then(|player| player.level(&*host))
+            .or_else(|| in_place_level(host))
+        else {
+            return;
+        };
+        if block_id(&*host, level, event.pos).as_deref() != Some(ENDERGENIC) {
+            return;
+        }
+        let Some(entity) = host.block_entity(level, event.pos) else {
+            return;
+        };
+        let Some(saved) = entity.data(&*host) else {
+            return;
+        };
+        let mut saved = Tag::Compound(saved);
+        let clamped = clamp_endergenic(int(&saved, KEY_ENERGY));
+        if clamped == int(&saved, KEY_ENERGY) {
+            return;
+        }
+        set_int(&mut saved, KEY_ENERGY, clamped);
+        if let Tag::Compound(data) = saved {
+            let _ = entity.replace_data(host, data);
+        }
+    }
+}
+
+/// The endergenic generator: it ticks, and a click reads it.
+pub(crate) struct EndergenicPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for EndergenicPart {
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseItemOnEvent<'_>,
+    ) -> Option<InteractionResult> {
+        endergenic_click(host, event.click)
+    }
+
+    fn use_without_item(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseWithoutItemEvent<'_>,
+    ) -> Option<InteractionResult> {
+        endergenic_click(host, event.click)
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for EndergenicPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound — idle, no FE, no link.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: it ticks. Never clear a value an earlier mod set.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: pearls in flight, the push, the loss chance, the redstone edge.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let changed = tick_endergenic(host, level, pos, &mut saved);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
+/// The pearl injector: a redstone edge injects one pearl, and a click puts pearls in its buffer.
+pub(crate) struct InjectorPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for InjectorPart {
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseItemOnEvent<'_>,
+    ) -> Option<InteractionResult> {
+        injector_click(host, event.click, event.click.stack)
+    }
+
+    fn use_without_item(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseWithoutItemEvent<'_>,
+    ) -> Option<InteractionResult> {
+        injector_click(host, event.click, None)
+    }
+
+    /// `BaseBlock.getStateForPlacement` with `RotationType.ROTATION`: `getFacingFromEntity` gives the
+    /// front the direction **toward the placer**, so the generator the injector feeds is behind it
+    /// (`facing.getOpposite()`). The event carries the placer's view angles, not its height, so
+    /// upstream's vertical branches (placer above → UP, block above the eye → DOWN) are not
+    /// expressible here and the front is horizontal — recorded in `notes.md`.
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        if level.state_block(event.state) != Some(INJECTOR) {
+            return None;
+        }
+        let front = facing_from_yaw(event.context.yaw).opposite();
+        Some(level.state_with_property(event.state, KEY_FACING, dir_name(front)))
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for InjectorPart {
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: a redstone rising edge injects one pearl into the generator it points at.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        if event.entity.items.len() != INJECTOR_SLOTS {
+            event.entity.items.resize(INJECTOR_SLOTS, None);
+        }
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let items = &mut event.entity.items;
+        let changed = tick_injector(host, level, pos, &mut saved, items);
         if let Tag::Compound(nbt) = saved {
             event.entity.nbt = nbt;
         }
@@ -2032,10 +2903,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_five_the_harness_types() {
+    fn the_commands_are_the_eight_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 5);
+        assert_eq!(commands.len(), 8);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -2056,6 +2927,18 @@ mod tests {
         assert_eq!(
             commands[4].usage, "rftoolspower side <pos:block_pos> <face:word> <mode:word>",
             "the side mode is set the way the smart wrench toggles it"
+        );
+        assert_eq!(
+            commands[5].usage, "rftoolspower endergenic <pos:block_pos> [nonce:word]",
+            "the endergenic's readout"
+        );
+        assert_eq!(
+            commands[6].usage, "rftoolspower injector <pos:block_pos> [nonce:word]",
+            "the pearl injector's readout"
+        );
+        assert_eq!(
+            commands[7].usage, "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
+            "the wrench's link, as a command"
         );
         for command in &commands {
             assert_eq!(command.level, OPERATOR_LEVEL);
@@ -2207,5 +3090,185 @@ mod tests {
             Some(&Tag::String(MONITOR_TYPE_ID.into()))
         );
         assert_eq!(read_monitor(&payload), state);
+    }
+
+    // --- the endergenic generator and the pearl injector --------------------
+
+    fn linked() -> Endergenic {
+        let mut state = Endergenic::new();
+        state.destination = Some([10, 101, 6]);
+        state.distance = 2;
+        state
+    }
+
+    #[test]
+    fn the_endergenic_state_reads_back_from_the_compound_it_wrote() {
+        let mut saved = compound();
+        assert_eq!(
+            read_endergenic(&saved),
+            Endergenic::new(),
+            "a fresh generator"
+        );
+        let mut state = linked();
+        state.energy = 1_600;
+        state.charging = HOLDING;
+        state.age = 3;
+        state.prev_in = true;
+        state.gained = 1_600;
+        state.spent = 500;
+        state.launched = 2;
+        state.dropped = 1;
+        state.arrived_at = 4;
+        state
+            .pearls
+            .push(crate::runtime::Pearl::new(2, [10, 101, 6], 1));
+        write_endergenic(&mut saved, &state);
+        assert_eq!(read_endergenic(&saved), state);
+        assert_eq!(
+            saved.get(KEY_ENERGY),
+            Some(&Tag::Int(1_600)),
+            "the store is the int `energy` the energy capability reads"
+        );
+        assert_eq!(
+            position(&saved, KEY_DEST),
+            Some([10, 101, 6]),
+            "the link is saved as three ints"
+        );
+    }
+
+    #[test]
+    fn a_generator_with_no_link_saves_no_destination() {
+        let mut saved = compound();
+        write_endergenic(&mut saved, &linked());
+        assert!(position(&saved, KEY_DEST).is_some());
+        write_endergenic(&mut saved, &Endergenic::new());
+        assert_eq!(
+            position(&saved, KEY_DEST),
+            None,
+            "an unlinked generator carries no stale destination"
+        );
+    }
+
+    #[test]
+    fn a_doctored_endergenic_reads_back_clamped() {
+        let mut saved = compound();
+        set_int(&mut saved, KEY_ENERGY, 9_000_000);
+        set_int(&mut saved, KEY_CHARGING, 40);
+        set_int(&mut saved, KEY_AGE, -5);
+        set_int(&mut saved, KEY_DISTANCE, 99);
+        set_position(&mut saved, KEY_DEST, [1, 2, 3]);
+        let state = read_endergenic(&saved);
+        assert_eq!(state.energy, ENDERGENIC_CAPACITY);
+        assert_eq!(
+            state.charging,
+            crate::runtime::MAX_CHARGE,
+            "40 is past the window"
+        );
+        assert_eq!(state.age, 0);
+        assert_eq!(state.distance, MAX_DISTANCE);
+        assert_eq!(state.pearls.len(), 0);
+    }
+
+    #[test]
+    fn the_endergenic_readout_is_the_line_the_e2e_asserts() {
+        let mut state = linked();
+        state.energy = 800;
+        state.charging = HOLDING;
+        state.gained = 800;
+        state.arrived_at = 4;
+        assert_eq!(
+            endergenic_line([300, 101, 2], &state, 4242, Some("9")),
+            "Endergenic at 300,101,2: energy=800/5000000 charging=-1 age=0 pearls=0 fired=0 \
+             dropped=0 gained=800 spent=0 arrived=4 reason=\"none\" dest=10,101,6 distance=2 \
+             t=4242 nonce=9"
+        );
+        let mut fresh = Endergenic::new();
+        fresh.last_loss = Some(Loss::WhileIdle);
+        assert_eq!(
+            endergenic_line([300, 101, 4], &fresh, 7, None),
+            "Endergenic at 300,101,4: energy=0/5000000 charging=0 age=0 pearls=0 fired=0 \
+             dropped=0 gained=0 spent=0 arrived=-2 reason=\"Pearl arrived while idle\" dest=none \
+             distance=0 t=7"
+        );
+    }
+
+    #[test]
+    fn the_injector_readout_is_the_line_the_e2e_asserts() {
+        assert_eq!(
+            injector_line([300, 102, 2], 3, Some([300, 101, 2]), 9, Some("2")),
+            "Pearl Injector at 300,102,2: pearls=3 generator=300,101,2 t=9 nonce=2"
+        );
+        assert_eq!(
+            injector_line([300, 102, 4], 0, None, 1, None),
+            "Pearl Injector at 300,102,4: pearls=0 generator=none t=1"
+        );
+    }
+
+    #[test]
+    fn the_injector_has_eighteen_insert_only_pearl_slots() {
+        let container = injector_container();
+        assert_eq!(container.slots, 18, "upstream's 9x2 buffer");
+        assert_eq!(container.inputs.len(), 18, "every slot takes pearls in");
+        assert!(container.outputs.is_empty(), "automation takes nothing out");
+        for face in &container.faces {
+            assert_eq!(face.len(), 18, "every face reaches every slot");
+        }
+        assert!(container.menu.is_none(), "no GUI in this slice");
+    }
+
+    #[test]
+    fn the_endergenic_buffer_is_a_store_that_gives_nothing_out() {
+        let battery = endergenic_battery();
+        assert_eq!(battery.capacity, ENDERGENIC_CAPACITY);
+        assert_eq!(battery.max_insert, 0, "the capability takes nothing in");
+        assert_eq!(
+            battery.max_extract, 0,
+            "the generator pushes on its own tick, not through the capability"
+        );
+        assert_eq!(battery.insert_faces, [false; 6]);
+        assert_eq!(battery.extract_faces, [false; 6]);
+    }
+
+    #[test]
+    fn a_broken_endergenics_store_rides_on_its_item_tagged_with_its_type() {
+        let mut payload = Compound::new();
+        payload.insert(KEY_ENERGY.into(), Tag::Int(3_000));
+        let patch = Tag::Compound(entity_data_patch(&payload, ENDERGENIC_TYPE_ID));
+        let Some(Tag::Compound(payload)) = patch.get(BLOCK_ENTITY_DATA) else {
+            panic!("the patch names the vanilla component");
+        };
+        let payload = Tag::Compound(payload.clone());
+        assert_eq!(
+            payload.get("id"),
+            Some(&Tag::String(ENDERGENIC_TYPE_ID.into())),
+            "the payload names the block entity type it is placed as"
+        );
+        assert_eq!(read_endergenic(&payload).energy, 3_000);
+    }
+
+    #[test]
+    fn the_endergenic_commands_are_declared_at_the_operator_level() {
+        let mut commands = Vec::new();
+        declare_commands(&mut commands);
+        let ender: Vec<&str> = commands
+            .iter()
+            .map(|command| command.usage.as_str())
+            .filter(|usage| {
+                usage.contains("endergenic")
+                    || usage.contains("injector")
+                    || usage.contains("enderlink")
+            })
+            .collect();
+        assert_eq!(
+            ender,
+            vec![
+                "rftoolspower endergenic <pos:block_pos> [nonce:word]",
+                "rftoolspower injector <pos:block_pos> [nonce:word]",
+                "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
+            ]
+        );
+        for command in &commands {
+            assert_eq!(command.level, OPERATOR_LEVEL);
+        }
     }
 }

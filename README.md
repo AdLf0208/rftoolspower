@@ -1,10 +1,10 @@
-# RFTools Power for Horizon — the Coal Generator, the Power Monitor and the Powercell
+# RFTools Power for Horizon — the Coal Generator, the Power Monitor, the Powercell and the Endergenic
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.2**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.3**.
 
-Three families so far:
+Four families so far:
 
 **The Coal Generator** (slice 1)
 
@@ -41,6 +41,20 @@ Three families so far:
   `/rftoolspower side <pos> <face> NONE|INPUT|OUTPUT` — the harness's stand-in for the smart wrench
   the parent port does not carry.
 
+**The Endergenic Generator and the Pearl Injector** (slice 4)
+
+- two linked generators: a **rising redstone edge** starts a 15-mode charge on one, and the pearl
+  injector fires a pearl from the other into it;
+- a pearl that lands **inside the charging window** pays `rfPerHit[mode] × 2` — **200 FE** at mode 1
+  up to **25,600 FE** at mode 10 — plus up to a **doubling** for its age; one that lands while the
+  generator is idle is **lost** and pays nothing;
+- a landed pearl is held for **500 FE a tick** and fired again on the next pulse;
+- the buffer is **5,000,000 FE** and pushes out up to **20,000 FE a tick**, keeping a **2,000 FE**
+  reserve to hold pearls with;
+- a link is a **2-tick flight** for a three-block gap, the injector holds **18 pearls**, and the
+  smart wrench's link is `/rftoolspower enderlink <pos> <dest>`;
+- the ender monitor is the next slice (`notes.md`, gap 10).
+
 ## Build
 
 ```sh
@@ -55,11 +69,11 @@ packed.
 
 | Path | What |
 |---|---|
-| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the cell's tiers/faces/network/budgets) with their unit tests |
+| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the cell's tiers/faces/network/budgets, the endergenic's window/table/flight/hold) with their unit tests |
 | `src/support.rs` | the glue: both block entity Parts, the container and buffer declarations, the ticks, the click, the drops, the redstone, the commands |
 | `src/lib.rs` | the one `impl mod_api::Hooks` |
 | `assets/`, `data/` | the carried content, built by `tools/assemble_content.py` |
-| `tools/e2e.sh` | the in-game leg (phases A–AD) |
+| `tools/e2e.sh` | the in-game leg (phases A–AM) |
 | `tools/build-e2e-game.sh`, `tools/harness-receiver/` | the e2e-only energy receiver the push is proven against (never in the `.hmod`) |
 | `notes.md` | the slices, the evidence, the gaps |
 | `FINDINGS.md` | the upstream behaviour extracted (analysis only) |

@@ -5,6 +5,8 @@
     "rftoolspower:power_monitor",
     "rftoolspower:cell1",
     "rftoolspower:cell2",
+    "rftoolspower:endergenic",
+    "rftoolspower:pearl_injector",
     "rftoolspower:power_core1"
   ],
   "title": "itemGroup.rftoolspower"

@@ -82,3 +82,29 @@ tier-1 cell at 250 a tick, not 2,000; a tier-2 cell at 1,000. The port's leg ass
 Recorded simplification: upstream's `PowerCellBlock` declares `upper`/`lower` states for connected
 models, but its own `blockstates/cell1.json` has only the `""` variant (a state/model mismatch); the
 port draws one plain cube and declares no extra states.
+
+## Slice 4: the endergenic generator and the pearl injector (read for the same commits)
+
+Files read (`1.21_neo`, `e44463c`), plus McJtyLib `1.21_neo` `ef393e6`:
+
+| File | What it gave |
+|---|---|
+| `modules/endergenic/blocks/EndergenicTileEntity.java` | the tick order (`handlePearls` → `handleSendingEnergy` → the loss chance → the pulse → idle/holding/charging); the charging modes (1…15, idle at 16); the `CHARGE_IDLE`/`CHARGE_HOLDING` sentinels; the `rfPerHit` table; `receivePearl`'s three branches and the age bonus; `firePearl`/`firePearlFromInjector`; `discardPearl` and its four reasons; the 500-a-tick hold with the infusable factor; `handleSendingEnergy` over `energy - ENDERGENIC_KEEPRF`; `calculateDistance`; the saved fields (`charging`, `age`, `dest`, `distance`, `prevIn`, `pearls`, `energy`); the loot's `item_energy` copy; the wrench's link and the "maximum 4" refusal |
+| `modules/endergenic/blocks/PearlInjectorTileEntity.java` | the 9×2 pearl buffer (`BUFFER_SIZE`), `itemValid(match(ENDER_PEARL))`, the rising-edge `injectPearl` (take the pearl, then fire unless the generator is holding), `findEndergenicTileEntity` (behind the front, else UP) |
+| `modules/endergenic/data/EndergenicPearl.java` | the flight: `ticksLeft--`, arrive at `<= 0`, deliver to the destination's `receivePearl(age)` |
+| `modules/endergenic/EndergenicConfiguration.java` | 5,000,000 FE; `chanceLost` 5; 500 a tick to hold; `endergenicKeepRf` 2,000; 20,000 a tick out; `powergenFactor` 2.0 |
+| `modules/endergenic/EndergenicModule.java` | the two recipes (`"dod"/"ZFZ"/"dod"` and `" C "/"rFr"/" H "`), the block properties, the ender monitor and its `EnderMonitorData`/`EnderMonitorMode` (phase 2) |
+| `mcjtylib/.../GenericTileEntity.java`, `blocks/BaseBlock.java` | `checkRedstone` = `world.getBestNeighborSignal(pos)` on a neighbour change and on placement; `powerLevel` saved as a byte; `RotationType.ROTATION`'s `getStateForPlacement` uses `OrientationTools.getFacingFromEntity` |
+| `modules/endergenic/blocks/EnderMonitorTileEntity.java`, `data/EnderMonitorMode.java` | the phase-2 family: three modes (`MODE_LOSTPEARL`, `MODE_PEARLFIRED`, `MODE_PEARLARRIVED`); `fireFromEndergenic` sets `needpulse` only when the mode it watches matches; the tick puts **15** on the redstone output for that one tick (`support.setRedstoneState`); rank 2; saved `rs`/`needPulse`; the mode rides on the item's own component |
+| `modules/endergenic/client/GuiEndergenic.java`, `EndergenicRenderer.java` | what the GUI and the renderer show (a gap: no GUI, no renderer in this slice) |
+
+**The load-bearing finding:** the *power* of a pearl is not a constant — it is the arrival **mode**
+looked up in a 16-entry table, so the mechanic is the timing window. A pearl that arrives at mode 1
+pays 200 FE and one at mode 10 pays 25,600; the window closes at mode 16, and an arrival while idle
+loses the pearl. The port therefore asserts `gained == rfPerHit[arrived] × 2` against the mode the
+readout reports, instead of a fixed amount.
+
+Second finding: the endergenic's buffer **answers** the energy capability but refuses insert and
+extract — it gives FE out only through its own tick's push, `energy - 2,000` a tick, capped at
+20,000. The 2,000 reserve is what a held pearl lives on, and the leg proves exactly it (100,000 in,
+2,000 left, 98,000 in the receiver).

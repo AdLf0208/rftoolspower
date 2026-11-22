@@ -2,7 +2,7 @@
 
 `assets/` and `data/` at the package root are generated from two jars by
 [`tools/assemble_content.py`](tools/assemble_content.py); rerun it to rebuild, or `--check` to
-re-derive into a temporary tree and compare (`ok: 90 entries re-derive exactly`). They ship inside
+re-derive into a temporary tree and compare (`ok: 109 entries re-derive exactly`). They ship inside
 the SDK package `rftoolspower.hmod`, beside `src/` and `horizon-mod.toml`.
 
 The two jars, both MIT, both already in this campaign's licence cache:
@@ -73,6 +73,30 @@ Slice 3 adds:
 | `data/rftoolspower/loot_table/blocks/cell1.json`, `cell2.json` | the block drop (`copy_name` kept; `copy_components` dropped — the store rides on `block_entity_data`) |
 | `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.cell1`/`cell2`, `item.rftoolspower.power_core1` (upstream's names) |
 | `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | + the two cells and the core |
+
+Slice 4 adds:
+
+| File | What |
+|---|---|
+| `assets/rftoolspower/blockstates/endergenic.json` | the jar's own single-variant blockstate |
+| `assets/rftoolspower/blockstates/pearl_injector.json` | the jar's six `facing` variants, byte for byte (the model rotated by `x`/`y`) |
+| `assets/rftoolspower/models/block/endergenic.json` | `cube_all` with `endergenic/endergenic` (the jar's model, minus its `render_type`) |
+| `assets/rftoolspower/models/block/pearl_injector.json` | the jar's front-based cube with the base textures re-pointed into this namespace |
+| `assets/rftoolspower/models/item/{endergenic,pearl_injector}.json`, `assets/rftoolspower/items/{…}.json` | the item models and the 26.3 item definitions |
+| `assets/rftoolspower/textures/block/endergenic/{endergenic,pearl_injector}.png` | the two textures, byte for byte |
+| `data/rftoolspower/horizon/block/endergenic.json` | a plain full cube (`minecraft:iron_block` template), hardness 2.0 / blast 2.0, pickaxe, iron sound |
+| `data/rftoolspower/horizon/block/pearl_injector.json` | the same cube plus a declared six-way `facing` enum (the injector's `RotationType.ROTATION`) |
+| `data/rftoolspower/recipe/endergenic.json` | `"dod"/"ZFZ"/"dod"` — diamonds, the `#c:ender_pearls` tag, `rftoolsbase:infused_enderpearl`, `rftoolsbase:machine_frame` |
+| `data/rftoolspower/recipe/pearl_injector.json` | `" C "/"rFr"/" H "` — the `#c:chests` tag, redstone, `rftoolsbase:machine_frame`, a hopper |
+| `data/rftoolspower/advancement/recipes/misc/{endergenic,pearl_injector}.json` | the two recipe unlocks, in the jar's own shape |
+| `data/rftoolspower/loot_table/blocks/{endergenic,pearl_injector}.json` | the block drops (`copy_name` kept, `copy_components` dropped — see below) |
+| `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.endergenic`/`pearl_injector` |
+| `data/minecraft/tags/block/…`, `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | both blocks in the tags and the tab |
+
+Two of the new recipes' ingredients — `rftoolsbase:infused_enderpearl` and the `#c:chests` /
+`#c:ender_pearls` tags — do not exist in a build without the parent (and 26.3 ships no `c:` tags at
+all), so the recipes load but cannot match; `notes.md`'s phase AK proves both patterns craft
+nothing here.
 
 ## Patched, because 1.21.1 → 26.3 differs
 

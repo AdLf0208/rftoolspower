@@ -1,0 +1,12 @@
+{
+  "parent": "minecraft:block/cube",
+  "textures": {
+    "down": "rftoolspower:block/base/machinebottom",
+    "east": "rftoolspower:block/base/machineside",
+    "north": "rftoolspower:block/endergenic/pearl_injector",
+    "particle": "rftoolspower:block/endergenic/pearl_injector",
+    "south": "rftoolspower:block/base/machineside",
+    "up": "rftoolspower:block/base/machinetop",
+    "west": "rftoolspower:block/base/machineside"
+  }
+}
