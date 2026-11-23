@@ -144,6 +144,43 @@ which this `machines` slice does not carry; the block model only names the base 
 | `cell2`'s recipe | **not carried**: McJtyLib's `copy_components` wrapper around a shaped recipe needing `power_core2`, whose recipe needs `rftoolsbase:dimensional_shard` — a parent item this build does not carry, so it could never craft |
 | the lang | only the three keys this slice can show (block name, tab, shift line); upstream's GUI and tooltip strings are not carried because nothing reads them |
 
+## Slice 7 — the blazing generator and the blazing rod
+
+| File | What |
+|---|---|
+| `assets/rftoolspower/blockstates/blazing_generator.json` | the jar's own twelve variants (`facing` × `working`, with the `x` rotations for up/down), byte for byte |
+| `assets/rftoolspower/models/block/blazing_generator_idle.json`, `…_busy.json` | the jar's two front models, with `rftoolsbase:block/base/…` re-pointed at this package's copies |
+| `assets/rftoolspower/models/item/blazing_generator.json` | the jar's (parent: the busy model) |
+| `assets/rftoolspower/textures/block/blazing/blazing_generator_idle.png`, `…_busy.png` (+`.mcmeta`) | the idle front and the animated busy front, byte for byte |
+| `data/rftoolspower/horizon/block/blazing_generator.json` | an iron machine cube with a six-way `facing` (the jar's `BlockStateProperties.FACING`) and the `working` boolean; hardness 2.0 / blast 2.0, pickaxe, iron sound |
+| `data/rftoolspower/loot_table/blocks/blazing_generator.json` | `copy_name` only; the store travels through `minecraft:block_entity_data` (the `copy_components` function names mcjtylib's components, which this port does not register) |
+| `data/rftoolspower/recipe/blazing_generator.json` | `"XYX"/"RFR"/"XYX"` — `#c:rods/blaze`, `rftoolsbase:infused_diamond`, redstone blocks and `rftoolsbase:machine_frame` |
+| `data/rftoolspower/advancement/recipes/misc/blazing_generator.json` | the recipe unlock, in the 26.3 predicate shape |
+| `assets/rftoolspower/models/item/blazing_rod.json`, `assets/rftoolspower/items/blazing_rod.json`, `assets/rftoolspower/textures/item/blazing_rod.png` (+`.mcmeta`) | the rod's handheld model, its item definition and its animated texture, byte for byte |
+| `data/rftoolspower/horizon/item/blazing_rod.json` | the rod as a plain item: `minecraft:blaze_rod`'s 64-stack template **minus `minecraft:cooking_fuel`** — upstream's `BlazingRod extends Item` with `new Item.Properties()` is not furnace fuel, and the template would make it one |
+| `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.blazing_generator`, `item.rftoolspower.blazing_rod` |
+| `data/minecraft/tags/block/…`, `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | the block in the pickaxe and needs-iron-tool tags, both entries in the tab |
+
+The rod's own data is **not** content: it is the mod component `rftoolspower:blazing_rod_data`
+(`{steps, time, quality, duration}`), registered by `Hooks::component_types` and read and written
+through [`mod_api::Component`] on the stack (`src/support.rs`). A rod crafted or given without the
+component reads upstream's default row `(64, 1200, 60000, 20)`, exactly as upstream's
+`getOrDefault(…, BlazingRodData.DEFAULT)` answers.
+
+The `blazing` blockstate's `up`/`down` variants are the jar's: the placement hook can only set a
+horizontal front (the pin's placement context carries the placer's view angles, not its height), the
+same limit the pearl injector records; `setblock … [facing=up]` still draws what the jar draws.
+
+## Patched, because 1.21.1 → 26.3 differs (slice 7)
+
+| File | Patch |
+|---|---|
+| the two block models | `rftoolsbase:block/base/…` → `rftoolspower:block/base/…` (the base textures travel in this package) |
+| the loot table | `copy_components` removed as above; the store rides on `minecraft:block_entity_data` |
+| `blazing_rod`'s item | `!minecraft:cooking_fuel` — the blaze-rod template is fuel, upstream's rod is not |
+| the recipe | `{"item": X}` → bare ids, `{"tag": T}` → `#T`; `#c:rods/blaze` is **not** a 26.3 tag, so the recipe loads with an unresolved-tag error and can never match here (`phase BE` proves the pattern crafts nothing) |
+| the lang | only the two names; upstream's tooltip (`power … RF/t`, `duration … ticks`) and GUI strings are not carried, because nothing reads them at this tier |
+
 ## What the content cannot do alone
 
 - **The monitor's recipe needs `rftoolsbase:machine_base`** (the parent port declares it), so with
@@ -160,3 +197,8 @@ which this `machines` slice does not carry; the block model only names the base 
 - **The `lit` overlay** (see above): the block is dark or lit by its state, not by a glow layer.
 - **The GUI textures** (`assets/rftoolspower/textures/gui/coalgenerator.png`) are not carried: there
   is no menu in this slice.
+- **The blazing generator's recipe needs the parent twice** — `rftoolsbase:machine_frame` and
+  `rftoolsbase:infused_diamond` — and its rods name the `#c:rods/blaze` tag, which 26.3 does not
+  ship: with only this package the pattern crafts nothing (`phase BE`). Its loot keeps the store
+  (upstream copies `mcjtylib:item_energy`) but not the rods in its slots, which the engine keeps
+  apart from the payload (gap 8's shape).

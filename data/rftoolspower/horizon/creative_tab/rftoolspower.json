@@ -9,6 +9,8 @@
     "rftoolspower:endergenic",
     "rftoolspower:ender_monitor",
     "rftoolspower:pearl_injector",
+    "rftoolspower:blazing_generator",
+    "rftoolspower:blazing_rod",
     "rftoolspower:power_core1"
   ],
   "title": "itemGroup.rftoolspower"

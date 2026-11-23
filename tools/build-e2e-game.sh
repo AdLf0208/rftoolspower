@@ -46,23 +46,20 @@ cp -a "$PORT/tools/harness-receiver/flat/receiver.json" \
       "$MODSET/rfpowerharness/data/rfpowerharness/horizon/block/receiver.json"
 
 before=$(ls -1 "$VERSIONS" 2>/dev/null | tr '\n' ' ')
-env XDG_DATA_HOME="$DATA" XDG_CONFIG_HOME="$CONFIG" HOME="$HOME_DIR" \
-    "$LAUNCHER" native-build "$MODSET" --instance "$INSTANCE" --trust-native-code --json \
+built_json=$(env XDG_DATA_HOME="$DATA" XDG_CONFIG_HOME="$CONFIG" HOME="$HOME_DIR" \
+    "$LAUNCHER" native-build "$MODSET" --instance "$INSTANCE" --trust-native-code --json 2>&1) \
     || die "native-build of the two-mod set failed" 10
-
-built=""
-for tag in "$VERSIONS"/native-*; do
-    [ -d "$tag" ] || continue
-    tag=${tag##*/}
-    case " $before " in *" $tag "*) ;; *) built=$tag ;; esac
-done
+# The launcher *names* the build it selected ("native-… built and selected for its instance"), and
+# that is the one matching these sources — also when it answers "Up to date (no build needed)".
+# Picking by directory age instead once exported a newer build of *older* sources (the diagnostic
+# build was tested as if it were the current one).
+built=$(printf '%s\n' "$built_json" \
+    | sed -n 's/^\(native-[0-9a-z-]*\) built and selected.*/\1/p' | tail -1)
 if [ -z "$built" ]; then
-    # "Up to date (no build needed)": reuse the newest build that carries both mods.
-    for tag in $(ls -1dt "$VERSIONS"/native-* 2>/dev/null); do
-        grep -q '"rfpowerharness"' "$tag/native-mods.json" 2>/dev/null || continue
-        grep -q '"rftoolspower"' "$tag/native-mods.json" 2>/dev/null || continue
-        built=${tag##*/}
-        break
+    for tag in "$VERSIONS"/native-*; do
+        [ -d "$tag" ] || continue
+        tag=${tag##*/}
+        case " $before " in *" $tag "*) ;; *) built=$tag ;; esac
     done
 fi
 [ -n "$built" ] || die "native-build reported success but no two-mod version exists" 10
@@ -71,8 +68,12 @@ rm -rf "$EXPORT/horizon-native-mods"
 cp -a "$VERSIONS/$built/horizon-native-mods" "$EXPORT/horizon-native-mods"
 cp -a "$VERSIONS/$built/native-mods.json" "$EXPORT/native-mods.json"
 # The mods themselves are cdylibs beside the game binary, as `launcher-game.sh`'s export copies.
+# The launcher hard-links a build's libraries, so an export that already points at one of them has a
+# second name for the same inode and `cp -a` refuses ("are the same file"); `ln -f` replaces the
+# name in place, which is the same bytes without a copy.
 for lib in "$VERSIONS/$built"/lib*.so; do
-    [ -e "$lib" ] && cp -a "$lib" "$EXPORT/"
+    [ -e "$lib" ] || continue
+    ln -f "$lib" "$EXPORT/${lib##*/}" 2>/dev/null || cp -a "$lib" "$EXPORT/"
 done
 say "built $built; export now carries: $(python3 - "$EXPORT/native-mods.json" <<'PY'
 import json, sys

@@ -220,7 +220,9 @@ LANG = {
     "block.rftoolspower.endergenic": "Endergenic",
     "block.rftoolspower.ender_monitor": "Ender Monitor",
     "block.rftoolspower.pearl_injector": "Pearl Injector",
+    "block.rftoolspower.blazing_generator": "Blazing Generator",
     "item.rftoolspower.power_core1": "Power Core (Low)",
+    "item.rftoolspower.blazing_rod": "Blazing Rod",
     "itemGroup.rftoolspower": "RFTools Power",
     "message.rftoolspower.shiftmessage": "<Press Shift>",
 }
@@ -236,6 +238,8 @@ CREATIVE_TAB = {
         "rftoolspower:endergenic",
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
+        "rftoolspower:blazing_generator",
+        "rftoolspower:blazing_rod",
         "rftoolspower:power_core1",
     ],
     "title": "itemGroup.rftoolspower",
@@ -251,6 +255,7 @@ TAGS = {
         "rftoolspower:endergenic",
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
+        "rftoolspower:blazing_generator",
     ],
     "data/minecraft/tags/block/needs_iron_tool.json": [
         "rftoolspower:coalgenerator",
@@ -261,6 +266,7 @@ TAGS = {
         "rftoolspower:endergenic",
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
+        "rftoolspower:blazing_generator",
     ],
 }
 
@@ -399,6 +405,41 @@ POWER_LEVEL_DECL = {
     "default_state": {"facing": "north", "power": "0"},
     "shapes": {"property": "facing", "values": POWER_LEVEL_SHAPES},
     "item": True,
+}
+
+# --- the blazing generator and its rod (`BlazingGeneratorTileEntity`, `BlazingRod`).
+BLAZING = "blazing_generator"
+ROD = "blazing_rod"
+
+# `BlazingGeneratorTileEntity.createBlock` is McJtyLib's STANDARD_IRON with `BlockStateProperties.FACING`
+# (the ROTATION default: the front faces the placer) plus its own `WORKING` boolean. The jar's own
+# blockstate carries all twelve variants (six faces × working), including the two `x` rotations for
+# up/down, which this pin's variant reader supports (`horizon-assets` `Variant::rotations`).
+BLAZING_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "state_properties": {
+        "facing": {
+            "type": "enum",
+            "values": ["north", "south", "east", "west", "up", "down"],
+        },
+        "working": {"type": "boolean"},
+    },
+    "default_state": {"facing": "north", "working": "false"},
+    "item": True,
+}
+
+# `BlazingRod extends Item` with McJtyLib's `defaultProperties()` (`new Item.Properties()`): a plain
+# 64-stack item with no components of its own. The blaze-rod template is the close vanilla item, and
+# the one component it would bring is removed: upstream's rod is not furnace fuel.
+ROD_DECL = {
+    "template": "minecraft:blaze_rod",
+    "components": {"!minecraft:cooking_fuel": {}},
 }
 
 
@@ -713,6 +754,58 @@ def build(out: Path) -> None:
             read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{POWER_LEVEL}.json")
         ),
     )
+
+    # --- the blazing generator: the jar's twelve-variant blockstate (facing × working), its two
+    # front models with the base textures re-pointed into this namespace, and the rod item a plain
+    # item of its own (its data is the mod component `rftoolspower:blazing_rod_data`).
+    write(
+        out / f"assets/rftoolspower/blockstates/{BLAZING}.json",
+        json.loads(read_jar(POWER, f"assets/rftoolspower/blockstates/{BLAZING}.json")),
+    )
+    for state in ("idle", "busy"):
+        model = json.loads(
+            read_jar(POWER, f"assets/rftoolspower/models/block/{BLAZING}_{state}.json")
+        )
+        model["textures"] = {
+            key: value.replace("rftoolsbase:block/base/", "rftoolspower:block/base/")
+            for key, value in model["textures"].items()
+        }
+        write(out / f"assets/rftoolspower/models/block/{BLAZING}_{state}.json", model)
+    write(
+        out / f"assets/rftoolspower/models/item/{BLAZING}.json",
+        {"parent": f"rftoolspower:block/{BLAZING}_busy"},
+    )
+    write(
+        out / f"assets/rftoolspower/items/{BLAZING}.json",
+        {"model": {"model": f"rftoolspower:item/{BLAZING}", "type": "minecraft:model"}},
+    )
+    for texture in (f"{BLAZING}_idle.png", f"{BLAZING}_busy.png", f"{BLAZING}_busy.png.mcmeta"):
+        binary(
+            out / f"assets/rftoolspower/textures/block/blazing/{texture}",
+            read_jar(POWER, f"assets/rftoolspower/textures/block/blazing/{texture}"),
+        )
+    write(out / f"data/rftoolspower/horizon/block/{BLAZING}.json", BLAZING_DECL)
+    write(out / f"data/rftoolspower/loot_table/blocks/{BLAZING}.json", plain_loot(BLAZING))
+    write(out / f"data/rftoolspower/recipe/{BLAZING}.json", patched_recipe(BLAZING))
+    write(
+        out / f"data/rftoolspower/advancement/recipes/misc/{BLAZING}.json",
+        json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{BLAZING}.json")),
+    )
+
+    write(
+        out / f"assets/rftoolspower/models/item/{ROD}.json",
+        json.loads(read_jar(POWER, f"assets/rftoolspower/models/item/{ROD}.json")),
+    )
+    write(
+        out / f"assets/rftoolspower/items/{ROD}.json",
+        {"model": {"model": f"rftoolspower:item/{ROD}", "type": "minecraft:model"}},
+    )
+    for texture in (f"{ROD}.png", f"{ROD}.png.mcmeta"):
+        binary(
+            out / f"assets/rftoolspower/textures/item/{texture}",
+            read_jar(POWER, f"assets/rftoolspower/textures/item/{texture}"),
+        )
+    write(out / f"data/rftoolspower/horizon/item/{ROD}.json", ROD_DECL)
 
 
 def ingredient(value: object) -> object:

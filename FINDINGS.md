@@ -1,4 +1,4 @@
-# RFTools Power — upstream behaviour extracted (slices 1–3)
+# RFTools Power — upstream behaviour extracted (slices 1–7)
 
 Analysis only. Repository `https://github.com/McJtyMods/RFToolsPower`, branch `1.21_neo`, commit
 **`e44463cacddb85155839373b42d39bc705d618c0`** (2026-06-16, `version=1.21-7.0.6`) — the exact
@@ -108,3 +108,32 @@ Second finding: the endergenic's buffer **answers** the energy capability but re
 extract — it gives FE out only through its own tick's push, `energy - 2,000` a tick, capped at
 20,000. The 2,000 reserve is what a held pearl lives on, and the leg proves exactly it (100,000 in,
 2,000 left, 98,000 in the receiver).
+
+## Slice 7: the blazing generator and its rod (read for the same commits)
+
+Files read (`1.21_neo`, `e44463c`):
+
+| File | What it gave |
+|---|---|
+| `modules/blazing/blocks/BlazingGeneratorTileEntity.java` | four rod slots (`BUFFER_SIZE = 4`, `slotLimit(1)`, `match(BLAZING_ROD)`); `updateSlot`'s ceiling `(int)(quality/1000 × (1 + infusedFactor×0.1))` and burn `(int)duration`; `handlePowerGeneration`'s ramp (`rft += (max−rft)/150 + 0.01` up, `(max−rft)/30` down, both clamped), `total += (int)rft`, `produceEnergy(total)`, the `WORKING` mirror of `total > 0`, and the burn (`ticks--` while enabled; at 0 the slot is emptied and the ceiling zeroed; else `setPowerDuration(stack, ticks)`); `handleSendingEnergy` with `GENERATOR_SENDPERTICK`; the saved keys `rftMax{i}`, `rft{i}`, `ticks{i}` |
+| `modules/blazing/BlazingConfiguration.java` | 1,000,000 FE (`blazingGeneratorMaxPower`), 20,000 FE a tick a neighbour (`blazingGeneratorSendPerTick`); the agitator's and infuser's numbers (not carried this slice) |
+| `modules/blazing/items/BlazingRod.java` | `MAXTIME = 20 × 30` (600), `START_QUALITY = 60000`, `START_DURATION = 20`, `MAX_INFUSION_STEPS = 64`; `getRfPerTick = (int)(quality/1000)`; `getTotalTicks = (int)duration`; every accessor is `getOrDefault(ITEM_BLAZING_ROD_DATA, DEFAULT)` |
+| `modules/blazing/items/BlazingRodStack.java` | the rod behind the `IBlazingRod` interface the agitator algorithm mutates |
+| `modules/blazing/data/BlazingRodData.java` | the record `(steps: int, time: float, quality: float, duration: float)`, its codec and its `DEFAULT` |
+| `modules/blazing/BlazingModule.java` | the registrations, the two component types (`blazing_rod_data`, `agitator_data`), the block LootConfig (`standardLoot(ITEM_INFUSABLE)`), and the three recipes (`"XXX"/"GFG"/"iii"`, `"XYX"/"RFR"/"XYX"`, `"iXi"/"sFs"/"iXi"`) |
+| `modules/blazing/blocks/BlazingAgitatorTileEntity.java`, `BlazingInfuserTileEntity.java`, `logic/BlazingAgitatorAlgorithm.java` | read to rank them, not ported this slice: the 3×3 rod box with its adjacency factor, the infuser's catalyst table (redstone/glowstone/quartz/dimensional shard/nether star/ghast tear) and its 10-tick counter |
+| `mcjtylib/setup/DefaultModSetup.java` | `defaultProperties()` is `new Item.Properties()` — the rod stacks to 64 and is not fuel |
+| `mcjtylib/tileentity/GenericEnergyStorage.java` | `extractEnergy` always answers 0: no buffer of the mod's is pullable, the machine pushes on its own tick |
+
+Two facts this slice measured against the artefact rather than the brief:
+
+- **The 400-tick rod never reaches its ceiling.** The climb is a 1/150th of the gap plus 0.01 a
+  tick; from rest it needs **556 ticks** to clamp at 60 (computed from the rule and confirmed in
+  game: `rft=60.000000` first read at t+556). A 400-tick rod is spent at `rft ≈ 57.8`, so
+  `Δenergy == 60 × Δt` is a property of a generator whose rod outlives the ramp, not of the
+  400-tick rod. The leg proves the ramp on the 400-tick rod and the 60-a-tick steady state on a
+  5,000-tick one.
+- **`working` outlives the rod.** A spent slot's ceiling drops to 0 but its rate decays
+  `(0 − rft)/30` a tick, and `total` keeps adding `(int)rft`, so `working` stays true for ~120
+  ticks after the 400th; the store stops rising only then. The leg asserts the empty slot at the
+  400th tick and the fall of `working` after the decay, not an instant one.

@@ -1254,6 +1254,199 @@ impl EnderMonitor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The blazing generator (`BlazingGeneratorTileEntity`, `BlazingRod`, `BlazingRodData`)
+// ---------------------------------------------------------------------------
+
+/// The rod slots a generator has (`BlazingGeneratorTileEntity.BUFFER_SIZE`).
+pub const BLAZING_SLOTS: usize = 4;
+/// The buffer's capacity (`blazingGeneratorMaxPower`).
+pub const BLAZING_CAPACITY: i32 = 1_000_000;
+/// FE one neighbour is offered a tick (`blazingGeneratorSendPerTick`, `GENERATOR_SENDPERTICK`).
+pub const BLAZING_SEND_PER_TICK: i32 = 20_000;
+/// A rod's starting quality, in RF per 1,000 ticks (`BlazingRod.START_QUALITY`).
+pub const ROD_START_QUALITY: f32 = 60_000.0;
+/// A rod's starting duration, in ticks (`BlazingRod.START_DURATION`).
+pub const ROD_START_DURATION: f32 = 20.0;
+/// A rod's starting agitation time (`BlazingRod.MAXTIME`, `20 * 30`).
+pub const ROD_START_TIME: f32 = 600.0;
+/// The infusing steps a fresh rod has left (`BlazingRod.MAX_INFUSION_STEPS`).
+pub const ROD_START_STEPS: i32 = 64;
+/// Quality is RF per this many ticks (`BlazingRod.getRfPerTick` divides by it).
+pub const ROD_QUALITY_TICKS: f32 = 1_000.0;
+/// A rate below its ceiling climbs a 150th of the gap a tick (`handlePowerGeneration`).
+pub const ROD_RAMP_UP: f32 = 150.0;
+/// The +0.01 that makes the climb reach the ceiling instead of stalling just below it.
+pub const ROD_RAMP_BIAS: f32 = 0.01;
+/// A rate above its ceiling falls a 30th of the gap a tick (`handlePowerGeneration`).
+pub const ROD_RAMP_DOWN: f32 = 30.0;
+
+/// One blazing rod's saved data (`BlazingRodData`): its whole mechanic rides on these four
+/// numbers, which live in the item's own `rftoolspower:blazing_rod_data` component.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rod {
+    /// Infusing steps left (`steps`); the infuser is not carried, so it only travels.
+    pub steps: i32,
+    /// Agitation time left (`time`); the agitator is not carried, so it only travels.
+    pub time: f32,
+    /// Quality, in RF per [`ROD_QUALITY_TICKS`] ticks (`quality`).
+    pub quality: f32,
+    /// Duration, in ticks (`duration`) — this is what the generator spends.
+    pub duration: f32,
+}
+
+impl Default for Rod {
+    /// `BlazingRodData.DEFAULT`: `(MAX_INFUSION_STEPS, MAXTIME, START_QUALITY, START_DURATION)`.
+    fn default() -> Self {
+        Self {
+            steps: ROD_START_STEPS,
+            time: ROD_START_TIME,
+            quality: ROD_START_QUALITY,
+            duration: ROD_START_DURATION,
+        }
+    }
+}
+
+impl Rod {
+    /// `BlazingRod.getRfPerTick`: `(int) (quality / 1000)` — the slot's ceiling before the
+    /// infusable factor, which this port does not carry (gap 3).
+    #[must_use]
+    pub fn rf_per_tick(self) -> i32 {
+        (self.quality / ROD_QUALITY_TICKS) as i32
+    }
+
+    /// `BlazingRod.getTotalTicks`: `(int) duration` — how long the slot burns.
+    #[must_use]
+    pub fn total_ticks(self) -> i32 {
+        self.duration as i32
+    }
+}
+
+/// One rod slot's live numbers: the ceiling it is climbing to, the rate it is at, and the ticks
+/// its rod has left (upstream's `rfPerTickMax[i]`, `rfPerTick[i]`, `ticksRemaining[i]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlazingSlot {
+    /// The ceiling this slot's rate climbs to; 0 with no rod.
+    pub max: i32,
+    /// The rate the slot is at this tick, as upstream's `f32`.
+    pub rft: f32,
+    /// Ticks the slot's rod has left; 0 with no rod.
+    pub ticks: i32,
+}
+
+/// A blazing generator's saved state: its store and its four slots.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Blazing {
+    /// The store, an int in the saved compound (`energyStorage`).
+    pub energy: i32,
+    /// The four rod slots.
+    pub slots: [BlazingSlot; BLAZING_SLOTS],
+}
+
+impl Blazing {
+    /// `updateSlot`: a rod put in a slot sets the ceiling it ramps to and the burn it gets.
+    ///
+    /// The rate itself is **not** reset — upstream leaves `rfPerTick[i]` where the last rod left
+    /// it, so a swapped rod climbs or falls from there.
+    pub fn load(&mut self, slot: usize, rod: Rod) {
+        let Some(state) = self.slots.get_mut(slot) else {
+            return;
+        };
+        state.max = rod.rf_per_tick();
+        state.ticks = rod.total_ticks();
+    }
+
+    /// `updateSlot` with no rod (`stack.isEmpty()`): the ceiling and the burn go to 0, the rate
+    /// decays from where it was.
+    pub fn clear(&mut self, slot: usize) {
+        let Some(state) = self.slots.get_mut(slot) else {
+            return;
+        };
+        state.max = 0;
+        state.ticks = 0;
+    }
+
+    /// `updateSlot` for a slot the tick did not put the rod there itself: a rod that arrived
+    /// through the container (a hopper, a menu, a payload) has never seen `updateSlot`, and a slot
+    /// emptied behind the tick's back still carries its ceiling.
+    ///
+    /// A rod already in step with its slot (the burn's remaining ticks are the rod's own
+    /// duration, which the tick writes back every tick) is left alone. True when a slot changed.
+    pub fn reconcile(&mut self, rods: &[Option<Rod>; BLAZING_SLOTS]) -> bool {
+        let mut changed = false;
+        for (state, rod) in self.slots.iter_mut().zip(rods.iter()) {
+            match *rod {
+                Some(rod) if state.ticks != rod.total_ticks() => {
+                    state.max = rod.rf_per_tick();
+                    state.ticks = rod.total_ticks();
+                    changed = true;
+                }
+                None if state.max != 0 || state.ticks != 0 => {
+                    state.max = 0;
+                    state.ticks = 0;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    /// What one neighbour is offered this tick (`handleSendingEnergy`'s `SENDPERTICK`).
+    #[must_use]
+    pub fn send_amount(&self) -> u32 {
+        send_amount(self.energy, BLAZING_SEND_PER_TICK)
+    }
+    /// Take what a neighbour accepted out of the store.
+    pub fn take(&mut self, moved: u32) {
+        self.energy = clamp_blazing(self.energy - i32::try_from(moved).unwrap_or(i32::MAX));
+    }
+
+    /// One server tick (`handlePowerGeneration`): ramp every slot, add its whole rate to the
+    /// store, and — when the machine runs — spend a tick of every rod and write its remaining
+    /// duration back onto the rod.
+    ///
+    /// Answers the FE this tick made (`totalRfGenerated`), which is what `working` mirrors.
+    pub fn tick(&mut self, enabled: bool, rods: &mut [Option<Rod>; BLAZING_SLOTS]) -> i32 {
+        let mut total = 0_i32;
+        for (state, rod) in self.slots.iter_mut().zip(rods.iter_mut()) {
+            let ceiling = state.max as f32;
+            if state.rft > ceiling {
+                state.rft += (ceiling - state.rft) / ROD_RAMP_DOWN;
+                if state.rft < ceiling {
+                    state.rft = ceiling;
+                }
+            } else if state.rft < ceiling {
+                state.rft += (ceiling - state.rft) / ROD_RAMP_UP + ROD_RAMP_BIAS;
+                if state.rft > ceiling {
+                    state.rft = ceiling;
+                }
+            }
+            total += state.rft as i32;
+            if !enabled {
+                continue;
+            }
+            state.ticks -= 1;
+            if state.ticks <= 0 {
+                // `ticksRemaining[i] <= 0`: the rod is spent and the slot emptied.
+                state.ticks = 0;
+                state.max = 0;
+                *rod = None;
+            } else if let Some(held) = rod {
+                held.duration = state.ticks as f32;
+            }
+        }
+        self.energy = clamp_blazing(self.energy.saturating_add(total));
+        total
+    }
+}
+
+/// A store read back from a saved compound, clamped to the buffer (`GenericEnergyStorage`).
+#[must_use]
+pub fn clamp_blazing(energy: i32) -> i32 {
+    energy.clamp(0, BLAZING_CAPACITY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2364,5 +2557,267 @@ mod tests {
         );
         assert_eq!(kept.pulses, 3);
         assert_eq!(kept.last, Some(MonitorMode::PearlFired));
+    }
+
+    // -- the blazing generator ------------------------------------------------
+
+    /// A rod with this duration at the default quality.
+    fn rod(ticks: f32) -> Rod {
+        Rod {
+            duration: ticks,
+            ..Rod::default()
+        }
+    }
+
+    /// A generator with `slot 0` loaded with a rod of `ticks`.
+    fn loaded(ticks: f32) -> Blazing {
+        let mut blazing = Blazing::default();
+        blazing.load(0, rod(ticks));
+        blazing
+    }
+
+    #[test]
+    fn a_default_rod_is_sixty_fe_a_tick_for_twenty_ticks() {
+        let fresh = Rod::default();
+        assert_eq!(fresh.rf_per_tick(), 60, "60,000 quality is 60 RF a tick");
+        assert_eq!(fresh.total_ticks(), 20);
+        assert_eq!(fresh.steps, ROD_START_STEPS);
+        assert_eq!(fresh.time, ROD_START_TIME);
+        // The `(int)` cast truncates, as upstream's does: a rod one RF short is a whole RF short.
+        let weak = Rod {
+            quality: 59_999.0,
+            ..Rod::default()
+        };
+        assert_eq!(weak.rf_per_tick(), 59);
+        let half = Rod {
+            quality: 30_500.0,
+            ..Rod::default()
+        };
+        assert_eq!(half.rf_per_tick(), 30);
+    }
+
+    #[test]
+    fn a_slot_takes_its_ceiling_and_its_burn_from_the_rod() {
+        let blazing = loaded(400.0);
+        assert_eq!(
+            blazing.slots[0].max, 60,
+            "the ceiling is the rod's RF a tick"
+        );
+        assert_eq!(
+            blazing.slots[0].ticks, 400,
+            "the burn is the rod's duration"
+        );
+        assert_eq!(blazing.slots[0].rft, 0.0, "a fresh slot starts at rest");
+        assert_eq!(
+            blazing.slots[1],
+            BlazingSlot::default(),
+            "the other slots stay empty"
+        );
+    }
+
+    #[test]
+    fn the_ramp_climbs_the_hundred_and_fiftieth_of_the_gap() {
+        let mut blazing = loaded(10_000.0);
+        let mut rods = [Some(rod(10_000.0)), None, None, None];
+        blazing.tick(true, &mut rods);
+        let first = blazing.slots[0].rft;
+        assert!(
+            (first - 0.41).abs() < 1e-6,
+            "one tick from rest is (60 - 0)/150 + 0.01, got {first}"
+        );
+        let mut previous = first;
+        for _ in 0..99 {
+            blazing.tick(true, &mut rods);
+            let now = blazing.slots[0].rft;
+            assert!(now > previous, "the climb is monotone");
+            previous = now;
+        }
+        assert!(
+            (25.0..31.0).contains(&previous),
+            "after 100 ticks the 150-tick curve is around 30, got {previous}"
+        );
+    }
+
+    #[test]
+    fn the_ramp_reaches_its_ceiling_and_never_passes_it() {
+        let mut blazing = loaded(10_000.0);
+        let mut rods = [Some(rod(10_000.0)), None, None, None];
+        for tick in 0..1_000 {
+            blazing.tick(true, &mut rods);
+            assert!(
+                blazing.slots[0].rft <= 60.0,
+                "the rate passed its ceiling at tick {tick}"
+            );
+        }
+        assert_eq!(
+            blazing.slots[0].rft, 60.0,
+            "the +0.01 bias carries it onto the ceiling instead of stalling below it"
+        );
+    }
+
+    #[test]
+    fn the_rate_falls_thirty_times_faster_than_it_climbs() {
+        let mut blazing = loaded(10_000.0);
+        let mut rods = [Some(rod(10_000.0)), None, None, None];
+        for _ in 0..700 {
+            blazing.tick(true, &mut rods);
+        }
+        assert_eq!(blazing.slots[0].rft, 60.0);
+        // The rod comes out: `updateSlot` zeroes the ceiling and leaves the rate to decay.
+        blazing.clear(0);
+        rods[0] = None;
+        blazing.tick(true, &mut rods);
+        assert_eq!(blazing.slots[0].rft, 58.0, "60 + (0 - 60)/30");
+        let mut ticks = 0;
+        while blazing.slots[0].rft as i32 > 0 {
+            blazing.tick(true, &mut rods);
+            ticks += 1;
+            assert!(ticks < 300, "a 1/30th-a-tick decay reaches 0 in ~120 ticks");
+        }
+        assert!(
+            ticks > 50,
+            "the decay is a curve, not a step: it took {ticks} ticks"
+        );
+    }
+
+    #[test]
+    fn a_spent_rod_clears_its_slot_and_leaves_the_rate_decaying() {
+        let mut blazing = loaded(3.0);
+        let mut rods = [Some(rod(3.0)), None, None, None];
+        blazing.tick(true, &mut rods);
+        assert_eq!(
+            rods[0].map(|held| held.duration),
+            Some(2.0),
+            "the rod's own duration counts down"
+        );
+        assert_eq!(blazing.slots[0].ticks, 2);
+        blazing.tick(true, &mut rods);
+        blazing.tick(true, &mut rods);
+        assert_eq!(rods[0], None, "the spent rod leaves the slot");
+        assert_eq!(blazing.slots[0].ticks, 0);
+        assert_eq!(blazing.slots[0].max, 0);
+        assert!(
+            blazing.slots[0].rft > 0.0,
+            "the rate decays from where the rod left it"
+        );
+    }
+
+    #[test]
+    fn four_rods_add_four_rates() {
+        let mut blazing = Blazing::default();
+        for slot in 0..BLAZING_SLOTS {
+            blazing.load(slot, rod(10_000.0));
+        }
+        let mut rods = [Some(rod(10_000.0)); BLAZING_SLOTS];
+        for _ in 0..700 {
+            blazing.tick(true, &mut rods);
+        }
+        let before = blazing.energy;
+        let made = blazing.tick(true, &mut rods);
+        assert_eq!(made, 240, "four ceilings of 60 FE a tick");
+        assert_eq!(blazing.energy, before + 240);
+    }
+
+    #[test]
+    fn the_store_clamps_at_a_million() {
+        let mut blazing = Blazing {
+            energy: BLAZING_CAPACITY - 10,
+            ..Blazing::default()
+        };
+        blazing.load(0, rod(10_000.0));
+        let mut rods = [Some(rod(10_000.0)), None, None, None];
+        for _ in 0..700 {
+            blazing.tick(true, &mut rods);
+        }
+        assert_eq!(blazing.energy, BLAZING_CAPACITY);
+        blazing.tick(true, &mut rods);
+        assert_eq!(
+            blazing.energy, BLAZING_CAPACITY,
+            "a full buffer takes no more FE"
+        );
+        assert_eq!(clamp_blazing(2_000_000), BLAZING_CAPACITY);
+        assert_eq!(clamp_blazing(-5), 0);
+    }
+
+    #[test]
+    fn a_disabled_generator_spends_no_rod() {
+        // `updateSlot` with the machine disabled zeroes the ceiling (upstream's own guard), so a
+        // disabled generator makes nothing; the tick's `isMachineEnabled` gate only stops the rods
+        // being spent.
+        let mut blazing = loaded(400.0);
+        blazing.clear(0);
+        let mut rods = [Some(rod(400.0)), None, None, None];
+        let made = blazing.tick(false, &mut rods);
+        assert_eq!(made, 0, "a zeroed ceiling makes nothing");
+        assert_eq!(blazing.energy, 0);
+        assert_eq!(blazing.slots[0].ticks, 0);
+        assert_eq!(
+            rods[0].map(|held| held.duration),
+            Some(400.0),
+            "a disabled tick spends no rod"
+        );
+    }
+
+    #[test]
+    fn a_neighbour_is_offered_twenty_thousand_a_tick() {
+        let mut blazing = Blazing {
+            energy: BLAZING_CAPACITY,
+            ..Blazing::default()
+        };
+        assert_eq!(blazing.send_amount(), 20_000);
+        blazing.take(20_000);
+        assert_eq!(blazing.energy, BLAZING_CAPACITY - 20_000);
+        blazing.energy = 1_000;
+        assert_eq!(
+            blazing.send_amount(),
+            1_000,
+            "a nearly empty store offers what it has"
+        );
+        blazing.energy = 0;
+        assert_eq!(blazing.send_amount(), 0);
+    }
+
+    #[test]
+    fn a_rod_that_arrives_without_its_ceiling_gets_one() {
+        let mut blazing = Blazing::default();
+        let arrived = [Some(rod(400.0)), None, None, None];
+        assert!(
+            blazing.reconcile(&arrived),
+            "a rod that never saw updateSlot is settled"
+        );
+        assert_eq!(blazing.slots[0].max, 60);
+        assert_eq!(blazing.slots[0].ticks, 400);
+        assert!(!blazing.reconcile(&arrived), "a settled slot is left alone");
+    }
+
+    #[test]
+    fn a_slot_emptied_behind_the_ticks_back_loses_its_ceiling() {
+        let mut blazing = loaded(400.0);
+        assert!(
+            blazing.reconcile(&[None; BLAZING_SLOTS]),
+            "the slot was emptied"
+        );
+        assert_eq!(blazing.slots[0].max, 0);
+        assert_eq!(blazing.slots[0].ticks, 0);
+        assert!(!blazing.reconcile(&[None; BLAZING_SLOTS]));
+    }
+
+    #[test]
+    fn a_burning_rod_is_not_reloaded_every_tick() {
+        let mut blazing = Blazing::default();
+        let mut rods = [Some(rod(400.0)), None, None, None];
+        blazing.reconcile(&rods);
+        for _ in 0..10 {
+            blazing.tick(true, &mut rods);
+        }
+        assert_eq!(blazing.slots[0].ticks, 390);
+        assert!(
+            !blazing.reconcile(&rods),
+            "the rod's own duration matches the burn it has left"
+        );
+        assert_eq!(
+            blazing.slots[0].ticks, 390,
+            "a reload would restart the 400"
+        );
     }
 }

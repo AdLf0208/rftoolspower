@@ -1,11 +1,11 @@
 # RFTools Power for Horizon — the Coal Generator, the Power Monitor, the Power Level, the
-# Powercell, the Endergenic and the Ender Monitor
+# Powercell, the Endergenic, the Ender Monitor and the Blazing Generator
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.5**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.6**.
 
-Six families so far:
+Seven families so far:
 
 **The Coal Generator** (slice 1)
 
@@ -75,6 +75,21 @@ Six families so far:
 - mirrors the ratio into its `power` state (the output's carrier at this pin) and reads out through
   `/rftoolspower powerlevel <pos> [nonce]` — the harness's stand-in for upstream's renderer.
 
+**The Blazing Generator and the Blazing Rod** (slice 7)
+
+- four rod slots; each rod **climbs** to its own ceiling — a 60,000-quality rod is **60 FE a tick**
+  — by **a 150th of the gap plus 0.01 a tick**, and its burn counts down from the rod's `duration`;
+- the buffer is **1,000,000 FE** and the generator **pushes 20,000 FE a tick into each neighbour**
+  with no reserve;
+- the rod's whole state — `quality`, `duration`, the agitator's `time` and the infuser's `steps` —
+  is the mod's own **`rftoolspower:blazing_rod_data` item component**, written back as the rod
+  burns and read by the generator;
+- `working` mirrors the tick's own total into the block state, and the block's front faces its
+  placer;
+- a click puts a rod in the first free slot, anything else is refused, and the held item never
+  acts on the machine (upstream opens its GUI there);
+- reads out through `/rftoolspower blazing <pos> [nonce]`.
+
 ## Build
 
 ```sh
@@ -89,11 +104,11 @@ packed.
 
 | Path | What |
 |---|---|
-| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the power level's 0–9 ratio/cadence, the cell's tiers/faces/network/budgets, the endergenic's window/table/flight/hold, the ender monitor's mode gate and one-tick pulse) with their unit tests |
-| `src/support.rs` | the glue: every block entity Part, the container and buffer declarations, the ticks, the clicks, the drops, the redstone, the `fireMonitors` notice and the commands |
+| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the power level's 0–9 ratio/cadence, the cell's tiers/faces/network/budgets, the endergenic's window/table/flight/hold, the ender monitor's mode gate and one-tick pulse, the blazing generator's rod/ramp/burn and its 1,000,000 FE clamp) with their unit tests |
+| `src/support.rs` | the glue: every block entity Part, the container and buffer declarations, the ticks, the clicks, the drops, the redstone, the `fireMonitors` notice, the blazing rod's item component and the commands |
 | `src/lib.rs` | the one `impl mod_api::Hooks` |
 | `assets/`, `data/` | the carried content, built by `tools/assemble_content.py` |
-| `tools/e2e.sh` | the in-game leg (phases A–AM) |
+| `tools/e2e.sh` | the in-game leg (phases A–BE) |
 | `tools/build-e2e-game.sh`, `tools/harness-receiver/` | the e2e-only energy receiver the push is proven against (never in the `.hmod`) |
 | `notes.md` | the slices, the evidence, the gaps |
 | `FINDINGS.md` | the upstream behaviour extracted (analysis only) |

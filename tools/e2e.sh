@@ -88,11 +88,27 @@
 #  AR the `endermonitor` command's refusals are parsed replies, and a refused mode changes nothing
 #  AS the ender monitor's carried recipe needs `rftoolsbase:machine_base`, so it crafts nothing here
 #
+#  AX a blazing generator placed from its item is empty (no rod, no rate, working false), and a rod
+#     given with the mod's own `rftoolspower:blazing_rod_data` component keeps it: the game reads it
+#     back and the click puts the rod in slot 0 with a 60 FE a tick ceiling and 400 ticks to burn
+#  AY the slot's rate climbs the artefact's curve: one 1/150th of the gap to the ceiling plus 0.01 a
+#     tick, folded in single precision over the window the two replies name
+#  AZ at the ceiling the store rises by exactly 60 FE per game tick, and it takes the ramp ~556
+#     ticks to get there (the 400-tick rod never does — asserted, not assumed)
+#  BA the rod is spent at its 400th tick: the slot empties, the rate decays a 30th of the gap a
+#     tick, `working` falls and the store stops (the differential for AZ)
+#  BB a doctored 999,995 FE generator clamps at 1,000,000 while its rod burns
+#  BC the generator pushes its store into a neighbour with no reserve: 100,000 FE in, 100,000 out
+#  BD the store, the rates and the rods survive save + relaunch
+#  BE a stone is refused as a rod, the `blazing` refusal parses, and the carried recipe needs the
+#     parent's machine frame and the absent `#c:rods/blaze` tag, so it crafts nothing here
+#
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
 # of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF;
 # SELFTEST_ENDERMON=1 inverts AO (the monitor must not have lit);
-# SELFTEST_POWERLEVEL=1 inverts the power level's 5 (it asserts the brief's mistaken 4).
+# SELFTEST_POWERLEVEL=1 inverts the power level's 5 (it asserts the brief's mistaken 4);
+# SELFTEST_BLAZING=1 asserts a rod at its ceiling makes no FE (AZ inverted) and exits non-zero.
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -109,6 +125,7 @@ SELFTEST=${SELFTEST:-0}
 SELFTEST_MONITOR=${SELFTEST_MONITOR:-0}
 SELFTEST_ENDERMON=${SELFTEST_ENDERMON:-0}
 SELFTEST_POWERLEVEL=${SELFTEST_POWERLEVEL:-0}
+SELFTEST_BLAZING=${SELFTEST_BLAZING:-0}
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
 WORLD=RFToolsPowerE2E
@@ -126,6 +143,8 @@ CELL=rftoolspower:cell1
 CELL2=rftoolspower:cell2
 CORE=rftoolspower:power_core1
 RECEIVER=rfpowerharness:receiver
+BLAZING=rftoolspower:blazing_generator
+ROD_ITEM=rftoolspower:blazing_rod
 COAL=minecraft:coal
 CHARCOAL=minecraft:charcoal
 COAL_BLOCK=minecraft:coal_block
@@ -511,6 +530,125 @@ aim_powerlevel() { # aim_powerlevel X Y Z FACE
         || fail "cannot set the power level's facing at $1,$2,$3"
     ctl wait 4 >/dev/null
     [ "$(block_name "$1" "$2" "$3")" = "$POWER_LEVEL" ] || fail "the power level vanished from $1,$2,$3"
+}
+
+# --- the blazing generator (slice 7) -------------------------------------
+# The rod's whole mechanic is the mod's own item component, so the rig gives rods with an explicit
+# `rftoolspower:blazing_rod_data={steps,time,quality,duration}` and reads the same stack back.
+blazing_arena() {
+    # This band has no floor yet, and a tp into the void followed by the fill leaves the player
+    # below it: the first run of this leg died there ("the dead screen is open" at the next
+    # place). The player is put down on the floor only after it is filled.
+    ctl command "gamemode creative" >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((SX + 1)).5 101 158.5" >/dev/null
+    ctl wait 2 >/dev/null
+    local attempt
+    for attempt in 1 2 3; do
+        ctl command "execute in minecraft:the_end run fill $((SX - 6)) 100 144 $((SX + 8)) 100 176 minecraft:stone" >/dev/null
+        ctl wait 6 >/dev/null
+        [ "$(block_name "$SX" 100 158)" = "minecraft:stone" ] && break
+        echo "  the blazing arena floor fill did not land (attempt $attempt); waiting" >&2
+        ctl wait 40 >/dev/null
+    done
+    [ "$(block_name "$SX" 100 158)" = "minecraft:stone" ] || fail "the blazing arena floor is not stone"
+    ctl command "execute in minecraft:the_end run fill $((SX - 6)) 101 144 $((SX + 8)) 108 176 minecraft:air" >/dev/null
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$SX" 101 158)" = "minecraft:air" ] || fail "the blazing arena air fill did not land"
+    ctl command "execute in minecraft:the_end run tp @s $((SX + 1)).5 101 158.5" >/dev/null
+    ctl wait 20 >/dev/null
+    # The clicks the rods need are survival clicks (a creative hand keeps the stack, the cell
+    # slice's trap), and the rod phase starts from an empty inventory.
+    ctl command "gamemode survival" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl wait 6 >/dev/null
+}
+
+aim_blazing() { # aim_blazing X Y Z
+    # The placement's yaw is the game's, not the player's (the monitor/ender-monitor trap), so the
+    # front is pinned after the placement; a `setblock` of the same block keeps its block entity.
+    ctl command "execute in minecraft:the_end run setblock $1 $2 $3 $BLAZING[facing=north,working=false]" >/dev/null \
+        || fail "cannot pin the blazing generator's facing at $1,$2,$3"
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$1" "$2" "$3")" = "$BLAZING" ] || fail "the blazing generator vanished from $1,$2,$3"
+}
+
+place_blazing() { # place_blazing X Y Z — a fresh generator from the hotbar
+    local x=$1 y=$2 z=$3 aim
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    hold "$BLAZING"
+    aim=$(ctl look-at-block "$x" $((y - 1)) "$z" up 2>&1) \
+        || fail "cannot aim at the floor under $x,$y,$z: $aim"
+    place_block "$x" "$y" "$z" "$BLAZING" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$BLAZING" ] || fail "the blazing generator did not place at $x,$y,$z"
+    aim_blazing "$x" "$y" "$z"
+    echo "  placed: $(ctl block "$x" "$y" "$z" | jq -r '.state')" >&2
+}
+
+place_blazing_kept() { # place_blazing_kept X Y Z — the generator item the player already carries
+    local x=$1 y=$2 z=$3
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select "$BLAZING" >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at-block "$x" $((y - 1)) "$z" up >/dev/null || fail "cannot aim at the floor under $x,$y,$z"
+    place_block "$x" "$y" "$z" "$BLAZING" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$BLAZING" ] || fail "the carried blazing generator did not place at $x,$y,$z"
+    aim_blazing "$x" "$y" "$z"
+}
+
+hold_rod() { # hold_rod DURATION [QUALITY]
+    ctl command "item replace entity @s hotbar.0 with $ROD_ITEM[rftoolspower:blazing_rod_data={steps:64,time:600,quality:${2:-60000},duration:$1}] 1" >/dev/null \
+        || fail "the game refused the rod with its component"
+    ctl wait 4 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+}
+
+click_held() { # click_held X Y Z — right-click with whatever hotbar slot 1 holds
+    local x=$1 y=$2 z=$3
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+    ctl interact "$x" "$y" "$z" >/dev/null
+    ctl wait 10 >/dev/null
+}
+
+# The *server's* inventory of the local player, as the `/data get entity @s Inventory` line. A
+# refused click leaves the stack there; the client's own view can lose it to a prediction.
+server_inventory() {
+    ctl command "data get entity @s Inventory" >/dev/null
+    ctl wait 4 >/dev/null
+    await_line 'has the following entity data'
+}
+
+# `/rftoolspower blazing X Y Z <nonce>`: the line, then the parsed fields (BZ_*).
+blazing() { # blazing X Y Z
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower blazing $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower blazing reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_blazing.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the blazing line did not parse: $line"
+    echo "  $line" >&2
+}
+
+expect_bz_energy() { [ "$BZ_ENERGY" = "$1" ] || fail "the blazing generator holds $BZ_ENERGY FE, expected $1"; }
+expect_bz_working() { [ "$BZ_WORKING" = "$1" ] || fail "the blazing generator reports working=$BZ_WORKING, expected $1"; }
+expect_bz_rod() { # expect_bz_rod SLOT ITEM|empty
+    local rod
+    eval "rod=\$BZ_ROD$1"
+    [ "$rod" = "$2" ] || fail "blazing slot $1 holds '$rod', expected '$2'"
 }
 
 echo "== launch (The End arena, the package's own content and code) =="
@@ -1862,21 +2000,35 @@ ctl command "gamemode creative" >/dev/null
 ctl wait 4 >/dev/null
 
 echo "== AO: an arrival pulses the arrived monitor for exactly one tick =="
-pearl_into_injector "$((SX + 1))" 101 130
-sample_pulse "$MONX" "$MONY" "$MONZ" "$ENDERMON"
+# The window is sixteen consecutive *stepped* server ticks. A window that saw no pulse while the
+# shot really fired is inconclusive, not a failure — the freeze/step hand-off is the harness's, and
+# one run missed it entirely ('0000000000000000') while the destination recorded the arrival; such
+# an attempt is retried, and the monitors' counters count every attempt. A real regression (no
+# pulse ever) fails on the third window.
+AO_ATTEMPTS=0
+while :; do
+    AO_ATTEMPTS=$((AO_ATTEMPTS + 1))
+    pearl_into_injector "$((SX + 1))" 101 130
+    sample_pulse "$MONX" "$MONY" "$MONZ" "$ENDERMON"
+    [ "$PULSE_TICK_LIT" = 1 ] && break
+    injector_state "$((SX + 1))" 101 130
+    [ "$PEARLS" = 0 ] \
+        || fail "the pulse left $PEARLS pearl(s) in the injector, so the shot never fired ('$PULSE_SEQUENCE')"
+    echo "  attempt $AO_ATTEMPTS: the shot fired but the window saw no pulse ('$PULSE_SEQUENCE'); sampling again" >&2
+    [ "$AO_ATTEMPTS" -lt 3 ] \
+        || fail "three windows saw no pulse although the injector fired each shot ('$PULSE_SEQUENCE'); the monitor never lit"
+done
 if [ "${SELFTEST_ENDERMON:-0}" = 1 ]; then
     echo "(selftest: asserting the monitor never lit)"
     [ "$PULSE_LIT" = 0 ] || fail "selftest: the monitor lit for $PULSE_LIT sample(s), so the one-tick assertion is alive"
 fi
-[ "$PULSE_TICK_LIT" = 1 ] \
-    || fail "the monitor's lit state was true in $PULSE_TICK_LIT game ticks of the pulse's window, expected exactly 1 ('$PULSE_SEQUENCE' over ticks $PULSE_TICKS)"
 case "$PULSE_SEQUENCE" in
     *0) ;;
     *) fail "the monitor was still lit at the end of the window: '$PULSE_SEQUENCE'" ;;
 esac
 endermonitor_state "$MONX" "$MONY" "$MONZ"
 expect_monitor_mode arrived
-expect_monitor_pulses 1
+expect_monitor_pulses "$AO_ATTEMPTS"
 [ "$LAST" = arrived ] || fail "the monitor's last mode is $LAST, expected arrived"
 [ "$NEEDPULSE" = false ] || fail "the monitor still owes a pulse after it fired"
 [ "$OUT" = 0 ] || fail "the monitor still answers out=$OUT after the pulse"
@@ -1886,7 +2038,7 @@ case "$(ctl block "$MONX" "$MONY" "$MONZ" | jq -r '.state')" in
 esac
 endermonitor_state "$FIREDX" 101 "$FIREDZ"
 expect_monitor_mode fired
-expect_monitor_pulses 1
+expect_monitor_pulses "$AO_ATTEMPTS"
 [ "$LAST" = fired ] || fail "the source monitor's last mode is $LAST, expected fired"
 endermonitor_state "$SX" 101 "$WRONGZ"
 expect_monitor_pulses 0
@@ -1913,9 +2065,9 @@ case "$PULSE_SEQUENCE" in
 esac
 [ "$(block_lit "$LAMPX" 101 "$LAMPZ")" = false ] || fail "the lamp is still lit after the pulse"
 endermonitor_state "$MONX" "$MONY" "$MONZ"
-expect_monitor_pulses 2
+expect_monitor_pulses "$((AO_ATTEMPTS + 1))"
 endermonitor_state "$FIREDX" 101 "$FIREDZ"
-expect_monitor_pulses 2
+expect_monitor_pulses "$((AO_ATTEMPTS + 1))"
 echo "  the second shot lit the lamp on the display face and went dark again"
 
 echo "== AP: the same shot does not pulse a monitor watching another mode =="
@@ -2195,4 +2347,229 @@ ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  a stone position and the missing parent are the recipe's limit here (RFToolsBase is not in this build)"
 
-echo "PASS: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+# --- the blazing generator (slice 7) -------------------------------------
+echo "== AX: a blazing generator places empty, and a given rod carries its component =="
+blazing_arena
+place_blazing "$SX" 101 150
+blazing "$SX" 101 150
+expect_bz_energy 0
+expect_bz_working 0
+for slot in 0 1 2 3; do
+    expect_bz_rod "$slot" empty
+done
+[ "$BZ_RFTMAX0" = 0 ] && [ "$BZ_TICKS0" = 0 ] || fail "a fresh generator's slot 0 reads rftmax=$BZ_RFTMAX0 ticks=$BZ_TICKS0"
+hold_rod 400
+ROD_COMPONENTS=$(ctl inventory | jq -r '.held.components // ""')
+echo "  the given rod's stack: $ROD_COMPONENTS" >&2
+case "$ROD_COMPONENTS" in
+    *rftoolspower:blazing_rod_data*) ;;
+    *) fail "the given rod carries no rftoolspower:blazing_rod_data component: $ROD_COMPONENTS" ;;
+esac
+case "$ROD_COMPONENTS" in
+    *quality*60000*) ;;
+    *) fail "the rod's component does not carry quality 60000: $ROD_COMPONENTS" ;;
+esac
+click_held "$SX" 101 150
+blazing "$SX" 101 150
+expect_bz_rod 0 "$ROD_ITEM"
+[ "$BZ_RFTMAX0" = 60 ] || fail "the rod's ceiling is $BZ_RFTMAX0, expected 60 (60,000 quality / 1,000)"
+[ "$BZ_TICKS0" -gt 300 ] && [ "$BZ_TICKS0" -le 400 ] \
+    || fail "the rod has $BZ_TICKS0 ticks left of its 400"
+[ "$(held_count "$ROD_ITEM")" = 0 ] || fail "the hand still holds $(held_count "$ROD_ITEM") rod(s) after the click"
+ctl wait 4 >/dev/null
+blazing "$SX" 101 150
+expect_bz_working 1
+echo "  the rod went into slot 0 with a ceiling of 60 and $BZ_TICKS0 ticks left; the generator is working"
+
+echo "== AY: the slot's rate climbs the artefact's 1/150th-of-the-gap curve =="
+blazing "$SX" 101 150
+R0=$BZ_RFT0; T0=$BZ_T; CEIL=$BZ_RFTMAX0
+ctl wait 25 >/dev/null
+blazing "$SX" 101 150
+R1=$BZ_RFT0; T1=$BZ_T
+eval "$(python3 "$PORT/tools/parse_blazing.py" --ramp "$R0" "$T0" "$R1" "$T1" "$CEIL")"
+echo "  rft $R0 at t=$T0 -> $R1 at t=$T1: the fold says $RAMP_EXPECTED (delta $RAMP_DELTA)" >&2
+[ "$RAMP_RISING" = 1 ] || fail "the rate did not climb: $R0 -> $R1"
+python3 - "$RAMP_DELTA" <<'RAMPCHECK' || fail "the rate at $R1 is not the 150-tick fold of $R0 ($RAMP_EXPECTED, delta $RAMP_DELTA)"
+import sys
+sys.exit(0 if float(sys.argv[1]) < 0.0001 else 1)
+RAMPCHECK
+echo "  the climb is one 1/150th of the gap plus 0.01 a tick, to six decimals"
+
+echo "== AZ: at its ceiling the store rises by exactly 60 FE a game tick =="
+place_blazing "$SX" 101 158
+hold_rod 5000
+click_held "$SX" 101 158
+REACHED=0
+for _ in $(seq 1 45); do
+    blazing "$SX" 101 158
+    [ "$BZ_RFT0" = "60.000000" ] && { REACHED=1; break; }
+    ctl wait 20 >/dev/null
+done
+[ "$REACHED" = 1 ] || fail "the rate settled at $BZ_RFT0 after its rod's whole ramp, expected the ceiling 60"
+E0=$BZ_ENERGY; T0=$BZ_T
+ctl wait 40 >/dev/null
+blazing "$SX" 101 158
+E1=$BZ_ENERGY; T1=$BZ_T
+DE=$((E1 - E0)); DT=$((T1 - T0))
+echo "  over $DT ticks: $E0 -> $E1 FE (+$DE)" >&2
+[ "$DT" -ge 20 ] || fail "only $DT ticks passed; the window is too small to assert"
+if [ "$SELFTEST_BLAZING" = 1 ]; then
+    echo "(selftest: asserting a rod at its ceiling makes no FE)"
+    [ "$DE" = 0 ] || fail "selftest: the blazing generator made $DE FE in $DT ticks, so the assertion is alive"
+fi
+[ "$DE" = $((60 * DT)) ] || fail "FE rose $DE over $DT ticks, expected $((60 * DT)) (one rod at its 60 ceiling)"
+
+echo "== BA: the 400-tick rod is spent, the slot empties and the rate decays away =="
+SPENT=0
+for _ in $(seq 1 40); do
+    blazing "$SX" 101 150
+    [ "$BZ_ROD0" = empty ] && { SPENT=1; break; }
+    ctl wait 20 >/dev/null
+done
+[ "$SPENT" = 1 ] || fail "the 400-tick rod was never spent: slot 0 still holds '$BZ_ROD0'"
+[ "$BZ_TICKS0" = 0 ] || fail "the spent slot still reads $BZ_TICKS0 ticks"
+[ "$BZ_RFTMAX0" = 0 ] || fail "the spent slot's ceiling is $BZ_RFTMAX0, expected 0"
+DECAY0=$BZ_RFT0
+ctl wait 20 >/dev/null
+blazing "$SX" 101 150
+DECAY1=$BZ_RFT0
+echo "  the spent slot's rate: $DECAY0 -> $DECAY1" >&2
+python3 - "$DECAY0" "$DECAY1" <<'DECAYCHECK' || fail "the spent slot's rate did not fall: $DECAY0 -> $DECAY1"
+import sys
+sys.exit(0 if float(sys.argv[2]) < float(sys.argv[1]) else 1)
+DECAYCHECK
+CALM=0
+for _ in $(seq 1 25); do
+    blazing "$SX" 101 150
+    [ "$BZ_WORKING" = 0 ] && { CALM=1; break; }
+    ctl wait 20 >/dev/null
+done
+[ "$CALM" = 1 ] || fail "the generator still reports working after its rod was spent and its rate decayed"
+E0=$BZ_ENERGY; T0=$BZ_T
+ctl wait 20 >/dev/null
+blazing "$SX" 101 150
+[ "$BZ_ENERGY" = "$E0" ] || fail "with no rod the store still moved: $E0 -> $BZ_ENERGY"
+echo "  no rod, no FE: the store held $BZ_ENERGY for $((BZ_T - T0)) ticks and working is false"
+
+echo "== BB: a doctored 999,995 FE generator clamps at the million =="
+ctl command "give @s $BLAZING[minecraft:block_entity_data={id:\"rftoolspower:blazing_generator_block_entity\",energy:999995}]" >/dev/null
+ctl wait 6 >/dev/null
+place_blazing_kept "$SX" 101 166
+blazing "$SX" 101 166
+expect_bz_energy 999995
+hold_rod 600
+click_held "$SX" 101 166
+ctl wait 40 >/dev/null
+blazing "$SX" 101 166
+expect_bz_energy 1000000
+expect_bz_working 1
+ctl wait 20 >/dev/null
+blazing "$SX" 101 166
+expect_bz_energy 1000000
+echo "  999,995 FE plus a 60 FE ceiling stops at exactly 1,000,000 and keeps burning"
+
+echo "== BC: the generator pushes its store into a neighbour, with no reserve =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 172 minecraft:air" >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 172 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+ctl command "give @s $BLAZING[minecraft:block_entity_data={id:\"rftoolspower:blazing_generator_block_entity\",energy:100000}]" >/dev/null
+ctl wait 6 >/dev/null
+place_blazing_kept "$SX" 101 172
+blazing "$SX" 101 172
+expect_bz_energy 100000
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 172 $RECEIVER" >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$((SX + 1))" 101 172)" = "$RECEIVER" ] || fail "the harness receiver did not place beside the blazing generator"
+ctl wait 40 >/dev/null
+blazing "$SX" 101 172
+expect_bz_energy 0
+PUSHED=$(energy_of "$((SX + 1))" 101 172)
+[ "$PUSHED" = 100000 ] || fail "the receiver holds $PUSHED FE, expected the generator's whole 100,000 (no reserve)"
+echo "  the 100,000 FE store moved into the receiver and the generator ends empty"
+
+echo "== BD: the store, the rates and the rods survive save + relaunch =="
+blazing "$SX" 101 158
+SAVED_ENERGY=$BZ_ENERGY
+SAVED_RFT=$BZ_RFT0
+ctl save >/dev/null
+ctl wait 10 >/dev/null
+ctl quit >/dev/null 2>&1 || true
+sleep 2
+launch
+ctl command "execute in minecraft:the_end run tp @s $((SX + 1)).5 101 158.5" >/dev/null
+ctl wait 30 >/dev/null
+[ "$(block_name "$SX" 101 158)" = "$BLAZING" ] || fail "the blazing generator did not survive the relaunch"
+blazing "$SX" 101 158
+[ "$BZ_ENERGY" -ge "$SAVED_ENERGY" ] || fail "after the relaunch the store is $BZ_ENERGY, was $SAVED_ENERGY before save"
+expect_bz_rod 0 "$ROD_ITEM"
+[ "$BZ_RFTMAX0" = 60 ] || fail "after the relaunch the ceiling is $BZ_RFTMAX0, expected 60"
+[ "$BZ_RFT0" = "60.000000" ] || fail "after the relaunch the rate is $BZ_RFT0, was $SAVED_RFT at its ceiling"
+echo "  after save + relaunch: $BZ_ENERGY FE, slot 0 still the rod with a ceiling of 60 and rft $BZ_RFT0"
+
+echo "== BE: a stone is refused as a rod, and the carried recipe needs the parent =="
+place_blazing "$SX" 101 176
+ctl command "execute in minecraft:the_end run tp @s $((SX - 2)).5 101 176.5" >/dev/null
+ctl wait 6 >/dev/null
+ctl command "item replace entity @s hotbar.0 with $STONE 1" >/dev/null
+ctl wait 4 >/dev/null
+ctl select 1 >/dev/null
+ctl wait 2 >/dev/null
+INTERACT=$(ctl interact "$SX" 101 176 2>&1) || true
+echo "  ctl interact on a blazing generator with a stone: $INTERACT" >&2
+ctl wait 10 >/dev/null
+blazing "$SX" 101 176
+expect_bz_rod 0 empty
+# The server is the authority. The *client's* own view loses the stack, because it predicts the
+# placement and this pin's prediction does not consult a mod's hooks — measured: the client shows an
+# empty hand while the entity's own Inventory still holds the stone (a refused click changed
+# nothing). So the assertion reads the server's inventory through a command, and the cells around
+# the machine (which the client predicted a stone into) are read back from the server too.
+SERVER_INV=$(server_inventory)
+echo "  the server's inventory after the click: $SERVER_INV" >&2
+case "$SERVER_INV" in
+    *'"minecraft:stone"'*) ;;
+    *) fail "the server lost the stone: a non-rod click must change nothing ($SERVER_INV)" ;;
+esac
+for cell in "$((SX - 1)) 101 176" "$SX 102 176" "$SX 101 177"; do
+    [ "$(block_name $cell)" = "minecraft:air" ] \
+        || fail "the refused stone was placed against the machine at $cell ($(block_name $cell))"
+done
+echo "  the server kept the stone and no block was placed against the machine; every rod slot stayed empty"
+ctl command "execute in minecraft:the_end run setblock $SX 101 178 minecraft:stone" >/dev/null
+ctl wait 4 >/dev/null
+say "rftoolspower blazing $SX 101 178"
+LINE=$(await_line "blazing generator there")
+[ -n "$LINE" ] || fail "no refusal for a position with no blazing generator: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE" >&2
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+TX3=$((SX + 4)); TY3=101; TZ3=170
+open_crafting_table "$TX3" "$TY3" "$TZ3"
+# The grid's ingredients are given with the table already open: a give issued before it was read
+# back by the screen one run (the client's inventory view had not caught up after the refused click).
+for item in minecraft:blaze_rod minecraft:redstone_block "$STONE"; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 10 >/dev/null
+echo "  the table's inventory: $(ctl screen | jq -c '[.slots[]? | select(.slot < 36 and .item != null) | {slot, item, count}]')" >&2
+# "XYX" / "RFR" / "XYX": blaze rods where `#c:rods/blaze` belongs, redstone blocks at R, a stone
+# where `rftoolsbase:machine_frame` (and where its `infused_diamond` Y) belongs.
+place_one minecraft:blaze_rod 100
+place_one "$STONE" 101
+place_one minecraft:blaze_rod 102
+place_one minecraft:redstone_block 103
+place_one "$STONE" 104
+place_one minecraft:redstone_block 105
+place_one minecraft:blaze_rod 106
+place_one "$STONE" 107
+place_one minecraft:blaze_rod 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the blazing generator's recipe with a stone where rftoolsbase:machine_frame belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the blazing generator's recipe crafted $RESULT without the parent"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  the machine frame and the absent #c:rods/blaze tag are the recipe's limit here"
+
+echo "PASS: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

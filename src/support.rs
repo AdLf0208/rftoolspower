@@ -11,21 +11,22 @@ use std::sync::{LazyLock, Mutex};
 use mod_api::{
     self, BlockClick, BlockDropsEvent, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
     BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, BlockSide, BlockSignalEvent,
-    BlockState, Command, CommandArgumentValue, Compound, Direction, ENERGY, EnergyHandler, Flow,
-    Host, HostTransaction, InteractionResult, IsSignalSourceEvent, ItemPart, ItemPlace,
-    ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, ModContainer, ModEnergyBuffer,
-    NeighbourUpdate, OnBlockPlacedByEvent, Registrar, RegistrationContext, RunModCommandEvent,
-    ServerHost, StateForPlacementEvent, Tag, Text, Transaction, UseItemOnEvent,
-    UseWithoutItemEvent,
+    BlockState, Command, CommandArgumentValue, Component, Compound, Direction, ENERGY,
+    EnergyHandler, Flow, Host, HostSide, HostTransaction, InteractionResult, IsSignalSourceEvent,
+    ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, ModContainer,
+    ModEnergyBuffer, NeighbourUpdate, OnBlockPlacedByEvent, Registrar, RegistrationContext,
+    RightClickBlockEvent, RunModCommandEvent, ServerHost, StateForPlacementEvent, Tag, Text,
+    Transaction, UseItemOnEvent, UseWithoutItemEvent,
 };
 
 use crate::runtime::{
-    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic,
-    FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE,
-    MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse,
-    SideMode, Sides, Tier, as_capability, capacity as network_capacity, clamp_endergenic,
-    clamped_energy, network_valid, pearl_lost, receive as network_receive, restored, rf_per_tick,
-    rising_edge, send_amount, stored as network_stored, take as network_take,
+    BLAZING_CAPACITY, BLAZING_SLOTS, Blazing, BlazingSlot, CAPACITY, Cell, ENDERGENIC_CAPACITY,
+    EXTRACT_PER_TICK, EnderMonitor, Endergenic, FIRST_POWER_OBSERVE_TICKS, Fuel, Generator,
+    HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE, MONITOR_SIGNAL, Monitor, MonitorMode,
+    NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse, Rod, SideMode, Sides, Tier,
+    as_capability, capacity as network_capacity, clamp_blazing, clamp_endergenic, clamped_energy,
+    network_valid, pearl_lost, receive as network_receive, restored, rf_per_tick, rising_edge,
+    send_amount, stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -209,6 +210,24 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     if let Err(error) = r.block_entity_part(&kind, EnderMonitorPart) {
         context.refuse(&format!(
             "rftoolspower: the ender monitor part was refused: {error}"
+        ));
+    }
+
+    // The blazing generator: a type, its four rod slots, its 1,000,000 FE buffer and its Part.
+    // Its item carries nothing (upstream's loot copies only the infusable factor, which this port
+    // does not carry), so there is no ItemPart. The rod is a pure item of its own.
+    let kind = r
+        .block_entity_type(BLAZING_TYPE)
+        .blocks(&["blazing_generator"])
+        .build();
+    let block = r.block_key(BLAZING);
+    r.block_container(&block, blazing_container());
+    r.block_energy(&block, blazing_battery());
+    let item = r.item_key(BLAZING);
+    r.item_part(item, BlazingItemPart);
+    if let Err(error) = r.block_entity_part(&kind, BlazingPart) {
+        context.refuse(&format!(
+            "rftoolspower: the blazing generator part was refused: {error}"
         ));
     }
 }
@@ -1688,6 +1707,16 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
         let mut payload = Compound::new();
         payload.insert(KEY_ENERGY.into(), Tag::Int(energy));
         entity_data_patch(&payload, ENDERGENIC_TYPE_ID)
+    } else if block == BLAZING {
+        // Upstream's loot copies `mcjtylib:item_energy` (and the inventory, which the engine keeps
+        // apart from this payload): the store travels, the slots and their rates do not.
+        let energy = int(&Tag::Compound(saved.clone()), KEY_ENERGY);
+        if energy == 0 {
+            return Flow::Continue;
+        }
+        let mut payload = Compound::new();
+        payload.insert(KEY_ENERGY.into(), Tag::Int(energy));
+        entity_data_patch(&payload, BLAZING_TYPE_ID)
     } else if block == ENDER_MONITOR {
         // Upstream's mode rides on the block's item (`EnderMonitorData` on the dropped stack):
         // the configured mode travels, the default one has nothing worth carrying, and the
@@ -1935,6 +1964,474 @@ impl BlockEntityPart for PowerLevelPart {
 }
 
 // ---------------------------------------------------------------------------
+// The blazing generator (`BlazingGeneratorTileEntity`, `BlazingRod`, `BlazingRodData`)
+// ---------------------------------------------------------------------------
+
+/// `rftoolspower:blazing_generator` (`BlazingModule.BLAZING_GENERATOR`).
+pub(crate) const BLAZING: &str = "rftoolspower:blazing_generator";
+/// Its block entity type, named apart from its block for the reason [`GENERATOR_TYPE`] is.
+const BLAZING_TYPE: &str = "blazing_generator_block_entity";
+/// That type's registry id, which a broken generator's payload names.
+const BLAZING_TYPE_ID: &str = "rftoolspower:blazing_generator_block_entity";
+/// `rftoolspower:blazing_rod` (`BlazingModule.BLAZING_ROD`) — a pure item, carried as content.
+pub(crate) const BLAZING_ROD: &str = "rftoolspower:blazing_rod";
+/// The mod's own item component (`BlazingModule.ITEM_BLAZING_ROD_DATA`), the rod's whole data.
+const ROD_DATA: &str = "rftoolspower:blazing_rod_data";
+/// The block's `working` state (`BlazingGeneratorTileEntity.WORKING`), mirrored from the tick.
+const KEY_WORKING: &str = "working";
+/// The per-slot saved fields, under upstream's own keys (`rftMax{i}`, `rft{i}`, `ticks{i}`).
+const KEY_RFT_MAX: &str = "rftMax";
+const KEY_RFT: &str = "rft";
+const KEY_ROD_TICKS: &str = "ticks";
+/// What a read where no blazing generator stands answers.
+const NO_BLAZING: &str = "No RFTools Power blazing generator there.";
+/// The rod slot the readout and the click name first.
+const ROD_SLOT_FIRST: usize = 0;
+
+/// `rftoolspower:blazing_rod_data`: the rod's `{steps, time, quality, duration}`, the component
+/// `BlazingRodData`'s own codec writes.
+struct RodData;
+
+impl Component for RodData {
+    type Value = Rod;
+
+    fn id(&self) -> &str {
+        ROD_DATA
+    }
+
+    /// A field that is absent or of another type keeps the default row's value, which is what
+    /// upstream's `getOrDefault(…, BlazingRodData.DEFAULT)` answers for a stack without data.
+    fn decode(&self, value: &Tag) -> Option<Rod> {
+        if !matches!(value, Tag::Compound(_)) {
+            return None;
+        }
+        let default = Rod::default();
+        Some(Rod {
+            steps: number(value, "steps").map_or(default.steps, |steps| steps as i32),
+            time: number(value, "time").unwrap_or(default.time),
+            quality: number(value, "quality").unwrap_or(default.quality),
+            duration: number(value, "duration").unwrap_or(default.duration),
+        })
+    }
+
+    /// Upstream's codec: an int `steps` and three floats.
+    fn encode(&self, rod: Rod) -> Tag {
+        Tag::compound([
+            ("steps", Tag::Int(rod.steps)),
+            ("time", Tag::Float(rod.time.to_bits())),
+            ("quality", Tag::Float(rod.quality.to_bits())),
+            ("duration", Tag::Float(rod.duration.to_bits())),
+        ])
+    }
+}
+
+/// A numeric component field, whatever numeric NBT type the item carries (`60000` is an int in
+/// SNBT, `60000.0f` a float; upstream's codec takes both).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "upstream's BlazingRodData fields are floats; a rod's numbers are small"
+)]
+fn number(saved: &Tag, key: &str) -> Option<f32> {
+    match saved.get(key)? {
+        Tag::Float(bits) => Some(f32::from_bits(*bits)),
+        Tag::Int(value) => Some(*value as f32),
+        Tag::Long(value) => Some(*value as f32),
+        Tag::Double(value) => Some(*value as f32),
+        _ => None,
+    }
+}
+
+/// The rod a stack carries, its default row when it carries none.
+fn rod_of(stack: &ItemStack) -> Rod {
+    stack.get(&RodData).unwrap_or_default()
+}
+
+/// Write the rod back onto its stack; false when the game refused the patch.
+fn set_rod(stack: &mut ItemStack, rod: Rod) -> bool {
+    stack.set(&RodData, rod).is_ok()
+}
+
+/// Register the mod's own item component with the game before content loads
+/// (`BlazingModule.ITEM_BLAZING_ROD_DATA`): the game installs the name, so a rod's patch survives
+/// a `/give`, a save and a reload instead of being dropped as an unknown component.
+pub(crate) fn declare_component(types: &mut Vec<String>) {
+    if !types.iter().any(|known| known == ROD_DATA) {
+        types.push(ROD_DATA.to_owned());
+    }
+}
+
+/// A saved float, 0 when absent or of another type.
+fn float(saved: &Tag, key: &str) -> f32 {
+    number(saved, key).unwrap_or(0.0)
+}
+
+/// Write one float into a saved compound.
+fn set_float(saved: &mut Tag, key: &str, value: f32) {
+    if let Tag::Compound(nbt) = saved {
+        nbt.insert(key.into(), Tag::Float(value.to_bits()));
+    }
+}
+
+/// The generator's saved state: its store and its four slots (upstream's `loadAdditional`).
+pub(crate) fn read_blazing(saved: &Tag) -> Blazing {
+    let mut blazing = Blazing {
+        energy: clamp_blazing(int(saved, KEY_ENERGY)),
+        ..Blazing::default()
+    };
+    for slot in 0..BLAZING_SLOTS {
+        blazing.slots[slot] = BlazingSlot {
+            max: int(saved, &format!("{KEY_RFT_MAX}{slot}")),
+            rft: float(saved, &format!("{KEY_RFT}{slot}")),
+            ticks: int(saved, &format!("{KEY_ROD_TICKS}{slot}")),
+        };
+    }
+    blazing
+}
+
+/// Write the generator's state back (`saveAdditional`).
+pub(crate) fn write_blazing(saved: &mut Tag, state: &Blazing) {
+    set_int(saved, KEY_ENERGY, state.energy);
+    for (slot, slot_state) in state.slots.iter().enumerate() {
+        set_int(saved, &format!("{KEY_RFT_MAX}{slot}"), slot_state.max);
+        set_float(saved, &format!("{KEY_RFT}{slot}"), slot_state.rft);
+        set_int(saved, &format!("{KEY_ROD_TICKS}{slot}"), slot_state.ticks);
+    }
+}
+
+/// The generator's container: four rod slots every face reaches, insert-only, one item each.
+pub(crate) fn blazing_container() -> ModContainer {
+    ModContainer {
+        slots: BLAZING_SLOTS,
+        faces: std::array::from_fn(|_| (0..BLAZING_SLOTS).collect()),
+        inputs: (0..BLAZING_SLOTS).collect(),
+        outputs: vec![],
+        menu: None,
+    }
+}
+
+/// The generator's buffer: upstream's `GenericEnergyStorage(this, false, 1000000, 0)` — it
+/// stores, takes nothing in and gives nothing out through the capability (`extractEnergy` is 0
+/// upstream too; the generator pushes on its own tick).
+pub(crate) fn blazing_battery() -> ModEnergyBuffer {
+    ModEnergyBuffer {
+        capacity: BLAZING_CAPACITY,
+        max_insert: 0,
+        max_extract: 0,
+        insert_faces: [false; 6],
+        extract_faces: [false; 6],
+    }
+}
+
+/// `BlazingGeneratorTileEntity.handleSendingEnergy`: up to 20,000 FE a tick to every neighbour
+/// that answers the energy capability, with no reserve.
+pub(crate) fn push_blazing_energy(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    state: &mut Blazing,
+) {
+    let Some(level) = level else {
+        return;
+    };
+    for direction in Direction::ALL {
+        let offer = state.send_amount();
+        if offer == 0 {
+            break;
+        }
+        let normal = direction.normal();
+        let target = [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]];
+        let Some(handler) = level.capability(host, &ENERGY, target, Some(direction.opposite()))
+        else {
+            continue;
+        };
+        let moved = host
+            .transaction(|host, tx| -> Result<u32, ()> { Ok(handler.insert(host, tx, offer)) })
+            .unwrap_or(0);
+        state.take(moved);
+    }
+}
+
+/// One blazing-generator tick (`BlazingGeneratorTileEntity.tickServer`): the push, then the ramp,
+/// the store and the rods' burn. True when the saved payload or a rod moved (the tick's reply
+/// decides whether this Part's edits are applied at all).
+pub(crate) fn tick_blazing(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    saved: &mut Tag,
+    items: &mut [Option<ItemStack>],
+) -> bool {
+    let before = read_blazing(saved);
+    let mut state = before.clone();
+    let mut rods = [None; BLAZING_SLOTS];
+    for (slot, rod) in rods.iter_mut().enumerate() {
+        *rod = items.get(slot).and_then(Option::as_ref).map(rod_of);
+    }
+    // A rod a hopper (or a menu) put there never saw `updateSlot`; a slot emptied behind the
+    // tick's back still carries its ceiling. Both are settled before the tick spends anything.
+    let mut changed = state.reconcile(&rods);
+    push_blazing_energy(host, level, pos, &mut state);
+    let made = state.tick(true, &mut rods);
+    for slot in 0..BLAZING_SLOTS {
+        match rods[slot] {
+            None => {
+                if items.get(slot).is_some_and(Option::is_some) {
+                    // The rod is spent: the slot is emptied (upstream's `setStackInSlot(EMPTY)`).
+                    items[slot] = None;
+                    changed = true;
+                }
+            }
+            Some(rod) => {
+                // The rod's own duration counts down with the burn (`setPowerDuration`).
+                if let Some(stack) = items.get_mut(slot).and_then(Option::as_mut)
+                    && rod_of(stack) != rod
+                    && set_rod(stack, rod)
+                {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed |= state != before;
+    write_blazing(saved, &state);
+    if level.is_some() {
+        mirror_working(host, pos, made > 0);
+    }
+    changed
+}
+
+/// The block's `working` state follows the tick's own total (`BlockStateProperties`-style mirror;
+/// upstream sets its `WORKING` property only when it moved).
+pub(crate) fn mirror_working(host: &mut dyn ServerHost, pos: [i32; 3], working: bool) {
+    let _ = host.set_block_property(pos, KEY_WORKING, if working { "true" } else { "false" });
+}
+
+/// The blazing generator's line, as `/rftoolspower blazing` and a click print it.
+pub(crate) fn blazing_line(
+    pos: [i32; 3],
+    state: &Blazing,
+    rods: &[Option<String>; BLAZING_SLOTS],
+    working: bool,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let rates: Vec<String> = state
+        .slots
+        .iter()
+        .map(|slot| format!("{:.6}", slot.rft))
+        .collect();
+    let ceilings: Vec<String> = state
+        .slots
+        .iter()
+        .map(|slot| slot.max.to_string())
+        .collect();
+    let ticks: Vec<String> = state
+        .slots
+        .iter()
+        .map(|slot| slot.ticks.to_string())
+        .collect();
+    let names: Vec<&str> = rods
+        .iter()
+        .map(|rod| rod.as_deref().unwrap_or("empty"))
+        .collect();
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Blazing Generator at {},{},{}: {}/{} FE (working {}, rft={}, rftmax={}, ticks={}, \
+         rods={}, t={t}{suffix})",
+        pos[0],
+        pos[1],
+        pos[2],
+        state.energy,
+        BLAZING_CAPACITY,
+        working,
+        rates.join(","),
+        ceilings.join(","),
+        ticks.join(","),
+        names.join(","),
+    )
+}
+
+/// The line `/rftoolspower blazing <pos>` prints for the block at `pos`.
+pub(crate) fn blazing_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(BLAZING) {
+        return NO_BLAZING.to_owned();
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_BLAZING.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_BLAZING.to_owned();
+    };
+    let rods: [Option<String>; BLAZING_SLOTS] = std::array::from_fn(|slot| {
+        entity
+            .item_slot(&*host, slot as u32)
+            .ok()
+            .flatten()
+            .map(|stack| stack.item().id(&*host))
+    });
+    let working = level
+        .block_property(&*host, pos, KEY_WORKING)
+        .is_some_and(|value| value == "true");
+    let t = level.game_time(&*host).unwrap_or(0);
+    blazing_line(
+        pos,
+        &read_blazing(&Tag::Compound(saved)),
+        &rods,
+        working,
+        t,
+        nonce,
+    )
+}
+
+/// `BaseBlock.getStateForPlacement` with `RotationType.ROTATION`: the front faces the placer.
+/// The event carries the placer's view angles, not its height, so upstream's vertical branches
+/// (placer above → UP, block above the eye → DOWN) are not expressible here and the front is
+/// horizontal — recorded in `notes.md`, the same limit the pearl injector has.
+pub(crate) fn blazing_placement(
+    level: &dyn LevelHost,
+    event: &StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    if level.state_block(event.state) != Some(BLAZING) {
+        return None;
+    }
+    let front = facing_from_yaw(event.context.yaw).opposite();
+    Some(level.state_with_property(event.state, KEY_FACING, dir_name(front)))
+}
+
+/// `PlayerInteractEvent.RightClickBlock`: the blazing generator takes every click as its own —
+/// a rod goes into the first empty slot, anything else is refused with a line, an empty hand reads
+/// the machine out — and **nothing else acts**. Upstream opens its GUI here, so the held item never
+/// runs either: without this a **block** held in the hand was placed against the machine, because
+/// this pin dispatches `BlockPart::use_item_on` for a click with an item only where the block's own
+/// template has a `useItemOn` to replace (measured: the furnace-template generator refused the
+/// stone, the `iron_block`-template blazing generator had it placed on its top face).
+///
+/// One owner per click: the Part answers only `state_for_placement`, so a click is never handled
+/// twice. The client is left to predict as it does; the server refuses before anything acts.
+pub(crate) fn on_right_click_block(
+    host: HostSide<'_>,
+    event: &mut RightClickBlockEvent<'_>,
+) -> Flow {
+    if event.cancelled {
+        return Flow::Continue;
+    }
+    let HostSide::Server(host) = host else {
+        return Flow::Continue;
+    };
+    let click = event.click;
+    let Some(level) = host.level(click.dimension.key().id()) else {
+        return Flow::Continue;
+    };
+    if block_id(&*host, level, click.pos).as_deref() != Some(BLAZING) {
+        return Flow::Continue;
+    }
+    blazing_click(host, click, click.stack);
+    *event.cancellation_result = InteractionResult::Success;
+    event.cancelled = true;
+    Flow::Cancel
+}
+
+/// A right click on the blazing generator: a rod goes into the first empty slot, anything else is
+/// refused with a line; a click with an empty hand prints the readout (the GUI stand-in).
+pub(crate) fn blazing_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+    held: Option<&ItemStack>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    if block_id(&*host, level, click.pos).as_deref() != Some(BLAZING) {
+        return None;
+    }
+    let Some(held) = held.filter(|stack| stack.count() > 0) else {
+        let line = blazing_status_line(host, level, click.pos, None);
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal(line));
+        }
+        return Some(InteractionResult::Success);
+    };
+    let refused = item_id(&*host, held);
+    if refused != BLAZING_ROD {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(
+                host,
+                Text::literal(format!("{refused} is not a blazing rod")),
+            );
+        }
+        return Some(InteractionResult::Success);
+    }
+    let free = free_rod_slot(host, level, click.pos);
+    let Some(slot) = free else {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal("all four blazing rod slots are full"));
+        }
+        return Some(InteractionResult::Success);
+    };
+    let hand = ItemPlace::PlayerHand {
+        player: click.player,
+        hand: click.hand,
+    };
+    if insert_rod_from_hand(host, level, click.pos, held, &hand, slot) == 0
+        && let Some(player) = host.player(click.player)
+    {
+        let _ = player.action_bar(host, Text::literal("the rod did not go in"));
+    }
+    Some(InteractionResult::Success)
+}
+
+/// The first rod slot with nothing in it, if any.
+fn free_rod_slot(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<usize> {
+    let entity = host.block_entity(level, pos)?;
+    (ROD_SLOT_FIRST..BLAZING_SLOTS).find(|slot| {
+        entity
+            .item_slot(&*host, *slot as u32)
+            .ok()
+            .flatten()
+            .is_none()
+    })
+}
+
+/// Put one held rod in `slot` and take exactly that from the hand, in one transaction (a creative
+/// player's hand gives without losing any, which is the game's rule and not this port's).
+pub(crate) fn insert_rod_from_hand(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    held: &ItemStack,
+    hand: &ItemPlace,
+    slot: usize,
+) -> u32 {
+    host.transaction(|host, tx| -> Result<u32, ()> {
+        let entity = host.block_entity(level, pos).ok_or(())?;
+        if entity
+            .item_slot(&*host, slot as u32)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Ok(0);
+        }
+        // One item a slot (`slotLimit(1)`): the stack's own components travel with it.
+        let mut after = held.clone();
+        after.set_count(1).map_err(|_| ())?;
+        let taken = hand.extract(&mut *host, tx, &ItemResource::of(held), 1);
+        if taken != 1 {
+            return Err(());
+        }
+        entity
+            .set_item_slot(&mut *host, tx, slot as u32, Some(after))
+            .map_err(|_| ())?;
+        let _ = entity.set_changed(&mut *host);
+        Ok(1)
+    })
+    .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // The command
 // ---------------------------------------------------------------------------
 
@@ -1955,6 +2452,7 @@ pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
         "rftoolspower injector <pos:block_pos> [nonce:word]",
         "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
         "rftoolspower endermonitor <pos:block_pos> <action:word> [nonce:word]",
+        "rftoolspower blazing <pos:block_pos> [nonce:word]",
     ] {
         commands.push(Command::op(usage, OPERATOR_LEVEL));
     }
@@ -2048,6 +2546,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             | "injector"
             | "enderlink"
             | "endermonitor"
+            | "blazing"
     ) {
         return Flow::Continue;
     }
@@ -2069,6 +2568,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             "endergenic" | "enderlink" => NO_ENDERGENIC,
             "injector" => NO_INJECTOR,
             "endermonitor" => NO_ENDER_MONITOR,
+            "blazing" => NO_BLAZING,
             _ => NO_GENERATOR,
         }));
         return Flow::Cancel;
@@ -2090,6 +2590,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         ),
         "endergenic" => endergenic_status_line(host, level, *pos, nonce_of(event)),
         "injector" => injector_status_line(host, level, *pos, nonce_of(event)),
+        "blazing" => blazing_status_line(host, level, *pos, nonce_of(event)),
         "endermonitor" => match word_of(event, "action") {
             None | Some("status") => ender_monitor_status_line(host, level, *pos, nonce_of(event)),
             Some(word) => set_monitor_mode(host, level, *pos, word, nonce_of(event)),
@@ -3444,11 +3945,100 @@ impl BlockEntityPart for EnderMonitorPart {
     }
 }
 
+/// The blazing generator: it ticks, a click puts a rod in the first empty slot, and the front
+/// faces its placer.
+pub(crate) struct BlazingPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for BlazingPart {
+    /// `BaseBlock.getStateForPlacement` with `RotationType.ROTATION`: the front faces the placer.
+    ///
+    /// The click is not handled here: `on_right_click_block` takes it, so a click cannot be handled
+    /// twice (a rod would land in the next slot as well).
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        blazing_placement(level, event)
+    }
+}
+
+/// A blazing generator's own item: it carries the store (`BlazingGeneratorTileEntity`'s loot
+/// copies `mcjtylib:item_energy`), clamped back to the buffer when it is placed again.
+pub(crate) struct BlazingItemPart;
+
+#[mod_api::horizon_part]
+impl ItemPart for BlazingItemPart {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        let Some(level) = event
+            .placer
+            .and_then(|player| player.level(&*host))
+            .or_else(|| in_place_level(host))
+        else {
+            return;
+        };
+        if block_id(&*host, level, event.pos).as_deref() != Some(BLAZING) {
+            return;
+        }
+        let Some(entity) = host.block_entity(level, event.pos) else {
+            return;
+        };
+        let Some(saved) = entity.data(&*host) else {
+            return;
+        };
+        let mut saved = Tag::Compound(saved);
+        let stored = int(&saved, KEY_ENERGY);
+        let clamped = clamp_blazing(stored);
+        if clamped == stored {
+            return;
+        }
+        set_int(&mut saved, KEY_ENERGY, clamped);
+        if let Tag::Compound(data) = saved {
+            let _ = entity.replace_data(host, data);
+        }
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for BlazingPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound; the tick fills it.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: it ticks. Never clear a value an earlier mod set.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: the push, the ramp, the store and the rods' burn.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        if event.entity.items.len() != BLAZING_SLOTS {
+            event.entity.items.resize(BLAZING_SLOTS, None);
+        }
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let items = &mut event.entity.items;
+        let changed = tick_blazing(host, level, pos, &mut saved, items);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::{COAL_BLOCK_TICKS, MAX_LEVEL, PERCENT, TICKS_PER_COAL};
-
     fn compound() -> Tag {
         Tag::Compound(Compound::new())
     }
@@ -3760,10 +4350,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_ten_the_harness_types() {
+    fn the_commands_are_the_eleven_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 10);
+        assert_eq!(commands.len(), 11);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -4267,5 +4857,127 @@ mod tests {
         for command in &commands {
             assert_eq!(command.level, OPERATOR_LEVEL);
         }
+    }
+
+    #[test]
+    fn the_blazing_generator_has_four_insert_only_rod_slots() {
+        let container = blazing_container();
+        assert_eq!(container.slots, BLAZING_SLOTS);
+        assert_eq!(
+            container.inputs,
+            vec![0, 1, 2, 3],
+            "a hopper feeds every slot"
+        );
+        assert!(container.outputs.is_empty(), "nothing is ever taken out");
+        assert_eq!(container.menu, None, "no GUI in this slice");
+        for face in container.faces {
+            assert_eq!(face, vec![0, 1, 2, 3], "every face reaches the four slots");
+        }
+    }
+
+    #[test]
+    fn the_blazing_buffer_is_a_million_that_gives_nothing_out() {
+        let battery = blazing_battery();
+        assert_eq!(battery.capacity, BLAZING_CAPACITY);
+        assert_eq!(battery.max_insert, 0, "the capability takes nothing in");
+        assert_eq!(
+            battery.max_extract, 0,
+            "the generator pushes on its own tick (upstream's extractEnergy is 0)"
+        );
+        assert_eq!(battery.insert_faces, [false; 6]);
+        assert_eq!(battery.extract_faces, [false; 6]);
+    }
+
+    #[test]
+    fn the_rod_component_round_trips_and_takes_any_numeric_type() {
+        let rod = Rod {
+            steps: 7,
+            time: 123.5,
+            quality: 120_000.0,
+            duration: 400.0,
+        };
+        let encoded = RodData.encode(rod);
+        assert_eq!(RodData.decode(&encoded), Some(rod));
+        // SNBT's `60000` is an int: upstream's codec takes it, and so does this decode.
+        let from_ints = Tag::compound([
+            ("steps", Tag::Int(64)),
+            ("time", Tag::Int(600)),
+            ("quality", Tag::Int(60_000)),
+            ("duration", Tag::Int(400)),
+        ]);
+        assert_eq!(
+            RodData.decode(&from_ints),
+            Some(Rod {
+                steps: 64,
+                time: 600.0,
+                quality: 60_000.0,
+                duration: 400.0,
+            })
+        );
+        // A missing field is the default row's (`getOrDefault(…, DEFAULT)`).
+        let partial = Tag::compound([("duration", Tag::Float(3.0_f32.to_bits()))]);
+        let decoded = RodData.decode(&partial).expect("a compound decodes");
+        assert_eq!(decoded.duration, 3.0);
+        assert_eq!(decoded.quality, Rod::default().quality);
+        assert_eq!(RodData.decode(&Tag::Int(1)), None, "not a rod's data");
+    }
+
+    #[test]
+    fn the_blazing_state_reads_back_from_the_compound_it_wrote() {
+        let mut state = Blazing {
+            energy: 12_345,
+            ..Blazing::default()
+        };
+        state.slots[0].max = 60;
+        state.slots[0].rft = 12.5;
+        state.slots[0].ticks = 377;
+        let mut saved = compound();
+        write_blazing(&mut saved, &state);
+        assert_eq!(read_blazing(&saved), state);
+        // A doctored store is clamped to the buffer on the way in.
+        let mut doctored = compound();
+        set_int(&mut doctored, KEY_ENERGY, 9_999_999);
+        assert_eq!(read_blazing(&doctored).energy, BLAZING_CAPACITY);
+        let mut negative = compound();
+        set_int(&mut negative, KEY_ENERGY, -5);
+        assert_eq!(read_blazing(&negative).energy, 0);
+    }
+
+    #[test]
+    fn the_blazing_readout_is_the_line_the_e2e_asserts() {
+        let mut state = Blazing {
+            energy: 1_234,
+            ..Blazing::default()
+        };
+        state.slots[0].max = 60;
+        state.slots[0].rft = 0.41;
+        state.slots[0].ticks = 399;
+        let rods = [Some(BLAZING_ROD.to_owned()), None, None, None];
+        let line = blazing_line([302, 101, 0], &state, &rods, true, 1_234, Some("n1"));
+        assert_eq!(
+            line,
+            "Blazing Generator at 302,101,0: 1234/1000000 FE (working true, \
+             rft=0.410000,0.000000,0.000000,0.000000, rftmax=60,0,0,0, ticks=399,0,0,0, \
+             rods=rftoolspower:blazing_rod,empty,empty,empty, t=1234 nonce=n1)"
+        );
+    }
+
+    #[test]
+    fn the_blazing_command_is_declared_at_the_operator_level() {
+        let mut commands = Vec::new();
+        declare_commands(&mut commands);
+        let blazing: Vec<&str> = commands
+            .iter()
+            .map(|command| command.usage.as_str())
+            .filter(|usage| usage.contains("blazing"))
+            .collect();
+        assert_eq!(
+            blazing,
+            vec!["rftoolspower blazing <pos:block_pos> [nonce:word]"]
+        );
+        let mut types = Vec::new();
+        declare_component(&mut types);
+        declare_component(&mut types);
+        assert_eq!(types, vec![ROD_DATA.to_owned()], "registered once");
     }
 }

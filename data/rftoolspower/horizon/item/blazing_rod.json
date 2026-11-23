@@ -1,0 +1,6 @@
+{
+  "components": {
+    "!minecraft:cooking_fuel": {}
+  },
+  "template": "minecraft:blaze_rod"
+}

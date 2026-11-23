@@ -1,4 +1,5 @@
 {
+  "block.rftoolspower.blazing_generator": "Blazing Generator",
   "block.rftoolspower.cell1": "Powercell (Low)",
   "block.rftoolspower.cell2": "Powercell (Medium)",
   "block.rftoolspower.coalgenerator": "Coal Generator",
@@ -7,6 +8,7 @@
   "block.rftoolspower.pearl_injector": "Pearl Injector",
   "block.rftoolspower.power_level": "Power Level",
   "block.rftoolspower.power_monitor": "Power Monitor",
+  "item.rftoolspower.blazing_rod": "Blazing Rod",
   "item.rftoolspower.power_core1": "Power Core (Low)",
   "itemGroup.rftoolspower": "RFTools Power",
   "message.rftoolspower.shiftmessage": "<Press Shift>"

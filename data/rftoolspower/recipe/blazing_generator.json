@@ -1,0 +1,19 @@
+{
+  "category": "misc",
+  "key": {
+    "F": "rftoolsbase:machine_frame",
+    "R": "minecraft:redstone_block",
+    "X": "#c:rods/blaze",
+    "Y": "rftoolsbase:infused_diamond"
+  },
+  "pattern": [
+    "XYX",
+    "RFR",
+    "XYX"
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:blazing_generator"
+  },
+  "type": "minecraft:crafting_shaped"
+}

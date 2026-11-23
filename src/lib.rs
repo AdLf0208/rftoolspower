@@ -44,9 +44,20 @@ impl Hooks for Mod {
         support::declare(r, context);
     }
 
-    /// `/rftoolspower info|monitor|powerlevel|band|cell|side|endergenic|injector|enderlink|endermonitor …`.
+    /// `/rftoolspower info|monitor|powerlevel|band|cell|side|endergenic|injector|enderlink|endermonitor|blazing …`.
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         support::declare_commands(event.commands);
+    }
+
+    /// The mod's own item component: a blazing rod's `{steps, time, quality, duration}`
+    /// (upstream's `BlazingModule.ITEM_BLAZING_ROD_DATA`). Registered before content loads; the
+    /// game installs the name, so a `/give` carrying it lands in the stack's patch.
+    fn component_types(
+        &self,
+        _cx: &RegistrationContext,
+        event: &mut mod_api::ComponentTypesEvent<'_>,
+    ) {
+        support::declare_component(event.types);
     }
 
     /// Run the `/rftoolspower` commands a player types.
@@ -56,6 +67,17 @@ impl Hooks for Mod {
         event: &mut mod_api::RunModCommandEvent<'_>,
     ) -> Flow {
         support::run_command(host, event)
+    }
+
+    /// A click on the blazing generator never uses the held item (upstream opens its GUI): the
+    /// block's own use takes the rod or refuses the item, and a block in the hand is not placed
+    /// against the machine.
+    fn right_click_block(
+        &self,
+        host: mod_api::HostSide<'_>,
+        event: &mut mod_api::RightClickBlockEvent<'_>,
+    ) -> Flow {
+        support::on_right_click_block(host, event)
     }
 
     /// A broken machine's own item carries what upstream's loot copies: the generator's store and

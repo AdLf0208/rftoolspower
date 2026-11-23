@@ -1,7 +1,7 @@
 # RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
 # powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor)
 
-> **Current state (2026-11-23): slice 6, package 0.1.5 at pin
+> **Current state (2026-11-23): slice 7, package 0.1.6 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
 > generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
 > (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
@@ -14,7 +14,11 @@
 > monitor**, the block that watches one of the generator's three events (lost / fired / arrived)
 > and answers it with **15 on its display face for exactly one tick**; slice 6 adds the **power
 > level** display, the monitor's sibling: a 0..9 ratio (`stored * 10 / capacity`) read 20 ticks
-> after placement and then every 10, written straight to its display face's redstone output. Where
+> after placement and then every 10, written straight to its display face's redstone output; and
+> slice 7 adds the **blazing generator** with its **blazing rod**: four rod slots whose rates each
+> climb a 150th of the gap to their own ceiling (60 FE a tick for a 60,000-quality rod) over a
+> 1,000,000 FE buffer with a 20,000 FE a tick push, the rod's whole state kept in the mod's own
+> `rftoolspower:blazing_rod_data` item component. Where
 > upstream's smart wrench is needed (the link, the cell's face modes), the harness uses commands —
 > `/rftoolspower enderlink`, `/rftoolspower side` — and never a fake item; the monitor's GUI picker
 > is `/rftoolspower endermonitor <pos> <mode|status> [nonce]`, and the power level's readout is
@@ -41,9 +45,9 @@ MIT (`5195ba53…4b00`), and the provenance is in [`LICENSE-NOTICE.md`](LICENSE-
 to the campaign's maintainer approval (ARCHITECTURE.md §8).
 
 Status: **ported-partial** — the coal generator (A–M), the power monitor plus the generator's
-energy push (N–T), the powercell (U–AD), the endergenic pair (AE–AM), the ender monitor (AN–AS)
-and the power level display (AT–AW) are implemented and verified in game at the current pin. The
-gap list below is the rest of the mod.
+energy push (N–T), the powercell (U–AD), the endergenic pair (AE–AM), the ender monitor (AN–AS),
+the power level display (AT–AW) and the blazing generator with its blazing rod (AX–BE) are
+implemented and verified in game at the current pin. The gap list below is the rest of the mod.
 
 ## What the powercell binds to (the 2026-11-21 parent-surface ruling)
 
@@ -914,6 +918,213 @@ One *documented* deviation (not a defect): **the `power` block state**. Upstream
 only in its tile entity; the pin's signal hook must answer from a state, so the ratio is mirrored
 into a `power` enum 0..9. The state is the output's carrier, not an extra feature.
 
+## Slice 7 — the blazing generator and the blazing rod (package 0.1.6)
+
+Gap line it comes from (`## Gaps` below): **gap 11** — *"**The rest of the mod:** the dimensional
+cell …, and the blazing generator/agitator/infuser with blazing rods, and the power level's
+renderer"*. This slice takes **the blazing generator and the blazing rod**; the **agitator** and the
+**infuser** mutate a rod rather than consume it and are left for the next slice (they need the
+3×3 adjacency algorithm and the catalyst table, and neither changes what this slice proves). Tier:
+still **machines** — a block entity with a server tick, a four-slot container, an energy buffer and
+a block-state mirror. No GUI, no renderer, no item Part.
+
+### The component gate (checked before the code, as the brief demanded)
+
+The rod's whole mechanic is a **custom item component** (`rftoolspower:blazing_rod_data`), so the pin
+has to register and read one. Confirmed in `ports/_shared/sdk/0a875da/`:
+
+- `Hooks::component_types(&self, cx, event: &mut ComponentTypesEvent<'_>)`, `event.types:
+  &mut Vec<String>` (`surface.json` `hook:component_types`); the game feeds those names to
+  `horizon_protocol::item::custom::install` before content loads;
+- `ItemStack::components() -> Option<&Components>` with `Components::as_nbt() -> &Compound`, and the
+  typed route this port uses: `mod_api::Component` (`type Value; id; decode; encode`) with
+  `ItemStack::get`/`set` — the shape `ports/ironjetpacks` ships;
+- a `/give` carrying a mod component lands in the stack's patch (`ports/mekanismcovers` proves it in
+  game; phase AX here reads it back from the delivered stack).
+
+**Verdict: supported.** Phase AX is the in-game proof: the given rod's `ctl inventory` stack carries
+`rftoolspower:blazing_rod_data` with `quality:60000`, and the generator consumes the same value
+(`rftmax=60`).
+
+### What it does (upstream `BlazingGeneratorTileEntity`, `BlazingRod`, `BlazingRodData`, 1.21-7.0.6)
+
+- **The block.** `rftoolspower:blazing_generator` on McJtyLib's STANDARD_IRON with the jar's
+  six-way `facing` and its own `working` boolean — the jar's own twelve-variant blockstate, idle
+  front and animated busy front.
+- **The rod.** `rftoolspower:blazing_rod`, a plain 64-stack item (not furnace fuel — upstream's rod
+  is an `Item` with `new Item.Properties()`), whose state is the mod component
+  `rftoolspower:blazing_rod_data` = `{steps, time, quality, duration}`, defaulting to
+  `(64, 600, 60000, 20)` exactly as `getOrDefault(…, DEFAULT)` does.
+- **The four slots.** One item each, rods only; a click fills the first empty slot. `updateSlot`'s
+  ceiling is `(int)(quality / 1000)` (the infusable factor is gap 3, not carried) and the burn is
+  `(int)duration` — a default rod is **60 FE a tick for 20 ticks**.
+- **The ramp** (`handlePowerGeneration`): a slot below its ceiling climbs `rft += (max − rft)/150 +
+  0.01` a tick, one above falls `(max − rft)/30`; both clamp. The `+0.01` is what carries the rate
+  onto the ceiling instead of stalling below it (measured: from rest it clamps at exactly 60 on the
+  **556th** tick).
+- **The store and the burn.** `total += (int)rft` over the four slots, `produceEnergy(total)` into
+  **1,000,000 FE**; while the machine runs every rod spends a tick, its remaining `duration` is
+  written back onto the rod, and at 0 the slot is emptied and its ceiling zeroed. `working` mirrors
+  `total > 0` into the block state.
+- **The push** (`handleSendingEnergy`): up to **20,000 FE a tick** to every neighbour that answers
+  the energy capability, with **no reserve**. The capability itself takes nothing in and gives
+  nothing out (`extractEnergy` is 0 upstream too; the generator pushes).
+- **The click.** Rods go in, anything else is refused with a line, and an empty hand reads the
+  machine out — upstream opens its GUI there, so **no held item ever acts on the machine**.
+- **The item.** A broken generator keeps its **store** (upstream's loot copies
+  `mcjtylib:item_energy`), clamped to the buffer when placed again; its slots' rods do not travel
+  (the engine keeps container items apart from the payload — gap 8's shape).
+- **The readout.** `/rftoolspower blazing <pos> [nonce]` prints
+  `energy/capacity`, `working`, the four `rft`, `rftmax`, `ticks`, the four slot contents and `t`.
+
+### Numbers and where they came from
+
+| Number | Value | Source |
+|---|---:|---|
+| capacity | 1,000,000 FE | `BlazingConfiguration.GENERATOR_MAXENERGY` (`blazingGeneratorMaxPower`) |
+| a neighbour's push | 20,000 FE a tick | `GENERATOR_SENDPERTICK` (`blazingGeneratorSendPerTick`) |
+| slots | 4, one item each | `BlazingGeneratorTileEntity.BUFFER_SIZE`, `slotLimit(1)` |
+| a rod's ceiling | `(int)(quality / 1000)` = 60 | `BlazingRod.getRfPerTick` |
+| a rod's burn | `(int)duration` | `BlazingRod.getTotalTicks` |
+| the climb | `(max − rft)/150 + 0.01` a tick | `handlePowerGeneration` |
+| the fall | `(max − rft)/30` a tick | the same |
+| the clamp | at 60 on tick 556 from rest | the rule, folded in single precision and confirmed in game |
+| a rod's defaults | `steps 64, time 600, quality 60,000, duration 20` | `BlazingRodData.DEFAULT`, `MAXTIME`, `START_QUALITY`, `START_DURATION`, `MAX_INFUSION_STEPS` |
+| block hardness | 2.0 / 2.0, pickaxe, iron sound | McJtyLib `BlockBuilder` (`BlazingGeneratorTileEntity.createBlock`) |
+| the recipe | `"XYX"/"RFR"/"XYX"` — `#c:rods/blaze`, infused diamond, redstone blocks, machine frame | `BlazingModule.initDatagen` |
+
+### Red → green
+
+The generator's and the rod's rules were stubbed `todo!()` behind their tests; the failing run is
+`ports/_shared/evidence/rftoolspower/red-blazing.log`:
+
+```
+test result: FAILED. 94 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+not yet implemented: Blazing::load is not written yet
+not yet implemented: Rod::rf_per_tick is not written yet
+```
+
+Green: **113 passed; 0 failed** (`sdk-test.log`). The ten new runtime tests pin: a default rod's
+60 RF a tick over 20 ticks (and the truncating `(int)` cast); a slot's ceiling and burn from its
+rod; the ramp's first step (`0.41` from rest) and its monotone 1/150th curve; the ramp reaching
+**exactly** 60 and never passing it; the fall being a 30th of the gap (60 → 58 in one tick, and
+~120 ticks to nothing); a spent rod clearing its slot at its own duration while the rate decays; four
+rods adding four rates (240 a tick); the 1,000,000 clamp; a disabled tick spending no rod; and a
+neighbour being offered 20,000. Three more pin the slot bookkeeping the hopper needs
+(`reconcile`: a rod that never saw `updateSlot` gets its ceiling, an emptied slot loses it, and a
+burning rod is not reloaded every tick). Four in `support`: the container and the buffer
+declarations, the component's round trip (with ints, floats, a partial compound and a non-compound),
+the saved state's clamp, the exact readout line, and the command's registration.
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `native-build` reported `Compiling rftoolspower (1 of 1)` and the
+two-mod e2e build is `native-0a875da-13096f5f5ed1` (`rfpowerharness`, `rftoolspower`), whose
+`native-mods.json` names version **0.1.6**.
+
+| log | verdict |
+|---|---|
+| `e2e-blazing.log` | **PASS**, `EXIT:0` — phases A–BE (the whole port), `PACKAGE … sha256=7fe0e237… bytes=162363` |
+| `e2e-blazing-selftest.log` | `FAIL: selftest: the blazing generator made 2880 FE in 48 ticks, so the assertion is alive`, `EXIT:1` |
+| `e2e-blazing-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` (the unmodded Nightly) |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=20 ok=20 missing-exit=0 bad-exit=0`.
+
+The parsed assertions, each from a `ctl` reply:
+
+| phase | what it asserts (observed) |
+|---|---|
+| AX | a fresh blazing generator reads `0/1000000 FE (working false, rft=0×4, rftmax=0×4, ticks=0×4, rods=empty×4)`; a rod given as `[rftoolspower:blazing_rod_data={…quality:60000,duration:400}]` keeps the component (`ctl inventory` reads it back), and the click puts it in slot 0 with `rftmax=60` and ~390 of its 400 ticks, the hand empty and `working` true |
+| AY | two replies 25+ ticks apart: `rft 6.976305 at t=7430 → 17.187056 at t=7461`, and the single-precision fold of `rft += (60 − rft)/150 + 0.01` over those 31 ticks is `17.187067` — a delta of **0.000011** |
+| AZ | a 5,000-tick rod climbs to `rft=60.000000` (first at t+556) and then `Δenergy == 60 × Δt` on the game clock: 25,749 → 28,629 FE over **48** ticks (+2,880) |
+| BA | the 400-tick rod leaves its slot at its 400th tick: `rods[0]=empty`, `ticks=0`, `rftmax=0`, the rate still decaying (`0.000878 → 0.000328` in 20 ticks); `working` then falls and the store holds for 25 ticks |
+| BB | a generator doctored to 999,995 FE reads 999,995, and with a rod burning reads exactly **1,000,000** — twice — while `working` stays true |
+| BC | a generator doctored to 100,000 FE beside the harness receiver ends at **0** with the receiver at **100,000** (no reserve) |
+| BD | after save + quit + relaunch: the store still 57,009 FE, slot 0 still the rod, `rftmax=60`, `rft=60.000000` |
+| BE | a click with a stone: every rod slot empty, the **server's** inventory still holds the stone (`data get entity @s Inventory`), no block placed against the machine; `blazing` at a stone position answers `No RFTools Power blazing generator there.`; the carried recipe with a stone where the parent's items belong crafts nothing |
+
+Counterfactual: `SELFTEST_BLAZING=1` asserts a rod at its ceiling makes no FE and the leg fails as
+designed, so AZ can fail; AY is the ramp's own differential (a rule that is not the 1/150th curve
+shows up as a large delta), BA is AZ's differential (no rod, no FE) and BC's differential is the
+generator's own store. The control leg proves AX is not vacuous.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **A `BlockPart::use_item_on` does not run for a click that carries a *block* item on an
+   `iron_block`-template block.** Measured: a stone click on the coal generator (template
+   `minecraft:furnace`, so its class chain has `useItemOn`) was refused and the stone stayed in
+   hand; the same click on the pearl injector and on the blazing generator (both
+   `minecraft:iron_block`) placed the stone on the machine's top face and consumed it. The blazing
+   click is therefore owned by the **global** `Hooks::right_click_block` (API 21), which sees every
+   click first: it takes the rod, refuses anything else and cancels with `Success`, so neither the
+   block's own use nor the item's `useOn` runs — one owner per click, and the Part answers only
+   `state_for_placement` so a rod cannot land in the next slot as well.
+2. **A refused click leaves the client's own inventory view one stack short.** The client predicts
+   the item's use (this pin's prediction does not consult a mod's hooks), the server cancels it, and
+   the client's view is not resynced because the server's slots never changed: the client showed an
+   empty hand while `data get entity @s Inventory` still held the stone at +10 and +70 ticks. BE
+   judges the refusal by the **server's** inventory for that reason.
+3. **A tp into this arena's band before its floor exists kills the player.** The new band (z 144…176)
+   has no floor yet, and a `tp @s … 101` followed by a fill leaves the player below it; one run died
+   there and the next `ctl place` answered *"the dead screen is open; close it first"*. The arena
+   fills first, then puts the player down, then switches to survival.
+4. **`build-e2e-game.sh` could export a build of *older* sources.** Its "Up to date" branch picked the
+   newest version directory carrying both mods, which after two consecutive builds was the previous
+   one (a diagnostic build was exported as if it were current). It now reads the build the launcher
+   names (`native-… built and selected`), and replaces a build's hard-linked libraries with `ln -f`
+   (`cp -a` refuses two names for one inode, which broke the export once).
+5. **`sample_pulse`'s freeze/step window can miss the one tick.** AO's sixteen stepped samples saw no
+   pulse in one run while the shot had landed (the destination recorded the arrival). The window is
+   retried up to three times when the injector really fired, and the monitors' counters count every
+   attempt — a window that cannot see the tick proves nothing, and the third miss still fails.
+
+### Platform facts recorded (not port defects)
+
+- **The rod's tooltip** (`power … RF/t`, `duration … ticks`, the agitation and infusion percentages)
+  needs a tooltip hook and is a `client` nicety; this `machines` slice does not carry it (gap 11).
+- **The client's prediction** of a refused block-item click (trap 2) shows a stale hand until the
+  slot is touched; the server is authoritative and the machine never takes the item.
+- **A one-item-per-slot click** is the only way in: the container declares all four slots as inputs,
+  so a hopper feeds them like upstream's menu slots (the same `ModContainer` shape the fuel slot
+  uses).
+
+### Upstream defects fixed (slice 7)
+
+None adopted: every rule is upstream's own. Two *documented deviations*:
+
+- **No GUI.** Upstream's four slots are a menu; here a click fills the first free one, and the
+  readout is `/rftoolspower blazing` (the same stand-in the other slices use).
+- **The front is horizontal.** The placement hook can set `facing` from the placer's yaw only; the
+  jar's `getFacingFromEntity` also answers UP/DOWN from the placer's height, which this pin's
+  placement context does not carry (the pearl injector's recorded limit). The up/down variants of
+  the jar's blockstate are still declared, so `setblock … [facing=up]` draws what the jar draws.
+
+A carried **behavioural** consequence, not a defect: a 400-tick rod never reaches its 60 FE a tick
+ceiling (the climb needs 556 ticks from rest) and `working` outlives the rod by the decay's ~120
+ticks. Both are upstream's own numbers; the leg asserts them as measured rather than the brief's
+assumption that either lands at the 400th tick.
+
+### Coverage of the blazing family (slice 7)
+
+| family | state |
+|---|---|
+| `blazing_generator`: block, item, the jar's twelve-state blockstate, the idle and busy front models, the two textures (the busy one animated), tags, creative tab, lang | tested (AX: placed from its item, front pinned, read back; BE: the block is refused a second entry) |
+| `blazing_rod`: the item, its handheld model and animated texture, its `horizon/item` declaration | tested (AX: given with its component and read back from the stack; the click puts it in a slot) |
+| the rod's data as the mod component, defaulted when absent | tested (AX: `quality:60000` read back and `rftmax=60`; the unit tests pin the default row and the decode of ints/floats/a partial compound) |
+| the 1/150th-of-the-gap climb with its +0.01 bias | tested (AY: the fold over the window two replies name; AZ: exactly 60 on the 556th tick; the unit tests pin the curve, its monotonicity and the clamp) |
+| the fall of a spent slot's rate | tested (BA: `0.000565 → 0.000211` while the slot is empty; unit test: 60 → 58 in one tick) |
+| the burn: one tick a rod tick, the duration written back, the slot emptied at 0 | tested (AX ~390 of 400 left; BA the empty slot at the 400th tick; unit test the write-back) |
+| the 1,000,000 FE buffer and its clamp | tested (BB: 999,995 + a rod = exactly 1,000,000, twice) |
+| the 20,000 FE a tick push, no reserve | tested (BC: 100,000 in, 100,000 out; the 20,000 cap itself is a unit test, because the harness receiver takes 10,000 an insert) |
+| `working` in the block state | tested (AX true with a rod, BA false after the decay, BB true at a full buffer) |
+| the click: a rod in, anything else refused, an empty hand reads out | tested (AX the rod, BE the stone refused on the server, the readout on demand) |
+| the store on the broken generator's item, clamped | tested (BB: a 999,995 FE item places as 999,995; the clamp is a unit test) |
+| persistence of the store, the rates and the rods | tested (BD: save + relaunch) |
+| the `blazing` command and its refusal | tested (AX–BD every line parsed by `tools/parse_blazing.py`; BE the stone-position refusal) |
+| the recipe | `blocked(rftoolsbase:machine_frame-absent, #c:rods/blaze-absent)` (BE proves the pattern crafts nothing) |
+| the GUI, the rod's tooltip, the agitator and the infuser | not ported (gap 11; the agitator and infuser mutate a rod and are the next slice) |
+| the renderer and TOP/Jade | not ported (gap 6/11) |
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
@@ -954,10 +1165,19 @@ into a `power` enum 0..9. The state is the output's carrier, not an extra featur
 11. ~~**The power level** display (`PowerLevelTileEntity`, the monitor's sibling — same tick, but a
     0..9 ratio written straight to the redstone output and no level state)~~ — **ported in slice
     6** (the 20-then-10 tick, `stored * 10 / capacity` clamped 0..9, the display-face output and
-    the `power` mirror; the renderer is the gap). **The rest of the mod:** the dimensional cell
-    (with its card-linked networks), and the blazing generator/agitator/infuser with blazing rods,
-    and the power level's **renderer** (`PowerLevelRenderer`: the ten `powerlevel_N` textures).
-    The power monitor is ported in slice 2 and the endergenic pair in slice 4.
+    the `power` mirror; the renderer is the gap). ~~**The blazing generator** with blazing rods~~ —
+    **ported in slice 7** (four rod slots, the 150th-of-the-gap climb with its +0.01 bias, the
+    burn's duration write-back, the 1,000,000 FE buffer, the 20,000 FE a tick push, `working`, the
+    rod's `rftoolspower:blazing_rod_data` component and the `/rftoolspower blazing` readout; the
+    click is owned by the global `right_click_block`, see the slice's trap 1). Still open in this
+    family: the **blazing agitator** (3×3 rod box, the adjacency algorithm, 9 output slots, the
+    `AgitatorData` locks, 50,000 FE / 100 in / 10 used a tick) and the **blazing infuser** (3 slots,
+    the six catalysts, the 10-tick counter, 50,000 FE / 100 in / 10 used a tick) — both **mutate**
+    a rod (`quality`, `duration`, `time`, `steps`) rather than consume it, and both are the next
+    slice; their GUIs too. **The rest of the mod:** the dimensional cell (with its card-linked
+    networks), the power level's **renderer** (`PowerLevelRenderer`: the ten `powerlevel_N`
+    textures) and the blazing generator's GUI and TOP/Jade drivers. The power monitor is ported in
+    slice 2 and the endergenic pair in slice 4.
 
 ## Coverage of the endergenic family (slice 4)
 
@@ -1071,39 +1291,34 @@ into a `power` enum 0..9. The state is the output's carrier, not an extra featur
 | the smart wrench, the GUI, the powercell card, `cell3` | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–7; slice 7 also used the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`)
 
-## Verification (slice 6 run)
+## Verification (slice 7 run)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **94 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **113 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 141,168 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.5 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 162,363 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.6 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
-| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree` |
-| the leg | `PASS` + `EXIT:0`; `SELFTEST_POWERLEVEL=1` `EXIT:1`; control `EXIT:1`; `--strict` 17/17 |
+| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 122 entries |
+| `tools/assemble_content.py --check` | `ok: 145 entries re-derive exactly` |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST_BLAZING=1` `EXIT:1`; control `EXIT:1`; `--strict` 20/20 |
 
-The red proof for slice 6's rules is `ports/_shared/evidence/rftoolspower/red-powerlevel.log`:
-`test result: FAILED. 87 passed; 4 failed`, every failure `not yet implemented`.
+The red proof for slice 7's rules is `ports/_shared/evidence/rftoolspower/red-blazing.log`:
+`test result: FAILED. 94 passed; 10 failed`, every failure `not yet implemented`.
 
-## Artifact (0.1.5)
+## Artifact (0.1.6)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 141,168 B | `26485b9a8e5277bc248ad4a476e17b98cdcd3a1632e4718bb44d0b8909b614d6` | 105 |
+| `rftoolspower.hmod` (port root) | 162,363 B | `7fe0e23708d8473564c53494f983c01bb9373fafdb8d551f7b8db5df0ae59a7c` | 122 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1 (including `package matches the
-tree`), `src/runtime.rs` byte-identical in the archive. The 0.1.4 artifact (134,377 B,
-`e1c60156…`, 96 entries) is the slice-5 record; the 0.1.3 (122,516 B, `ab452bd8…`, 87 entries),
-0.1.2 (100,317 B, `989543d7…`, 69 entries) and 0.1.1 records are kept in `notes.md`.
-
-The first 0.1.5 build (`fc6a1706…`, 140,994 B) packed a `README.md` that predated the slice's
-README update (the tree's README changed after the build), so the archive and the tree differed in
-one document. The package was rebuilt from the final tree; both builds are `cmp`-identical at
-`26485b9a…`, every packed file is the tree's bytes (`verify-sdk-package` prints `package matches
-the tree`), and the main leg and the power-level selftest were re-run on those bytes (their logs
-carry `PACKAGE rftoolspower.hmod sha256=26485b9a… bytes=141168`).
+tree`), and the three legs ran on these bytes (their `PACKAGE` lines name them). The 0.1.5
+artifact (141,168 B, `26485b9a…`, 105 entries) is the slice-6 record; the 0.1.4 (134,377 B,
+`e1c60156…`, 96 entries), 0.1.3 (122,516 B, `ab452bd8…`, 87 entries), 0.1.2 (100,317 B,
+`989543d7…`, 69 entries) and 0.1.1 records are kept in this file.
