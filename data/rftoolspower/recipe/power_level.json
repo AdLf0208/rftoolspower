@@ -1,0 +1,19 @@
+{
+  "category": "misc",
+  "key": {
+    "A": "rftoolsbase:machine_base",
+    "P": "#c:glass_panes",
+    "R": "minecraft:redstone_block",
+    "r": "minecraft:redstone"
+  },
+  "pattern": [
+    " P ",
+    "rAr",
+    " R "
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:power_level"
+  },
+  "type": "minecraft:crafting_shaped"
+}

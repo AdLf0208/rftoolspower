@@ -20,12 +20,12 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic, Fuel,
-    Generator, HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE, MONITOR_SIGNAL, Monitor,
-    MonitorMode, NETWORK_MAX, OBSERVE_TICKS, PEARL, Pulse, SideMode, Sides, Tier, as_capability,
-    capacity as network_capacity, clamp_endergenic, clamped_energy, network_valid, pearl_lost,
-    receive as network_receive, restored, rf_per_tick, rising_edge, send_amount,
-    stored as network_stored, take as network_take,
+    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic,
+    FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE,
+    MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse,
+    SideMode, Sides, Tier, as_capability, capacity as network_capacity, clamp_endergenic,
+    clamped_energy, network_valid, pearl_lost, receive as network_receive, restored, rf_per_tick,
+    rising_edge, send_amount, stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -84,6 +84,15 @@ const NO_MONITOR: &str = "No RFTools Power power monitor there.";
 /// The strongest signal a monitor's alarm gives.
 const ALARM_SIGNAL: i32 = 15;
 
+/// The power level display (`MonitorModule.POWER_LEVEL`). Its block entity type is named apart
+/// from its block for the reason [`GENERATOR_TYPE`] is.
+pub(crate) const POWER_LEVEL: &str = "rftoolspower:power_level";
+const POWER_LEVEL_TYPE: &str = "power_level_block_entity";
+/// The ratio the display mirrors into its `power` state (upstream's tile-entity field).
+const KEY_POWER: &str = "power";
+/// What a read where no power level stands answers.
+const NO_POWER_LEVEL: &str = "No RFTools Power power level there.";
+
 // The powercell (`PowerCellModule.CELL1`/`CELL2`). Its block entity type is named apart from its
 // block for the reason [`GENERATOR_TYPE`] is; the type id is what a broken cell's payload names.
 /// `rftoolspower:cell1`, the tier-1 cell (500,000 FE, 250 a side a tick).
@@ -139,6 +148,19 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     if let Err(error) = r.block_entity_part(&kind, MonitorPart) {
         context.refuse(&format!(
             "rftoolspower: the power monitor part was refused: {error}"
+        ));
+    }
+
+    // The power level: a type and a Part. Like the monitor it has no container and no buffer —
+    // it reads the block it faces and mirrors the ratio into its redstone output. It carries no
+    // item data (upstream keeps no component on the block's item).
+    let kind = r
+        .block_entity_type(POWER_LEVEL_TYPE)
+        .blocks(&["power_level"])
+        .build();
+    if let Err(error) = r.block_entity_part(&kind, PowerLevelPart) {
+        context.refuse(&format!(
+            "rftoolspower: the power level part was refused: {error}"
         ));
     }
 
@@ -320,6 +342,22 @@ pub(crate) fn write_monitor(saved: &mut Tag, state: &Monitor) {
     set_int(saved, KEY_MINIMUM, state.minimum);
     set_int(saved, KEY_MAXIMUM, state.maximum);
     set_flag(saved, KEY_ALARM, state.alarm);
+    set_int(saved, KEY_COUNTER, state.counter as i32);
+}
+
+/// The power level a saved compound holds, with every value clamped (`PowerLevel::restored`).
+pub(crate) fn read_power_level(saved: &Tag) -> PowerLevel {
+    let counter = match saved.get(KEY_COUNTER) {
+        Some(Tag::Int(value)) => u32::try_from(*value).unwrap_or(0),
+        // A fresh block entity observes 20 ticks after placement, as upstream's field does.
+        _ => FIRST_POWER_OBSERVE_TICKS,
+    };
+    PowerLevel::restored(int(saved, KEY_POWER), counter)
+}
+
+/// Write the power level back into a saved compound.
+pub(crate) fn write_power_level(saved: &mut Tag, state: &PowerLevel) {
+    set_int(saved, KEY_POWER, state.power);
     set_int(saved, KEY_COUNTER, state.counter as i32);
 }
 
@@ -745,6 +783,196 @@ pub(crate) fn set_band(
         "Power Monitor band at {},{},{}: {}..{} (alarm at the next observation)",
         pos[0], pos[1], pos[2], banded.minimum, banded.maximum
     )
+}
+
+// ---------------------------------------------------------------------------
+// The power level
+// ---------------------------------------------------------------------------
+
+/// Mirror the power level's ratio into its `power` block state, and let the neighbours re-read the
+/// redstone output when it changed (a wire on the display face must see the new signal at once).
+///
+/// Upstream keeps the ratio in the tile entity, but the pin's `block_signal` gets only a state and
+/// must answer from it (`BlockPart::block_signal`: "don't read or change the world here"), so the
+/// state is this port's carrier for the output — the same mirror the monitor's `lit` gives its
+/// alarm.
+pub(crate) fn mirror_power_level(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    power: i32,
+) {
+    let _ = host.set_block_property(pos, KEY_POWER, &power.to_string());
+    if let Some(source) = level.block_state(&*host, pos) {
+        let _ = level.update_neighbors(host, pos, source, NeighbourUpdate::Neighbours);
+    }
+}
+
+/// One power level tick (`PowerLevelTileEntity.tickServer`): count the ticks down, then read the
+/// block it faces and set its ratio. True when the saved state moved.
+pub(crate) fn tick_power_level(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    saved: &mut Tag,
+) -> bool {
+    let before = read_power_level(saved);
+    let mut state = before.clone();
+    let due = state.tick();
+    if due {
+        // A tick is only asked in the level in place; if none answers (shutdown), keep the last
+        // reading rather than treating the target as absent.
+        if let Some(level) = level {
+            let observed = read_target(&*host, level, pos)
+                .and_then(|(target, _read)| energy_at(host, level, target));
+            state.observe(observed);
+        }
+    }
+    let changed = state != before;
+    if changed {
+        write_power_level(saved, &state);
+        if let Some(level) = level {
+            mirror_power_level(host, level, pos, state.power);
+        }
+    }
+    changed
+}
+
+/// A state decoded for `block_signal`, cached by ordinal: a state's properties never change.
+#[derive(Clone, Copy)]
+struct PowerLevelFace {
+    display: Direction,
+    power: i32,
+}
+
+static POWER_LEVEL_FACES: LazyLock<Mutex<HashMap<BlockState, PowerLevelFace>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Decode a serialized power level state into its display face and ratio
+/// (`rftoolspower:power_level[facing=east,power=5]`).
+pub(crate) fn parse_power_level_state(text: &str) -> Option<(Direction, i32)> {
+    let (block, rest) = text.split_once('[')?;
+    if block != POWER_LEVEL {
+        return None;
+    }
+    let mut facing = None;
+    let mut power = 0;
+    for property in rest.strip_suffix(']')?.split(',') {
+        let (key, value) = property.split_once('=')?;
+        match key {
+            KEY_FACING => facing = Some(dir_from_name(value)?),
+            KEY_POWER => power = value.parse().ok()?,
+            _ => {}
+        }
+    }
+    Some((facing?, power))
+}
+
+/// The decoded state, through the cache `block_signal` (asked very often) reads.
+fn power_level_face(level: &dyn LevelHost, state: BlockState) -> Option<PowerLevelFace> {
+    if let Some(hit) = POWER_LEVEL_FACES
+        .lock()
+        .expect("the power level state cache is never held across a panic")
+        .get(&state)
+    {
+        return Some(*hit);
+    }
+    // The state's `facing` is the display front; the block read is behind it, and the output
+    // leaves through the display (upstream's notify side, the same fix slice 2 recorded).
+    let (display, power) = parse_power_level_state(&level.state_string(state)?)?;
+    let face = PowerLevelFace { display, power };
+    POWER_LEVEL_FACES
+        .lock()
+        .expect("the power level state cache is never held across a panic")
+        .insert(state, face);
+    Some(face)
+}
+
+/// `block_signal`: the ratio on the display side, nothing anywhere else.
+///
+/// Upstream answers only `getSignal` (weak) and leaves `getDirectSignal` at 0; so does this.
+pub(crate) fn power_level_signal(level: &dyn LevelHost, event: &mut BlockSignalEvent) {
+    if event.direct {
+        return;
+    }
+    let Some(face) = power_level_face(level, event.state) else {
+        return;
+    };
+    if event.face == face.display {
+        event.signal = face.power;
+    }
+}
+
+/// `is_signal_source`: a power level answers the signal query, so redstone wire connects to it.
+pub(crate) fn power_level_signal_source(level: &dyn LevelHost, event: &mut IsSignalSourceEvent) {
+    if level.state_block(event.state) == Some(POWER_LEVEL) {
+        event.source = true;
+    }
+}
+
+/// `LogicSlabBlock.getStateForPlacement`: the placer's look sets the display face.
+pub(crate) fn power_level_placement(
+    level: &dyn LevelHost,
+    event: &StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    if level.state_block(event.state) != Some(POWER_LEVEL) {
+        return None;
+    }
+    let display = facing_from_yaw(event.context.yaw);
+    Some(level.state_with_property(event.state, KEY_FACING, dir_name(display)))
+}
+
+/// The power level's report line, as `/rftoolspower powerlevel` prints it.
+pub(crate) fn power_level_line(
+    pos: [i32; 3],
+    state: &PowerLevel,
+    display: Option<Direction>,
+    target: Option<(&str, Option<(u32, u32)>)>,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let facing = display.map_or_else(|| "none".to_owned(), |face| dir_name(face).to_owned());
+    let target = match target {
+        Some((id, Some((stored, max)))) => format!("target={id} stored={stored} max={max}"),
+        Some((id, None)) => format!("target={id} (not an energy block) stored=- max=-"),
+        None => "target=none stored=- max=-".to_owned(),
+    };
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Power Level at {},{},{}: power={} facing={facing} {target} t={t}{suffix}",
+        pos[0], pos[1], pos[2], state.power,
+    )
+}
+
+/// The power level's line for the block at `pos`, or [`NO_POWER_LEVEL`].
+pub(crate) fn power_level_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(POWER_LEVEL) {
+        return NO_POWER_LEVEL.to_owned();
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_POWER_LEVEL.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_POWER_LEVEL.to_owned();
+    };
+    let state = read_power_level(&Tag::Compound(saved));
+    let display = level
+        .block_property(&*host, pos, KEY_FACING)
+        .and_then(|name| dir_from_name(name.as_str()));
+    let target = read_target(&*host, level, pos).map(|(target, _read)| target);
+    let report = target.map(|target| {
+        let id = block_id(&*host, level, target);
+        let energy = energy_at(host, level, target);
+        (id.unwrap_or_else(|| "none".to_owned()), energy)
+    });
+    let t = level.game_time(&*host).unwrap_or(0);
+    let report = report.as_ref().map(|(id, energy)| (id.as_str(), *energy));
+    power_level_line(pos, &state, display, report, t, nonce)
 }
 
 // ---------------------------------------------------------------------------
@@ -1650,6 +1878,62 @@ impl BlockEntityPart for MonitorPart {
     }
 }
 
+/// The Power Level: it ticks, reads the block it faces and answers its ratio on the display face.
+pub(crate) struct PowerLevelPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for PowerLevelPart {
+    /// The placer's look sets the display face.
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        power_level_placement(level, event)
+    }
+
+    /// The ratio on the display side.
+    fn block_signal(&self, level: &dyn LevelHost, event: &mut BlockSignalEvent) {
+        power_level_signal(level, event);
+    }
+
+    /// A power level answers the signal query, so wire connects to it.
+    fn is_signal_source(&self, level: &dyn LevelHost, event: &mut IsSignalSourceEvent) {
+        power_level_signal_source(level, event);
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for PowerLevelPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound; the tick fills it.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: it ticks. Never clear a value an earlier mod set.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: count the window down, then read the block it faces.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let changed = tick_power_level(host, level, pos, &mut saved);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The command
 // ---------------------------------------------------------------------------
@@ -1663,6 +1947,7 @@ pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
     for usage in [
         "rftoolspower info <pos:block_pos> [nonce:word]",
         "rftoolspower monitor <pos:block_pos> [nonce:word]",
+        "rftoolspower powerlevel <pos:block_pos> [nonce:word]",
         "rftoolspower band <pos:block_pos> <minimum:integer> <maximum:integer>",
         "rftoolspower cell <pos:block_pos> [nonce:word]",
         "rftoolspower side <pos:block_pos> <face:word> <mode:word>",
@@ -1755,6 +2040,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         subcommand,
         "info"
             | "monitor"
+            | "powerlevel"
             | "band"
             | "cell"
             | "side"
@@ -1778,6 +2064,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
     if level.is_none() {
         let _ = host.commands().feedback(Text::literal(match subcommand {
             "monitor" | "band" => NO_MONITOR,
+            "powerlevel" => NO_POWER_LEVEL,
             "cell" | "side" => NO_CELL,
             "endergenic" | "enderlink" => NO_ENDERGENIC,
             "injector" => NO_INJECTOR,
@@ -1792,6 +2079,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
     let line = match subcommand {
         "info" => status_line(host, level, *pos, nonce_of(event)),
         "monitor" => monitor_status_line(host, level, *pos, nonce_of(event)),
+        "powerlevel" => power_level_status_line(host, level, *pos, nonce_of(event)),
         "cell" => cell_status_line(host, level, *pos, nonce_of(event)),
         "side" => set_side(
             host,
@@ -3408,11 +3696,74 @@ mod tests {
         assert_eq!(parse_monitor_state("rftoolspower:power_monitor"), None);
     }
 
+    // --- the power level ---------------------------------------------------
+
     #[test]
-    fn the_commands_are_the_nine_the_harness_types() {
+    fn the_power_levels_saved_state_reads_back_and_a_doctored_one_is_clamped() {
+        let mut saved = compound();
+        assert_eq!(
+            read_power_level(&saved),
+            PowerLevel::new(),
+            "a fresh power level is ratio 0, first observation in 20 ticks"
+        );
+        let state = PowerLevel::restored(5, 10);
+        write_power_level(&mut saved, &state);
+        assert_eq!(read_power_level(&saved), state);
+        assert_eq!(saved.get(KEY_POWER), Some(&Tag::Int(5)));
+        assert_eq!(saved.get(KEY_COUNTER), Some(&Tag::Int(10)));
+
+        let mut doctored = compound();
+        set_int(&mut doctored, KEY_POWER, 99);
+        set_int(&mut doctored, KEY_COUNTER, 0);
+        let read = read_power_level(&doctored);
+        assert_eq!(read.power, 9, "no ratio above 9");
+        assert_eq!(read.counter, 1, "a zero counter is due next tick");
+    }
+
+    #[test]
+    fn the_power_level_readout_is_the_line_the_e2e_asserts() {
+        let state = PowerLevel::restored(5, 10);
+        assert_eq!(
+            power_level_line(
+                [303, 101, 140],
+                &state,
+                Some(Direction::East),
+                Some((MONITOR_GENERATOR_LINE, Some((250_000, 500_000)))),
+                400,
+                Some("1")
+            ),
+            "Power Level at 303,101,140: power=5 facing=east \
+             target=rftoolspower:coalgenerator stored=250000 max=500000 t=400 nonce=1"
+        );
+        assert_eq!(
+            power_level_line([303, 101, 140], &PowerLevel::new(), None, None, 9, None),
+            "Power Level at 303,101,140: power=0 facing=none target=none stored=- max=- t=9"
+        );
+    }
+
+    #[test]
+    fn a_power_level_state_decodes_its_display_face_and_ratio() {
+        assert_eq!(
+            parse_power_level_state("rftoolspower:power_level[facing=east,power=5]"),
+            Some((Direction::East, 5))
+        );
+        assert_eq!(
+            parse_power_level_state("rftoolspower:power_level[facing=north,power=0]"),
+            Some((Direction::North, 0))
+        );
+        assert_eq!(
+            parse_power_level_state("rftoolspower:power_monitor[facing=east,level=3,lit=true]"),
+            None,
+            "another block's state is not a power level"
+        );
+        assert_eq!(parse_power_level_state("rftoolspower:power_level"), None);
+    }
+
+    #[test]
+    fn the_commands_are_the_ten_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 9);
+        assert_eq!(commands.len(), 10);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -3422,32 +3773,36 @@ mod tests {
             "rftoolspower monitor <pos:block_pos> [nonce:word]"
         );
         assert_eq!(
-            commands[2].usage,
+            commands[2].usage, "rftoolspower powerlevel <pos:block_pos> [nonce:word]",
+            "the power level's readout"
+        );
+        assert_eq!(
+            commands[3].usage,
             "rftoolspower band <pos:block_pos> <minimum:integer> <maximum:integer>",
             "the band is set the way upstream's GUI sliders set it"
         );
         assert_eq!(
-            commands[3].usage, "rftoolspower cell <pos:block_pos> [nonce:word]",
+            commands[4].usage, "rftoolspower cell <pos:block_pos> [nonce:word]",
             "the cell's readout"
         );
         assert_eq!(
-            commands[4].usage, "rftoolspower side <pos:block_pos> <face:word> <mode:word>",
+            commands[5].usage, "rftoolspower side <pos:block_pos> <face:word> <mode:word>",
             "the side mode is set the way the smart wrench toggles it"
         );
         assert_eq!(
-            commands[5].usage, "rftoolspower endergenic <pos:block_pos> [nonce:word]",
+            commands[6].usage, "rftoolspower endergenic <pos:block_pos> [nonce:word]",
             "the endergenic's readout"
         );
         assert_eq!(
-            commands[6].usage, "rftoolspower injector <pos:block_pos> [nonce:word]",
+            commands[7].usage, "rftoolspower injector <pos:block_pos> [nonce:word]",
             "the pearl injector's readout"
         );
         assert_eq!(
-            commands[7].usage, "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
+            commands[8].usage, "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
             "the wrench's link, as a command"
         );
         assert_eq!(
-            commands[8].usage,
+            commands[9].usage,
             "rftoolspower endermonitor <pos:block_pos> <action:word> [nonce:word]",
             "the monitor's readout is `status <nonce>`; a mode word sets its GUI picker"
         );

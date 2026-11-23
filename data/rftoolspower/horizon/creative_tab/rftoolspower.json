@@ -3,6 +3,7 @@
   "items": [
     "rftoolspower:coalgenerator",
     "rftoolspower:power_monitor",
+    "rftoolspower:power_level",
     "rftoolspower:cell1",
     "rftoolspower:cell2",
     "rftoolspower:endergenic",

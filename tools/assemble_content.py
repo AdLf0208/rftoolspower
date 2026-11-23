@@ -214,6 +214,7 @@ ADVANCEMENT = {
 LANG = {
     "block.rftoolspower.coalgenerator": "Coal Generator",
     "block.rftoolspower.power_monitor": "Power Monitor",
+    "block.rftoolspower.power_level": "Power Level",
     "block.rftoolspower.cell1": "Powercell (Low)",
     "block.rftoolspower.cell2": "Powercell (Medium)",
     "block.rftoolspower.endergenic": "Endergenic",
@@ -229,6 +230,7 @@ CREATIVE_TAB = {
     "items": [
         "rftoolspower:coalgenerator",
         "rftoolspower:power_monitor",
+        "rftoolspower:power_level",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
         "rftoolspower:endergenic",
@@ -243,6 +245,7 @@ TAGS = {
     "data/minecraft/tags/block/mineable/pickaxe.json": [
         "rftoolspower:coalgenerator",
         "rftoolspower:power_monitor",
+        "rftoolspower:power_level",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
         "rftoolspower:endergenic",
@@ -252,6 +255,7 @@ TAGS = {
     "data/minecraft/tags/block/needs_iron_tool.json": [
         "rftoolspower:coalgenerator",
         "rftoolspower:power_monitor",
+        "rftoolspower:power_level",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
         "rftoolspower:endergenic",
@@ -363,6 +367,37 @@ ENDER_MONITOR_DECL = {
     # `shapes` is the outline *and* the collision box at this pin (`BlockShapes`: "per-state
     # outline and collision boxes"); there is no separate collision key in the loader.
     "shapes": {"property": "facing", "values": ENDER_MONITOR_SHAPES},
+    "item": True,
+}
+
+POWER_LEVEL = "power_level"
+# The same 4/16 plate: the jar's `power_level_0` model carries the screen on its `up` face, so
+# that face is the display and the plate lies behind it. Models 1–3 differ only in the `up`
+# texture's UV rotation, which a four-way horizontal `facing` never needs.
+POWER_LEVEL_ROTATION = ENDER_MONITOR_ROTATION
+POWER_LEVEL_SHAPES = ENDER_MONITOR_SHAPES
+
+# Upstream's `PowerLevelTileEntity` has no block state: the ratio lives in its tile entity and is
+# written straight to the redstone output. The pin's `block_signal` gets only a state and must
+# answer from it, so the ratio is mirrored into a `power` enum (0..9) — the output's carrier, as
+# the power monitor's `lit` carries its alarm.
+POWER_LEVEL_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "state_properties": {
+        "facing": {"type": "enum", "values": ["north", "south", "east", "west"]},
+        "power": {
+            "type": "enum",
+            "values": [str(power) for power in range(10)],
+        },
+    },
+    "default_state": {"facing": "north", "power": "0"},
+    "shapes": {"property": "facing", "values": POWER_LEVEL_SHAPES},
     "item": True,
 }
 
@@ -634,6 +669,48 @@ def build(out: Path) -> None:
         out / f"data/rftoolspower/advancement/recipes/misc/{ENDER_MONITOR}.json",
         json.loads(
             read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{ENDER_MONITOR}.json")
+        ),
+    )
+
+    # --- the power level: the jar's 4/16 plate rotated onto a four-way display side, with the
+    # `power` enum the ratio is mirrored into (the output's carrier at this pin). The ten
+    # `powerlevel_N` textures belong to upstream's renderer, which this machines slice does not
+    # carry; the plate's own `power_level` screen texture is the one the model names.
+    variants = {}
+    for facing, rotation in POWER_LEVEL_ROTATION.items():
+        for power in range(10):
+            variants[f"facing={facing},power={power}"] = {
+                "model": f"rftoolspower:block/{POWER_LEVEL}_0",
+                **rotation,
+            }
+    write(out / f"assets/rftoolspower/blockstates/{POWER_LEVEL}.json", {"variants": variants})
+    model = json.loads(
+        read_jar(POWER, f"assets/rftoolspower/models/block/{POWER_LEVEL}_0.json")
+    )
+    model["textures"] = {
+        key: value.replace("rftoolsbase:block/base/", "rftoolspower:block/base/")
+        for key, value in model["textures"].items()
+    }
+    write(out / f"assets/rftoolspower/models/block/{POWER_LEVEL}_0.json", model)
+    write(
+        out / f"assets/rftoolspower/models/item/{POWER_LEVEL}.json",
+        {"parent": f"rftoolspower:block/{POWER_LEVEL}_0"},
+    )
+    write(
+        out / f"assets/rftoolspower/items/{POWER_LEVEL}.json",
+        {"model": {"model": f"rftoolspower:item/{POWER_LEVEL}", "type": "minecraft:model"}},
+    )
+    binary(
+        out / "assets/rftoolspower/textures/block/monitor/power_level.png",
+        read_jar(POWER, "assets/rftoolspower/textures/block/monitor/power_level.png"),
+    )
+    write(out / f"data/rftoolspower/horizon/block/{POWER_LEVEL}.json", POWER_LEVEL_DECL)
+    write(out / f"data/rftoolspower/loot_table/blocks/{POWER_LEVEL}.json", plain_loot(POWER_LEVEL))
+    write(out / f"data/rftoolspower/recipe/{POWER_LEVEL}.json", patched_recipe(POWER_LEVEL))
+    write(
+        out / f"data/rftoolspower/advancement/recipes/misc/{POWER_LEVEL}.json",
+        json.loads(
+            read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{POWER_LEVEL}.json")
         ),
     )
 

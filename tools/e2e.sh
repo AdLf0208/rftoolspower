@@ -91,7 +91,8 @@
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
 # of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF;
-# SELFTEST_ENDERMON=1 inverts AO (the monitor must not have lit).
+# SELFTEST_ENDERMON=1 inverts AO (the monitor must not have lit);
+# SELFTEST_POWERLEVEL=1 inverts the power level's 5 (it asserts the brief's mistaken 4).
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -107,6 +108,7 @@ SOCK=${SOCK:-$TMP/rftoolspower-e2e.sock}
 SELFTEST=${SELFTEST:-0}
 SELFTEST_MONITOR=${SELFTEST_MONITOR:-0}
 SELFTEST_ENDERMON=${SELFTEST_ENDERMON:-0}
+SELFTEST_POWERLEVEL=${SELFTEST_POWERLEVEL:-0}
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
 WORLD=RFToolsPowerE2E
@@ -118,6 +120,8 @@ TICKS_PER_COAL=600
 TICKS_PER_COAL_BLOCK=5400
 BLOCK=rftoolspower:coalgenerator
 MONITOR=rftoolspower:power_monitor
+POWER_LEVEL=rftoolspower:power_level
+DUST=minecraft:redstone_wire
 CELL=rftoolspower:cell1
 CELL2=rftoolspower:cell2
 CORE=rftoolspower:power_core1
@@ -136,6 +140,11 @@ if [ "$CONTROL" = 1 ]; then
 fi
 [ -x "$GAME" ] || { echo "missing horizon-client: $GAME" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
+# Name the delivered bytes this leg proves (the campaign's rule: a log names the package it ran
+# against). The control leg does not load the package, so it says nothing.
+if [ "$CONTROL" = 0 ] && [ -f "$PORT/rftoolspower.hmod" ]; then
+    echo "PACKAGE rftoolspower.hmod sha256=$(sha256sum "$PORT/rftoolspower.hmod" | cut -d' ' -f1) bytes=$(stat -c%s "$PORT/rftoolspower.hmod")"
+fi
 
 SCRATCH=$(mktemp -d "$TMP/rftoolspower-home.XXXXXX")
 export HORIZON_HOME=$SCRATCH/game
@@ -458,6 +467,50 @@ aim_monitor() { # aim_monitor X Y Z FACE
 place_monitor() { # place_monitor X Y Z — a fresh monitor from the hotbar, watching the block west
     hold "$MONITOR"
     place_facing_player "$1" "$2" "$3" "$MONITOR"
+}
+
+# `/rftoolspower powerlevel X Y Z <nonce>`: the line, then the parsed fields.
+powerlevel() { # powerlevel X Y Z
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower powerlevel $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower powerlevel reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_powerlevel.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the power level line did not parse: $line"
+    echo "  $line" >&2
+    echo "  parsed: power=$POWER facing=$FACING target=$TARGET energy=$IS_ENERGY stored=$STORED/$MAXE" >&2
+}
+
+expect_power() { [ "$POWER" = "$1" ] || fail "the power level reads power=$POWER, expected $1"; }
+
+# The `power` property of a redstone wire: what the wire beside the display face actually sees.
+dust_power() { ctl block "$1" "$2" "$3" | jq -r '.state // empty' | sed -n 's/.*power=\([0-9]*\).*/\1/p'; }
+
+# A power level placed from its item (so `state_for_placement` runs), then its display face pinned:
+# `ctl place`'s yaw is the game's, not the player's (the monitor/ender-monitor trap).
+place_powerlevel() { # place_powerlevel X Y Z FACE
+    local x=$1 y=$2 z=$3 face=$4 dx=2 aim
+    [ "$face" = west ] && dx=-2
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x + dx)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    hold "$POWER_LEVEL"
+    ctl wait 2 >/dev/null
+    aim=$(ctl look-at-block "$x" $((y - 1)) "$z" up 2>&1) \
+        || fail "cannot aim at the floor under $x,$y,$z: $aim"
+    place_block "$x" "$y" "$z" "$POWER_LEVEL" \
+        || fail "ctl place $POWER_LEVEL at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$POWER_LEVEL" ] || fail "the power level is not at $x,$y,$z"
+}
+
+aim_powerlevel() { # aim_powerlevel X Y Z FACE
+    ctl command "execute in minecraft:the_end run setblock $1 $2 $3 $POWER_LEVEL[facing=$4,power=0]" >/dev/null \
+        || fail "cannot set the power level's facing at $1,$2,$3"
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$1" "$2" "$3")" = "$POWER_LEVEL" ] || fail "the power level vanished from $1,$2,$3"
 }
 
 echo "== launch (The End arena, the package's own content and code) =="
@@ -2030,4 +2083,116 @@ expect_monitor_mode lost
 expect_monitor_pulses 1
 echo "  after save + relaunch: the arrived monitor still watches 'arrived' with $((BASE_PULSES + 1)) pulses, the lost one 'lost' with 1"
 
-echo "PASS: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+echo "== AT: a power level on a 250,000 FE generator gives 5 on its display face =="
+# A clear band in the monitor arena (its floor spans z 126..140); the earlier phases left blocks
+# at z 130..138, so clear the strip this rig uses first.
+ctl command "execute in minecraft:the_end run tp @s $((SX + 1)).5 101 136.5" >/dev/null
+ctl wait 20 >/dev/null
+ctl command "execute in minecraft:the_end run fill $((SX - 2)) 101 135 $((SX + 4)) 108 139 minecraft:air" >/dev/null
+ctl wait 6 >/dev/null
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",burn:0,burn_max:0,energy:250000}]" >/dev/null
+ctl wait 8 >/dev/null
+place_kept "$SX" 101 136
+info "$SX" 101 136
+expect_energy 250000
+place_powerlevel "$((SX + 1))" 101 136 east
+aim_powerlevel "$((SX + 1))" 101 136 east
+ctl command "execute in minecraft:the_end run setblock $((SX + 2)) 101 136 $DUST" >/dev/null
+# The wrong face: a wire on the block's north side, which is not the display.
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 135 $DUST" >/dev/null
+ctl wait 40 >/dev/null
+powerlevel "$((SX + 1))" 101 136
+expect_power 5
+[ "$FACING" = east ] || fail "the power level faces '$FACING', expected its display east"
+[ "$TARGET" = "$BLOCK" ] || fail "the power level reads target=$TARGET, expected $BLOCK"
+expect_stored 250000
+[ "$MAXE" = "$CAPACITY" ] || fail "the power level reads capacity $MAXE, expected $CAPACITY"
+PSTATE=$(ctl block "$((SX + 1))" 101 136 | jq -r '.state')
+case "$PSTATE" in
+    *power=5*) ;;
+    *) fail "the power level's state does not mirror power=5: $PSTATE" ;;
+esac
+DISPLAY_POWER=$(dust_power "$((SX + 2))" 101 136)
+WRONG_POWER=$(dust_power "$((SX + 1))" 101 135)
+echo "  display wire: $(ctl block "$((SX + 2))" 101 136 | jq -c '{block,state}')" >&2
+echo "  north wire:   $(ctl block "$((SX + 1))" 101 135 | jq -c '{block,state}')" >&2
+if [ "$SELFTEST_POWERLEVEL" = 1 ]; then
+    echo "(selftest: asserting the brief's mistaken 4, so the assertion is alive)"
+    [ "$DISPLAY_POWER" = 4 ] \
+        || fail "selftest: the power level reads $DISPLAY_POWER at 250,000/500,000, not the 4 the inversion expects, so the assertion is alive"
+fi
+[ "$DISPLAY_POWER" = 5 ] \
+    || fail "the redstone wire on the display face reads power=$DISPLAY_POWER, expected 5 (state $(ctl block "$((SX + 2))" 101 136 | jq -r '.state'))"
+[ "$WRONG_POWER" = 0 ] \
+    || fail "the wire on the power level's north face reads power=$WRONG_POWER, expected 0 (state $(ctl block "$((SX + 1))" 101 135 | jq -r '.state'))"
+echo "  250,000/500,000 FE: the display face's wire reads power=5, the mirror says power=5, and the wire on another face reads 0"
+
+echo "== AU: an empty generator reads 0 (the differential for AT) =="
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+place_generator "$SX" 101 138
+info "$SX" 101 138
+expect_energy 0
+place_powerlevel "$((SX + 1))" 101 138 east
+aim_powerlevel "$((SX + 1))" 101 138 east
+ctl command "execute in minecraft:the_end run setblock $((SX + 2)) 101 138 $DUST" >/dev/null
+ctl wait 40 >/dev/null
+powerlevel "$((SX + 1))" 101 138
+expect_power 0
+expect_stored 0
+EMPTY_POWER=$(dust_power "$((SX + 2))" 101 138)
+echo "  empty display wire: $(ctl block "$((SX + 2))" 101 138 | jq -c '{block,state}')" >&2
+[ "$EMPTY_POWER" = 0 ] || fail "the display wire on an empty generator reads power=$EMPTY_POWER, expected 0"
+echo "  0/500,000 FE: power=0 on the readout and on the display face's wire — the signal follows the store"
+
+echo "== AV: a full generator reads 9, not 10 =="
+ctl command "clear @s" >/dev/null
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",burn:0,burn_max:0,energy:500000}]" >/dev/null
+ctl wait 8 >/dev/null
+place_kept "$SX" 101 139
+info "$SX" 101 139
+expect_energy 500000
+place_powerlevel "$((SX + 1))" 101 139 east
+aim_powerlevel "$((SX + 1))" 101 139 east
+ctl command "execute in minecraft:the_end run setblock $((SX + 2)) 101 139 $DUST" >/dev/null
+ctl wait 40 >/dev/null
+powerlevel "$((SX + 1))" 101 139
+expect_power 9
+FULL_POWER=$(dust_power "$((SX + 2))" 101 139)
+echo "  full display wire: $(ctl block "$((SX + 2))" 101 139 | jq -c '{block,state}')" >&2
+[ "$FULL_POWER" = 9 ] || fail "the display wire on a full generator reads power=$FULL_POWER, expected 9 (the ratio clamps to 9)"
+echo "  500,000/500,000 FE: the ratio 10 clamps to 9 on the readout and on the display face's wire"
+
+echo "== AW: the powerlevel refusal and the recipe's parent are parsed =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 141 minecraft:stone" >/dev/null
+ctl wait 4 >/dev/null
+say "rftoolspower powerlevel $SX 101 141"
+LINE=$(await_line "power level there")
+[ -n "$LINE" ] || fail "no refusal for a position with no power level: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+for item in minecraft:glass_pane minecraft:redstone minecraft:redstone_block minecraft:stone; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 8 >/dev/null
+TX2=$((SX + 4)); TY2=101; TZ2=136
+open_crafting_table "$TX2" "$TY2" "$TZ2"
+# " P " / "rAr" / " R ": a glass pane up, redstone beside the centre, a stone where
+# `rftoolsbase:machine_base` belongs, and a redstone block below.
+place_one minecraft:glass_pane 101
+place_one minecraft:redstone 103
+place_one "$STONE" 104
+place_one minecraft:redstone 105
+place_one minecraft:redstone_block 107
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the power level's recipe with a stone where rftoolsbase:machine_base belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the power level's recipe crafted $RESULT without the parent"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  a stone position and the missing parent are the recipe's limit here (RFToolsBase is not in this build)"
+
+echo "PASS: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

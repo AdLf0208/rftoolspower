@@ -303,6 +303,87 @@ impl Monitor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The power level (`PowerLevelTileEntity`)
+// ---------------------------------------------------------------------------
+
+/// The steps the power level's reading takes across the whole store (upstream's `stored * 10`).
+pub const POWER_LEVEL_STEPS: u32 = 10;
+/// The highest a power level shows; upstream clamps the ratio to 0..=9.
+pub const MAX_POWER_LEVEL: i32 = 9;
+/// Ticks before a fresh power level's first observation (upstream's `counter = 20` field).
+pub const FIRST_POWER_OBSERVE_TICKS: u32 = 20;
+/// Ticks between two observations after the first (upstream resets `counter = 10`).
+pub const POWER_OBSERVE_TICKS: u32 = 10;
+
+/// The power level's saved state: the ratio it shows and the tick counter (upstream keeps both
+/// in the tile entity; the counter is saved here because the tick reply discards payload edits
+/// that are not reported as changed).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PowerLevel {
+    /// The ratio the `power` block state mirrors and the redstone output answers, 0…=9.
+    pub power: i32,
+    /// Ticks left until the next observation.
+    pub counter: u32,
+}
+
+impl PowerLevel {
+    /// A fresh power level: ratio 0, and its first observation due in 20 ticks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            power: 0,
+            counter: FIRST_POWER_OBSERVE_TICKS,
+        }
+    }
+
+    /// The ratio upstream's tick sets: `stored * 10 / capacity` in integer arithmetic, clamped
+    /// to 0…=9, and 0 when the target has no capacity (upstream leaves the ratio at 0 when
+    /// `maxEnergy <= 0`). At 250,000 of 500,000 FE this is **5**, not 4.
+    #[must_use]
+    pub fn ratio(stored: u32, capacity: u32) -> i32 {
+        if capacity == 0 {
+            return 0;
+        }
+        // u64: `stored * 10` overflows a u32 for a doctored store above ~429 million FE.
+        let steps = u64::from(stored) * u64::from(POWER_LEVEL_STEPS) / u64::from(capacity);
+        i32::try_from(steps)
+            .unwrap_or(MAX_POWER_LEVEL)
+            .clamp(0, MAX_POWER_LEVEL)
+    }
+
+    /// A power level a saved compound describes, with every doctored value clamped.
+    #[must_use]
+    pub fn restored(power: i32, counter: u32) -> Self {
+        Self {
+            power: power.clamp(0, MAX_POWER_LEVEL),
+            counter: counter.clamp(1, FIRST_POWER_OBSERVE_TICKS),
+        }
+    }
+
+    /// One server tick: count down; true when this tick is an observation and the counter reset.
+    /// The first observation lands at [`FIRST_POWER_OBSERVE_TICKS`], later ones every
+    /// [`POWER_OBSERVE_TICKS`] (upstream's field starts at 20 and is reset to 10).
+    pub fn tick(&mut self) -> bool {
+        self.counter = self.counter.saturating_sub(1);
+        if self.counter == 0 {
+            self.counter = POWER_OBSERVE_TICKS;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply one observation: `None` when the facing block has no energy capability (upstream's
+    /// `setRedstoneState(this, 0)`), else its store and capacity. Returns whether the ratio
+    /// changed.
+    pub fn observe(&mut self, target: Option<(u32, u32)>) -> bool {
+        let before = self.power;
+        self.power = target.map_or(0, |(stored, capacity)| Self::ratio(stored, capacity));
+        self.power != before
+    }
+}
+
 /// What one neighbour of the generator is offered this tick: `min(stored, send)`.
 #[must_use]
 pub fn send_amount(stored: i32, send_per_tick: i32) -> u32 {
@@ -1504,6 +1585,101 @@ mod tests {
         assert!(
             swapped.minimum <= swapped.maximum,
             "a reversed band is ordered, not left impossible"
+        );
+    }
+
+    // --- the power level ---------------------------------------------------
+
+    #[test]
+    fn the_power_level_ratio_is_ten_steps_of_charge() {
+        assert_eq!(PowerLevel::ratio(0, 500_000), 0, "an empty store is 0");
+        assert_eq!(
+            PowerLevel::ratio(250_000, 500_000),
+            5,
+            "half of 500,000 FE is 5 — the artefact's stored * 10 / max, not the brief's 4"
+        );
+        assert_eq!(PowerLevel::ratio(50_000, 500_000), 1, "a tenth is 1");
+        assert_eq!(
+            PowerLevel::ratio(500_000, 500_000),
+            9,
+            "a full store is 10 clamped to 9, never 10"
+        );
+        assert_eq!(
+            PowerLevel::ratio(900_000, 500_000),
+            9,
+            "a doctored store above the capacity still clamps"
+        );
+        assert_eq!(
+            PowerLevel::ratio(1, 3),
+            3,
+            "integer arithmetic, as upstream's (int) cast"
+        );
+        assert_eq!(
+            PowerLevel::ratio(0, 0),
+            0,
+            "no capacity is no reading — upstream's maxEnergy > 0 guard"
+        );
+        assert_eq!(PowerLevel::ratio(5, 0), 0);
+    }
+
+    #[test]
+    fn a_fresh_power_level_observes_at_twenty_ticks_then_every_ten() {
+        let mut level = PowerLevel::new();
+        assert_eq!(level.counter, FIRST_POWER_OBSERVE_TICKS);
+        for tick in 1..FIRST_POWER_OBSERVE_TICKS {
+            assert!(!level.tick(), "tick {tick} is not the first observation");
+        }
+        assert!(level.tick(), "the twentieth tick observes");
+        assert_eq!(
+            level.counter, POWER_OBSERVE_TICKS,
+            "the counter resets to 10"
+        );
+        for tick in 1..POWER_OBSERVE_TICKS {
+            assert!(!level.tick(), "tick {tick} of the second window");
+        }
+        assert!(level.tick(), "the tenth tick of the second window observes");
+        assert_eq!(level.counter, POWER_OBSERVE_TICKS);
+    }
+
+    #[test]
+    fn a_power_level_observation_only_says_changed_when_the_ratio_moved() {
+        let mut level = PowerLevel::new();
+        assert!(
+            level.observe(Some((250_000, 500_000))),
+            "0 -> 5 is a change"
+        );
+        assert_eq!(level.power, 5);
+        assert!(
+            !level.observe(Some((250_000, 500_000))),
+            "the same store changes nothing"
+        );
+        assert!(
+            level.observe(None),
+            "a target that is not an energy block is a change"
+        );
+        assert_eq!(level.power, 0, "upstream's no-capability branch sets 0");
+        assert!(!level.observe(None), "and staying invalid changes nothing");
+        assert!(
+            !level.observe(Some((0, 500_000))),
+            "an empty store is still 0, not a change"
+        );
+        assert!(
+            level.observe(Some((500_000, 500_000))),
+            "0 -> 9 is a change"
+        );
+        assert_eq!(level.power, MAX_POWER_LEVEL);
+    }
+
+    #[test]
+    fn a_doctored_power_level_is_clamped() {
+        let low = PowerLevel::restored(-4, 0);
+        assert_eq!(low.power, 0, "no ratio below 0");
+        assert_eq!(low.counter, 1, "a zero counter is due on the next tick");
+        let high = PowerLevel::restored(99, 999);
+        assert_eq!(high.power, MAX_POWER_LEVEL, "no ratio above 9");
+        assert_eq!(
+            high.counter, FIRST_POWER_OBSERVE_TICKS,
+            "no counter beyond one window"
         );
     }
 

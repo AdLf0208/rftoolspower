@@ -2,7 +2,7 @@
 
 `assets/` and `data/` at the package root are generated from two jars by
 [`tools/assemble_content.py`](tools/assemble_content.py); rerun it to rebuild, or `--check` to
-re-derive into a temporary tree and compare (`ok: 109 entries re-derive exactly`). They ship inside
+re-derive into a temporary tree and compare (`ok: 127 entries re-derive exactly`). They ship inside
 the SDK package `rftoolspower.hmod`, beside `src/` and `horizon-mod.toml`.
 
 The two jars, both MIT, both already in this campaign's licence cache:
@@ -113,6 +113,24 @@ Slice 5 adds the ender monitor:
 | `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.ender_monitor` |
 | `data/minecraft/tags/block/…`, `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | the block in the tags and the tab |
 
+Slice 6 adds the power level display:
+
+| File | What |
+|---|---|
+| `assets/rftoolspower/blockstates/power_level.json` | 40 variants (`facing` four ways × `power` 0–9), all the jar's `power_level_0` plate rotated onto the display side |
+| `assets/rftoolspower/models/block/power_level_0.json` | the jar's 4/16 plate (its screen on the `up` face), the base textures re-pointed into this namespace; models 1–3 differ only in the `up` texture's UV rotation, which a four-way `facing` never needs |
+| `assets/rftoolspower/models/item/power_level.json`, `assets/rftoolspower/items/power_level.json` | the item model and the 26.3 item definition |
+| `assets/rftoolspower/textures/block/monitor/power_level.png` | the plate's screen texture, byte for byte |
+| `data/rftoolspower/horizon/block/power_level.json` | an iron base plate with a `facing` enum and a `power` enum 0–9 (the ratio's carrier, the redstone output's state at this pin); hardness 2.0 / blast 2.0, pickaxe, iron sound; the plate's shape follows `facing` |
+| `data/rftoolspower/recipe/power_level.json` | `" P "/"rAr"/" R "` — a glass-pane tag, redstone, `rftoolsbase:machine_base` and a redstone block |
+| `data/rftoolspower/advancement/recipes/misc/power_level.json` | the recipe unlock, in the 26.3 predicate shape |
+| `data/rftoolspower/loot_table/blocks/power_level.json` | the block drop (plain: upstream keeps no component on its item) |
+| `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.power_level` |
+| `data/minecraft/tags/block/…`, `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | the block in the tags and the tab |
+
+The ten `powerlevel_0..9` textures belong to upstream's `PowerLevelRenderer` (the visual reading),
+which this `machines` slice does not carry; the block model only names the base `power_level.png`.
+
 ## Patched, because 1.21.1 → 26.3 differs
 
 | File | Patch |
@@ -129,7 +147,10 @@ Slice 5 adds the ender monitor:
 ## What the content cannot do alone
 
 - **The monitor's recipe needs `rftoolsbase:machine_base`** (the parent port declares it), so with
-  only this package the pattern crafts nothing (`phase T` proves the negative).
+  only this package the pattern crafts nothing (`phase T` proves the negative). The ender monitor's
+  and the power level's recipes need the same parent item, and both also name a `c:` tag 26.3 does
+  not ship (`#c:chests`/`#c:ender_pearls`, `#c:glass_panes`), so they load with an unresolved-tag
+  error and can never match here (`phase AS`, `phase AW`).
 - **The recipes need `rftoolsbase:machine_frame`** (the generator's and cell1's), an item the
   `rftoolsbase` port's content declares (`data/rftoolsbase/horizon/item/machine_frame.json`). A game
   with only this port has the recipes loaded but uncraftable, so the e2e proves the patterns craft

@@ -1,6 +1,6 @@
 id = "rftoolspower"
 name = "RFTools Power"
-version = "0.1.4"
+version = "0.1.5"
 description = """A port of RFTools Power for Horizon: the Coal Generator, which burns coal, charcoal or a
 coal block for 600 ticks each (nine times that for a block) at 60 FE a tick into a 500,000 FE
 buffer, lights its own front while it burns, takes fuel from a hopper or a right click, gives its
@@ -13,9 +13,10 @@ network — capacity and per-side throughput summed over every cell of it; and t
 Generator with its Pearl Injector: two linked generators, a pearl fired across the link, and the
 5,000,000 FE buffer a pearl pays into when it lands inside the generator's 15-tick charging window
 (200 FE to 25,600 FE depending on where in the window it hits), the pearl then held for 500 FE a
-tick and fired again on the next redstone pulse; and the Ender Monitor, whose mode (lost / fired /
+tick and fired again on the next redstone pulse; the Ender Monitor, whose mode (lost / fired /
 arrived) decides which of those events it reports as a redstone pulse of 15 on its display face for
-exactly one tick."""
+exactly one tick; and the Power Level, which reads the block it faces 20 ticks after placement and
+then every 10 and gives stored * 10 / capacity (0 to 9) straight out of its display face."""
 authors = ["McJty", "Horizon native mod contributors"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside the carried data/ and assets/. The id is the resource namespace and the only identity:
