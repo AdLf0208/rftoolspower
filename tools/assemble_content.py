@@ -217,6 +217,7 @@ LANG = {
     "block.rftoolspower.cell1": "Powercell (Low)",
     "block.rftoolspower.cell2": "Powercell (Medium)",
     "block.rftoolspower.endergenic": "Endergenic",
+    "block.rftoolspower.ender_monitor": "Ender Monitor",
     "block.rftoolspower.pearl_injector": "Pearl Injector",
     "item.rftoolspower.power_core1": "Power Core (Low)",
     "itemGroup.rftoolspower": "RFTools Power",
@@ -231,6 +232,7 @@ CREATIVE_TAB = {
         "rftoolspower:cell1",
         "rftoolspower:cell2",
         "rftoolspower:endergenic",
+        "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
         "rftoolspower:power_core1",
     ],
@@ -244,6 +246,7 @@ TAGS = {
         "rftoolspower:cell1",
         "rftoolspower:cell2",
         "rftoolspower:endergenic",
+        "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
     ],
     "data/minecraft/tags/block/needs_iron_tool.json": [
@@ -252,6 +255,7 @@ TAGS = {
         "rftoolspower:cell1",
         "rftoolspower:cell2",
         "rftoolspower:endergenic",
+        "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
     ],
 }
@@ -320,6 +324,46 @@ INJECTOR_CUBE = {
         "up": "rftoolspower:block/base/machinetop",
         "west": "rftoolspower:block/base/machineside",
     },
+}
+
+# `EnderMonitorTileEntity` is a `LogicSlabBlock`: a 4/16 plate mounted on the face it was clicked
+# against, with the display on its outward face. Its `logic_facing` state has 24 values (six mount
+# faces × four display directions); this slice mounts it on a horizontal face only, so its `facing`
+# is the **display** direction and the plate sits on the opposite side. The jar's own bottom-plate
+# model is rotated by the same x/y pair the jar's blockstate uses for that display direction
+# (`facing=east` is the jar's `east_*` geometry), so the plate really is against the generator.
+ENDER_MONITOR = "ender_monitor"
+ENDER_MONITOR_ROTATION = {
+    "north": {"x": -90},
+    "south": {"x": 90},
+    "east": {"x": 90, "y": 270},
+    "west": {"x": 90, "y": 90},
+}
+# A 4/16 plate on the side the display faces away from.
+ENDER_MONITOR_SHAPES = {
+    "north": [[0.0, 0.0, 0.75, 1.0, 1.0, 1.0]],
+    "south": [[0.0, 0.0, 0.0, 1.0, 1.0, 0.25]],
+    "east": [[0.0, 0.0, 0.0, 0.25, 1.0, 1.0]],
+    "west": [[0.75, 0.0, 0.0, 1.0, 1.0, 1.0]],
+}
+
+ENDER_MONITOR_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "state_properties": {
+        "facing": {"type": "enum", "values": ["north", "south", "east", "west"]},
+        "lit": {"type": "boolean"},
+    },
+    "default_state": {"facing": "north", "lit": "false"},
+    # `shapes` is the outline *and* the collision box at this pin (`BlockShapes`: "per-state
+    # outline and collision boxes"); there is no separate collision key in the loader.
+    "shapes": {"property": "facing", "values": ENDER_MONITOR_SHAPES},
+    "item": True,
 }
 
 
@@ -552,6 +596,46 @@ def build(out: Path) -> None:
             out / f"data/rftoolspower/advancement/recipes/misc/{name}.json",
             json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{name}.json")),
         )
+
+    # --- the ender monitor: the jar's plate model and texture, a facing/lit blockstate (the plate
+    # rotated onto the display side), its declaration, loot, recipe and advancement. Models 1–3 of
+    # the jar differ only in the display texture's UV rotation, which a horizontal-only `facing`
+    # never needs; model 0 carries it.
+    variants = {}
+    for facing, rotation in ENDER_MONITOR_ROTATION.items():
+        for lit in ("false", "true"):
+            variant = {"model": f"rftoolspower:block/{ENDER_MONITOR}_0", **rotation}
+            variants[f"facing={facing},lit={lit}"] = variant
+    write(out / f"assets/rftoolspower/blockstates/{ENDER_MONITOR}.json", {"variants": variants})
+    model = json.loads(
+        read_jar(POWER, f"assets/rftoolspower/models/block/{ENDER_MONITOR}_0.json")
+    )
+    model["textures"] = {
+        key: value.replace("rftoolsbase:block/base/", "rftoolspower:block/base/")
+        for key, value in model["textures"].items()
+    }
+    write(out / f"assets/rftoolspower/models/block/{ENDER_MONITOR}_0.json", model)
+    write(
+        out / f"assets/rftoolspower/models/item/{ENDER_MONITOR}.json",
+        {"parent": f"rftoolspower:block/{ENDER_MONITOR}_0"},
+    )
+    write(
+        out / f"assets/rftoolspower/items/{ENDER_MONITOR}.json",
+        {"model": {"model": f"rftoolspower:item/{ENDER_MONITOR}", "type": "minecraft:model"}},
+    )
+    binary(
+        out / "assets/rftoolspower/textures/block/endergenic/ender_monitor.png",
+        read_jar(POWER, "assets/rftoolspower/textures/block/endergenic/ender_monitor.png"),
+    )
+    write(out / f"data/rftoolspower/horizon/block/{ENDER_MONITOR}.json", ENDER_MONITOR_DECL)
+    write(out / f"data/rftoolspower/loot_table/blocks/{ENDER_MONITOR}.json", plain_loot(ENDER_MONITOR))
+    write(out / f"data/rftoolspower/recipe/{ENDER_MONITOR}.json", patched_recipe(ENDER_MONITOR))
+    write(
+        out / f"data/rftoolspower/advancement/recipes/misc/{ENDER_MONITOR}.json",
+        json.loads(
+            read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{ENDER_MONITOR}.json")
+        ),
+    )
 
 
 def ingredient(value: object) -> object:

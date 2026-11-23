@@ -1040,6 +1040,139 @@ pub const fn pearl_lost(seed: u64) -> bool {
     chance_roll(seed) <= CHANCE_LOST
 }
 
+// ---------------------------------------------------------------------------
+// The ender monitor (`EnderMonitorTileEntity`, `EnderMonitorMode`, `EnderMonitorData`)
+// ---------------------------------------------------------------------------
+
+/// The strongest signal the monitor's one-tick output gives (`support.setRedstoneState(this, 15)`).
+pub const MONITOR_SIGNAL: i32 = 15;
+
+/// What an ender monitor watches: one of upstream's three `EnderMonitorMode`s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MonitorMode {
+    /// A pearl was dropped (`MODE_LOSTPEARL`).
+    #[default]
+    LostPearl,
+    /// A pearl left a generator (`MODE_PEARLFIRED`).
+    PearlFired,
+    /// A pearl landed on a generator, inside or outside its window (`MODE_PEARLARRIVED`).
+    PearlArrived,
+}
+
+impl MonitorMode {
+    /// The three modes, in upstream's declaration order.
+    pub const ALL: [Self; 3] = [Self::LostPearl, Self::PearlFired, Self::PearlArrived];
+
+    /// The mode's serialised name, which is what upstream's `StringRepresentable` codec writes.
+    #[must_use]
+    pub const fn saved(self) -> &'static str {
+        match self {
+            Self::LostPearl => "MODE_LOSTPEARL",
+            Self::PearlFired => "MODE_PEARLFIRED",
+            Self::PearlArrived => "MODE_PEARLARRIVED",
+        }
+    }
+
+    /// The mode a saved string names.
+    #[must_use]
+    pub fn parse_saved(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.saved() == text)
+    }
+
+    /// The word `/rftoolspower endermonitor` accepts: `lost`, `fired`, `arrived`.
+    #[must_use]
+    pub const fn command_name(self) -> &'static str {
+        match self {
+            Self::LostPearl => "lost",
+            Self::PearlFired => "fired",
+            Self::PearlArrived => "arrived",
+        }
+    }
+
+    /// The mode a command word names.
+    #[must_use]
+    pub fn parse_command(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.command_name() == text)
+    }
+}
+
+/// The ender monitor's saved state: the mode it watches, the pulse it owes and the readout's
+/// counters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnderMonitor {
+    /// The mode it watches.
+    pub mode: MonitorMode,
+    /// Upstream's saved `needPulse`: an event it watches happened and this tick owes 15.
+    pub need_pulse: bool,
+    /// How many one-tick outputs it has given (the readout's counter).
+    pub pulses: u32,
+    /// The mode of the last event it armed for.
+    pub last: Option<MonitorMode>,
+}
+
+impl EnderMonitor {
+    /// A fresh monitor: watches lost pearls, owes no pulse (upstream's attachment default).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            mode: MonitorMode::LostPearl,
+            need_pulse: false,
+            pulses: 0,
+            last: None,
+        }
+    }
+
+    /// `fireFromEndergenic(mode)`: arm the next tick only when this is the mode it watches.
+    ///
+    /// True when it armed.
+    pub fn notice(&mut self, mode: MonitorMode) -> bool {
+        if self.mode != mode {
+            return false;
+        }
+        self.need_pulse = true;
+        self.last = Some(mode);
+        true
+    }
+
+    /// One server tick: spend an owed pulse as [`MONITOR_SIGNAL`] for this tick, else 0.
+    pub fn tick(&mut self) -> i32 {
+        if !self.need_pulse {
+            return 0;
+        }
+        self.need_pulse = false;
+        self.pulses += 1;
+        MONITOR_SIGNAL
+    }
+
+    /// The state a saved compound describes.
+    ///
+    /// A "last" mode is kept while it still describes something: a pulse already given, or the one
+    /// the next tick owes (a notice is written a tick before the tick spends it). A saved "last"
+    /// with neither is a doctored save and is dropped — in game this rule was written the wrong way
+    /// round first, and the e2e caught it: the notice wrote `last=arrived` with `pulses=0`, the
+    /// tick's own read dropped it, and the monitor then read `pulses=1 last=none`.
+    #[must_use]
+    pub fn restored(
+        mode: MonitorMode,
+        need_pulse: bool,
+        pulses: u32,
+        last: Option<MonitorMode>,
+    ) -> Self {
+        Self {
+            mode,
+            need_pulse,
+            pulses,
+            last: if pulses == 0 && !need_pulse {
+                None
+            } else {
+                last
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1924,5 +2057,136 @@ mod tests {
             generator.gained - generator.spent,
             i64::from(generator.energy)
         );
+    }
+
+    // --- the ender monitor ---------------------------------------------------
+
+    #[test]
+    fn a_fresh_ender_monitor_watches_the_lost_pearl() {
+        let monitor = EnderMonitor::new();
+        assert_eq!(
+            monitor.mode,
+            MonitorMode::LostPearl,
+            "upstream's attachment default is MODE_LOSTPEARL"
+        );
+        assert!(!monitor.need_pulse);
+        assert_eq!(monitor.pulses, 0);
+        assert_eq!(monitor.last, None);
+    }
+
+    #[test]
+    fn the_monitor_mode_parses_the_command_words_and_the_saved_names() {
+        assert_eq!(
+            MonitorMode::parse_command("lost"),
+            Some(MonitorMode::LostPearl)
+        );
+        assert_eq!(
+            MonitorMode::parse_command("fired"),
+            Some(MonitorMode::PearlFired)
+        );
+        assert_eq!(
+            MonitorMode::parse_command("arrived"),
+            Some(MonitorMode::PearlArrived)
+        );
+        assert_eq!(
+            MonitorMode::parse_command("Lost Pearl"),
+            None,
+            "upstream's GUI label is not a command word"
+        );
+        assert_eq!(MonitorMode::PearlArrived.command_name(), "arrived");
+        assert_eq!(
+            MonitorMode::parse_saved("MODE_PEARLARRIVED"),
+            Some(MonitorMode::PearlArrived)
+        );
+        assert_eq!(
+            MonitorMode::parse_saved("arrived"),
+            None,
+            "the saved name is the enum's, not the command's"
+        );
+    }
+
+    #[test]
+    fn a_notice_arms_only_the_mode_the_monitor_watches() {
+        let mut monitor = EnderMonitor::new();
+        assert!(
+            !monitor.notice(MonitorMode::PearlArrived),
+            "it watches lost pearls"
+        );
+        assert!(!monitor.need_pulse);
+        assert_eq!(monitor.last, None);
+        assert!(monitor.notice(MonitorMode::LostPearl));
+        assert!(monitor.need_pulse);
+        assert_eq!(monitor.last, Some(MonitorMode::LostPearl));
+    }
+
+    #[test]
+    fn the_pulse_is_fifteen_for_exactly_one_tick() {
+        let mut monitor = EnderMonitor::new();
+        monitor.mode = MonitorMode::PearlArrived;
+        assert_eq!(monitor.tick(), 0, "nothing has happened yet");
+        assert!(monitor.notice(MonitorMode::PearlArrived));
+        assert_eq!(monitor.tick(), MONITOR_SIGNAL);
+        assert!(!monitor.need_pulse, "the tick spent it");
+        assert_eq!(monitor.tick(), 0, "the next tick is silent");
+        assert_eq!(monitor.tick(), 0);
+        assert_eq!(monitor.pulses, 1);
+    }
+
+    #[test]
+    fn two_notices_before_a_tick_make_one_pulse() {
+        let mut monitor = EnderMonitor::new();
+        monitor.mode = MonitorMode::LostPearl;
+        assert!(monitor.notice(MonitorMode::LostPearl));
+        assert!(monitor.notice(MonitorMode::LostPearl));
+        assert_eq!(monitor.tick(), MONITOR_SIGNAL);
+        assert_eq!(monitor.tick(), 0);
+        assert_eq!(monitor.pulses, 1, "one owed pulse, one output");
+    }
+
+    #[test]
+    fn a_monitor_watching_another_mode_never_pulses() {
+        let mut monitor = EnderMonitor::new();
+        for _ in 0..5 {
+            assert!(!monitor.notice(MonitorMode::PearlFired));
+            assert_eq!(monitor.tick(), 0);
+        }
+        assert_eq!(monitor.pulses, 0);
+        assert_eq!(monitor.last, None);
+    }
+
+    #[test]
+    fn a_doctored_monitor_reads_back_without_a_phantom_last_mode() {
+        // The armed-but-not-yet-pulsed state keeps its `last`: the notice is written a tick before
+        // the tick spends it, and dropping it there loses the event's name (the e2e caught this).
+        let armed = EnderMonitor::restored(
+            MonitorMode::PearlFired,
+            true,
+            0,
+            Some(MonitorMode::PearlArrived),
+        );
+        assert_eq!(armed.mode, MonitorMode::PearlFired);
+        assert!(armed.need_pulse);
+        assert_eq!(armed.pulses, 0);
+        assert_eq!(
+            armed.last,
+            Some(MonitorMode::PearlArrived),
+            "an owed pulse still names its event"
+        );
+        // A saved "last" with neither a pulse given nor one owed describes nothing.
+        let doctored = EnderMonitor::restored(
+            MonitorMode::PearlFired,
+            false,
+            0,
+            Some(MonitorMode::PearlArrived),
+        );
+        assert_eq!(doctored.last, None);
+        let kept = EnderMonitor::restored(
+            MonitorMode::PearlFired,
+            false,
+            3,
+            Some(MonitorMode::PearlFired),
+        );
+        assert_eq!(kept.pulses, 3);
+        assert_eq!(kept.last, Some(MonitorMode::PearlFired));
     }
 }

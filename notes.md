@@ -1,7 +1,7 @@
 # RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
-# powercell; slice 4: the endergenic generator and the pearl injector)
+# powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor)
 
-> **Current state (2026-11-22): slice 4, package 0.1.3 at pin
+> **Current state (2026-11-23): slice 5, package 0.1.4 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
 > generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
 > (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
@@ -10,9 +10,12 @@
 > of an `OUTPUT` face; slice 4 adds the mod's signature mechanic, the **endergenic generator** with
 > its **pearl injector**: two linked generators, a redstone pulse that starts a 15-mode charge and
 > one that fires the held pearl, and the `rfPerHit` table that pays 200…25,600 FE for a pearl that
-> lands inside the window (and nothing for one that lands outside it). Where upstream's smart
+> lands inside the window (and nothing for one that lands outside it); slice 5 adds the **ender
+> monitor**, the block that watches one of the generator's three events (lost / fired / arrived)
+> and answers it with **15 on its display face for exactly one tick**. Where upstream's smart
 > wrench is needed (the link, the cell's face modes), the harness uses commands —
-> `/rftoolspower enderlink`, `/rftoolspower side` — and never a fake item.
+> `/rftoolspower enderlink`, `/rftoolspower side` — and never a fake item; the monitor's GUI picker
+> is `/rftoolspower endermonitor <pos> <mode|status> [nonce]`.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -35,8 +38,8 @@ MIT (`5195ba53…4b00`), and the provenance is in [`LICENSE-NOTICE.md`](LICENSE-
 to the campaign's maintainer approval (ARCHITECTURE.md §8).
 
 Status: **ported-partial** — the coal generator (A–M), the power monitor plus the generator's
-energy push (N–T), the powercell (U–AD) and the endergenic pair (AE–AM) are implemented and
-verified in game at the current pin. The gap list below is the rest of the mod.
+energy push (N–T), the powercell (U–AD), the endergenic pair (AE–AM) and the ender monitor (AN–AS)
+are implemented and verified in game at the current pin. The gap list below is the rest of the mod.
 
 ## What the powercell binds to (the 2026-11-21 parent-surface ruling)
 
@@ -620,6 +623,145 @@ None adopted. Three *documented* deviations:
   height, so the injector's front is horizontal; the `findEndergenicTileEntity` UP fallback still
   works for a generator above it.
 
+## Slice 5 — the ender monitor (package 0.1.4)
+
+Gap line it comes from (`## Gaps` below): **gap 10** — *"Still open in this family: the **ender
+monitor** (`EnderMonitorTileEntity`: three modes …)`"*, phase 2 of the endergenic family, together
+with the `fireMonitors` notice the generator left as a no-op. Tier: still **machines** — one block
+entity with a server tick, saved state, a block state mirror and a redstone output. No GUI, no
+renderer, no item carrier.
+
+### What it does (upstream `EnderMonitorTileEntity`, `EnderMonitorMode`, `EnderMonitorData`,
+`EndergenicTileEntity.fireMonitors`, 1.21-7.0.6)
+
+- **The block.** `rftoolspower:ender_monitor` on the iron base template: a thin plate (4/16) whose
+  `facing` is the **display** side (upstream's `logic_facing`), plus a boolean `lit` the port
+  mirrors the one-tick output into (upstream has no such state; slice 2's monitor mirrors its alarm
+  the same way). The generator it watches is behind the display, as upstream's `getInputSide()`.
+- **The mode.** Three values, saved under upstream's own serialised names: `MODE_LOSTPEARL`
+  (default, the attachment's initialiser), `MODE_PEARLFIRED`, `MODE_PEARLARRIVED`. The GUI's picker
+  is the harness stand-in `/rftoolspower endermonitor <pos> <mode> <nonce>`.
+- **`needPulse`.** The generator's `fireFromEndergenic(mode)` sets it only when the mode the monitor
+  watches just happened; the monitor's next tick spends it as **15** on its redstone output for
+  exactly that tick, then 0 — the *one* tick this slice is about. Two notices before a tick still
+  make one pulse; a monitor watching another mode is never armed.
+- **`fireMonitors`.** After each event the generator walks its six neighbours and arms the monitor
+  at `pos + dir` whose display faces `dir` (upstream's `inputSide == dir.getOpposite()`). The three
+  events: a discarded pearl (`lost`), a real launch from a pulse or the injector (`fired`), and a
+  landing (`arrived` — fired **before** the landing branch, so a pearl that lands while idle pulses
+  both `arrived` and `lost`, upstream's order).
+- **The signal's face.** Upstream answers `getRedstoneOutput` on the input side while
+  `setRedstoneState` notifies the opposite one; this port follows the notify side (the display face)
+  for both, the same fix slice 2 recorded for the power monitor. A lamp on the display face lights
+  on the pulse's tick and is dark again on the next.
+- **The item.** A broken monitor's own item carries its **mode** (`minecraft:block_entity_data`
+  naming `rftoolspower:ender_monitor_block_entity`), which placing restores — upstream keeps the
+  mode on the block's item. A default (`lost`) monitor carries nothing; the readout's pulse/last
+  counters are this port's and stay on the block.
+- **The readout.** `/rftoolspower endermonitor <pos> status <nonce>` prints
+  `mode/facing/pulses/last/needpulse/out/t` in one line; a mode word in place of `status` sets the
+  mode and answers the same line. Both are the harness's stand-ins for the GUI, and the nonce is
+  what makes a reply provably fresh.
+
+### Numbers and where they came from
+
+| Number | Value | Source |
+|---|---:|---|
+| the one-tick signal | 15 | `support.setRedstoneState(this, 15)` in `tickOnServer` |
+| the modes | 3, default `MODE_LOSTPEARL` | `EnderMonitorMode`, `AttachmentType.builder(() -> new EnderMonitorData(MODE_LOSTPEARL))` |
+| the saved keys | `mode`, `needPulse` | `EnderMonitorData`'s fields |
+| the plate | 4/16 on the side away from the display | upstream's `VoxelShape` box |
+| monitor hardness | 2.0 / 2.0, pickaxe, iron sound | `EndergenicModule`'s monitor block (`STANDARD_IRON`) |
+| monitor recipe | ender pearl / redstone / redstone torch / machine base (`" o "/"rAr"/"TrT"`) | `EndergenicModule.initDatagen` |
+
+### Red → green
+
+The monitor's rules were stubbed `todo!()` behind their tests; the failing run is
+`ports/_shared/evidence/rftoolspower/red-endermonitor.log`:
+
+```
+test result: FAILED. 74 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+not yet implemented
+```
+
+Green: **87 passed; 0 failed** (`sdk-test.log`, which prints the package sha). The seven tests pin:
+a fresh monitor's default mode and empty counters; the command words versus the saved names; the
+mode gate (a notice for another mode arms nothing); the pulse as 15 for exactly one tick; two
+notices before a tick as one pulse; a monitor watching another mode never pulsing; and a doctored
+save (an owed pulse keeps its `last`, a phantom one is dropped). Two more in `support`: the saved
+compound round-trip and its clamp, and the mode on the broken item's payload. The mode-on-item test
+also pins that the readout's counters do **not** travel.
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `native-build` reported `Compiling rftoolspower (1 of 1)` and
+installed `native-0a875da-574eb87eae42`; the two-mod e2e build is
+`native-0a875da-aa42b6d48852` (`rfpowerharness`, `rftoolspower`), and its `native-mods.json` names
+version **0.1.4**.
+
+| log | verdict |
+|---|---|
+| `e2e-endermonitor.log` | **PASS**, `EXIT:0` — phases A–AS (the whole port) |
+| `e2e-endermonitor-selftest.log` | `FAIL: selftest: the monitor lit for 1 sample(s), so the one-tick assertion is alive`, `EXIT:1` |
+| `e2e-endermonitor-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` (the unmodded Nightly) |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=14 ok=14 missing-exit=0 bad-exit=0`.
+
+The parsed assertions, each from a `ctl` reply:
+
+| phase | what it asserts (observed) |
+|---|---|
+| AN | three monitors placed from their items on the generators' sides: a bare item reads the default `lost`; an item carrying `mode=MODE_PEARLFIRED` reads `fired` with no command; the command sets `arrived` on B's east monitor and on the mis-facing one. Breaking the `fired` monitor in survival drops an item whose `SelectedItem` carries `id: rftoolspower:ender_monitor_block_entity, mode: "MODE_PEARLFIRED"`; re-placing it reads `fired` with 0 pulses |
+| AO | one pearl fired across the link: the 16 consecutive server ticks sampled while the game is frozen read `'0010000000000000'` — the display face's `lit` state true in **exactly one** tick and false before and after; the same window on the lamp beside it reads `'001111…'` (vanilla's 4-tick lamp) and goes dark; the source's `fired` monitor pulsed with it, the mis-facing one stayed at 0; the destination gained 200 FE |
+| AP | the differential: the same shot with that monitor's mode set to `lost` samples `'0000000000000000'` (0 of 16 lit) while the shot still lands; the source's `fired` monitor recorded the extra shot. A random discard (upstream's 0.6 % a tick) can pulse a `lost` monitor, so an attempt where the drop reason names it is retried, and the transcript says which event the counter names |
+| AQ | a pearl that lands while the destination is idle: the generator records `dropped=1 reason="Pearl arrived while idle"`, the `arrived` monitor goes 3 → 4 (upstream notifies before the miss) and the `lost` monitor gives its 1, the mis-facing one stays 0 |
+| AR | the refusals are parsed replies: no monitor at a stone position, and `unknown mode 'wrong' (lost\|fired\|arrived\|status)`; the refused mode changes nothing |
+| AS | the monitor's carried recipe with a stone where `rftoolsbase:machine_base` belongs crafts nothing |
+| AM | after save + quit + relaunch the arrived monitor still watches `arrived` with its 4 pulses, the lost one `lost` with 1 |
+
+Counterfactual: `SELFTEST_ENDERMON=1` asserts the monitor never lit and the leg fails as designed, so
+AO's one-tick assertion can fail; AP is AO's differential (the same shot with another mode), and the
+control leg proves A is not vacuous.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **A re-placed picked-up block keeps the *game's* placement yaw, not the harness's.**
+   `place_held` put the broken monitor back facing east, so it watched the wrong side and never
+   pulsed; the leg re-places it through `place_endermonitor`, which pins the display face after the
+   placement (the same trap as the first placement, now proven for a picked-up item too).
+2. **A reply that arrives a few ticks late is the previous call's line, and a timestamp is not a
+   nonce.** The first version compared the reply's `t` with the last accepted one, which accepted an
+   older command's pending reply (a `pulses=2` read where the truth was 3: the real reply at
+   `t=6625` arrived after the read had already accepted a pending `t=6533`). The command now takes
+   the harness's nonce (`status <nonce>`, or a mode plus the nonce) and every read awaits its own
+   nonce exactly as the other readouts do.
+3. **The random discard can legitimately pulse the differential's monitor.** A landed pearl is held
+   and upstream's 0.6 %-a-tick discard fires `lost`; a `lost` monitor therefore may pulse after the
+   arrival. The differential treats that attempt as inconclusive (named by the drop reason, retried
+   up to three times) and the counter check distinguishes `last=arrived` (no event) from
+   `last=lost` (the discard), so the arrival itself can never be mistaken for either.
+4. **`tick step 1` sampling is exact, but the `state` reply's `ticks` is the client's clock.** The
+   frozen window steps the server once per sample; the sample labels advance ~2 per step because the
+   client keeps running, so they are a cross-check, not the cadence.
+
+### Upstream defects fixed (slice 5)
+
+**The signal's face.** The same disagreement slice 2 fixed on the power monitor:
+`EnderMonitorTileEntity.getRedstoneOutput` answers on the input side (the generator's side) while
+`LogicSupport.setRedstoneState` notifies `getInputSide().getOpposite()` (the display side). The port
+answers and notifies on the display face, so a lamp beside the monitor lights. A user notices: the
+monitor's one-tick pulse reaches a lamp or wire on its free face.
+
+Three *documented* deviations (not defects):
+
+- **No GUI.** The mode picker is `/rftoolspower endermonitor <pos> <mode> <nonce>`; a click prints
+  the status line.
+- **The item carries the mode only.** Upstream's mode rides on the block's item; the readout's
+  `pulses`/`last` counters are this port's addition, so they stay on the block and a placed item
+  starts at 0.
+- **The `status` action and the nonce** are harness-only command words (upstream has no command at
+  all); they exist so a one-tick state can be sampled and read back safely.
+
 ## Engines traps this slice cost (measured, not read)
 
 1. **Creative keeps the container stack.** `ItemPlace::PlayerHand.extract` follows vanilla's
@@ -678,10 +820,10 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
 10. ~~**The endergenic generator with the pearl injector**~~ — **ported in slice 4** (the charge
     window, the hit table, the flight, the hold, the link, the push with its 2,000 FE reserve, and
     the injector's 18-slot buffer; the wrench's link is the `/rftoolspower enderlink` command).
-    Still open in this family: the **ender monitor** (`EnderMonitorTileEntity`: three modes —
-    `MODE_LOSTPEARL`/`MODE_PEARLFIRED`/`MODE_PEARLARRIVED` — where `fireFromEndergenic` sets
-    `needpulse` when the mode it watches just happened and the tick puts **15** on its redstone
-    output for that one tick, plus the `fireMonitors` notice the generator owes its neighbours), the
+    ~~**The ender monitor**~~ — **ported in slice 5** (the three modes, the mode gate, the saved
+    `needPulse` spent as 15 for one tick on the display face, the `fireMonitors` notice at all
+    three events, and the mode on the broken item; the GUI picker is
+    `/rftoolspower endermonitor <pos> <mode|status> [nonce]`). Still open in this family: the
     **endergenic GUI** (`GuiEndergenic`: the stats list, the destination display) and its
     **renderer** (the floating pearl, the good/bad flash), the **infusable factors** in the hold and
     the gain (no upgrade slot in this port), and the **5-second statistics window** the HUD averages.
@@ -709,10 +851,26 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
 | persistence of the store, the arrival mode and the link | tested (AM: save + quit + relaunch) |
 | the `endergenic`, `injector` and `enderlink` commands and their refusals | tested (AE–AM every line parsed by `tools/parse_ender.py`/`parse_injector.py`; AL the three refusals) |
 | the two recipes | `blocked(rftoolsbase:machine_frame-absent)`: the endergenic's also needs `rftoolsbase:infused_enderpearl` and an empty `#c:ender_pearls`, the injector's an empty `#c:chests` — AK proves both patterns craft nothing here |
-| the ender monitor, its three modes and the `fireMonitors` notice | not ported (gap 10, phase 2 of this family) |
+| the ender monitor, its three modes and the `fireMonitors` notice | tested (AN–AQ: the mode from its item and the command, the one-tick pulse, the lost differential, the idle landing that pulses both modes; see the ender-monitor table below) |
 | the endergenic GUI, the stats window and the renderer (the floating pearl, the good/bad flash) | not ported (gap 10; no GUI and no renderer in a `machines` slice) |
 | the infusable factors on the hold and the gain | not ported (gap 3) |
 | the comparator output and TOP/Jade | not ported (gap 6) |
+
+## Coverage of the ender monitor family (slice 5)
+
+| family | state |
+|---|---|
+| `ender_monitor`: block, item, blockstate (four `facing` × `lit`), the plate model and texture, tags, creative tab, lang | tested (AN: three placed from their items and read back, facings pinned; the item's mode carries the placement) |
+| the three modes, the default `MODE_LOSTPEARL` | tested (AN: a bare item reads `lost`; unit tests pin the saved names and the default) |
+| the mode gate: only the mode it watches arms | tested (AP: the same shot with `lost` samples 0 of 16 lit; the unit test pins a notice for another mode arming nothing) |
+| `needPulse` spent as 15 for exactly one tick | tested (AO: `'0010000000000000'` — one lit tick of 16 consecutive server ticks; the unit test pins 15 and that the next tick is silent) |
+| the redstone output on the display face | tested (AO: the lamp beside it reads `'001111…'` and goes dark; the second shot samples the lamp itself) |
+| the `fireMonitors` notice for a landing, a fire and a loss | tested (AO `arrived` + `fired`; AQ the idle landing pulses `arrived` and `lost`) |
+| the mode on the broken monitor's item, and the counters staying on the block | tested (AN: a survival break drops an item carrying `id` + `mode`, re-placing reads `fired` with 0 pulses; the unit test pins the payload) |
+| the `endermonitor` command (`status`/mode/nonce) and its refusals | tested (AN, AP, AQ, AR: every line parsed by `tools/parse_endermonitor.py`; AR the two refusals) |
+| persistence of the mode and the counters | tested (AM: save + relaunch, `arrived` with 4 pulses and `lost` with 1) |
+| the recipe | `blocked(rftoolsbase:machine_base-absent)` (AS proves the pattern crafts nothing) |
+| the GUI (`GuiEndergenic`/monitor screen), the renderer, TOP/Jade | not ported (gap 10/6; no GUI or renderer in a `machines` slice) |
 
 ## Coverage of the coal generator family
 
@@ -773,26 +931,26 @@ None adopted: every rule in this slice is upstream's own. Two *documented* devia
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
 
-## Verification (slice 4 run)
+## Verification (slice 5 run)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **74 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **87 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 122,516 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.3 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 134,377 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.4 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
 | `verify-sdk-package.py rftoolspower` | **1/1** |
-| the leg | `PASS` + `EXIT:0`; `SELFTEST_ENDER=1` `EXIT:1`; control `EXIT:1`; `--strict` 11/11 |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST_ENDERMON=1` `EXIT:1`; control `EXIT:1`; `--strict` 14/14 |
 
-## Artifact (0.1.3)
+## Artifact (0.1.4)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 122,516 B | `ab452bd8913d68820359293365a983d30d8c47bfa729bb2053c1039276c45af0` | 87 |
+| `rftoolspower.hmod` (port root) | 134,377 B | `e1c6015697ba7825e07e6b58f0ca25daa89c7617c6880a90af4fec6968b1c9b2` | 96 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1, `src/runtime.rs` byte-identical in
-the archive. The 0.1.2 artifact (100,317 B, `989543d7…`, 69 entries) is the slice-3 record; its
-gates are kept as `sdk-*-0.1.1.log` beside this run's.
+the archive. The 0.1.3 artifact (122,516 B, `ab452bd8…`, 87 entries) is the slice-4 record; the
+0.1.2 (100,317 B, `989543d7…`, 69 entries) and 0.1.1 records are kept in `notes.md`.

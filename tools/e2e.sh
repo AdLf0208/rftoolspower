@@ -73,9 +73,25 @@
 #  AL the enderlink command's refusals are parsed replies (a stone, a 5-tick link, no generator)
 #  AM the store and the link survive save + relaunch
 #
+#  AN an ender monitor placed on a generator's side reads the default `lost` mode, and the
+#     `endermonitor` command sets each of the three modes (arrived on the destination, lost and a
+#     mis-facing one beside it, fired on the source); a broken monitor's item carries its mode and
+#     placing it restores it
+#  AO one pearl fired across the link pulses the destination's `arrived` monitor for exactly one
+#     tick (a per-tick sample of its `lit` state and of the lamp on its display face) and the
+#     source's `fired` monitor; the `lost` and the mis-facing monitors never pulse
+#  AP the differential: the same shot with that monitor's mode set to `lost` does not pulse it,
+#     while the shot still lands and is recorded as an arrival (an attempt where upstream's random
+#     pearl discard fired the lost monitor is named and retried; the arrival itself must not)
+#  AQ a pearl that lands while the destination is idle pulses the `arrived` monitor (upstream
+#     fires it before the miss) and the `lost` monitor, and the generator records the loss
+#  AR the `endermonitor` command's refusals are parsed replies, and a refused mode changes nothing
+#  AS the ender monitor's carried recipe needs `rftoolsbase:machine_base`, so it crafts nothing here
+#
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
-# of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF.
+# of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF;
+# SELFTEST_ENDERMON=1 inverts AO (the monitor must not have lit).
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -90,6 +106,7 @@ TMP=${E2E_TMP:-/tmp/opencode}
 SOCK=${SOCK:-$TMP/rftoolspower-e2e.sock}
 SELFTEST=${SELFTEST:-0}
 SELFTEST_MONITOR=${SELFTEST_MONITOR:-0}
+SELFTEST_ENDERMON=${SELFTEST_ENDERMON:-0}
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
 WORLD=RFToolsPowerE2E
@@ -255,6 +272,33 @@ clear_mobs() {
     ctl command "execute in minecraft:the_end run kill @e[type=!player]" >/dev/null 2>&1 || true
     ctl wait 2 >/dev/null
 }
+
+# Open a crafting table at X Y Z for the player standing beside it. `ctl interact` races the
+# teleport under load (this run's first attempt answered "0 grid slots" once), so the table is
+# re-set and the click retried; a block that is really there and a click that landed opens the grid.
+open_crafting_table() { # X Y Z
+    local x=$1 y=$2 z=$3 attempt grid
+    for attempt in 1 2 3; do
+        ctl close >/dev/null 2>&1 || true
+        ctl setblock "$x" "$y" "$z" minecraft:air >/dev/null
+        ctl setblock "$x" "$y" "$z" minecraft:crafting_table >/dev/null
+        ctl wait 2 >/dev/null
+        if [ "$(block_name "$x" "$y" "$z")" != "minecraft:crafting_table" ]; then
+            echo "  the crafting table at $x,$y,$z did not place (attempt $attempt)" >&2
+            ctl wait 20 >/dev/null
+            continue
+        fi
+        ctl command "execute in minecraft:the_end run tp @s $((x - 1)).5 $y $((z)).5" >/dev/null
+        ctl wait 4 >/dev/null
+        ctl interact "$x" "$y" "$z" >/dev/null || fail "the crafting table did not take the click"
+        ctl wait 6 >/dev/null
+        grid=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
+        [ "$grid" = 10 ] && return 0
+        echo "  the crafting table's grid did not open ($grid grid slots, attempt $attempt)" >&2
+    done
+    fail "the crafting table at $x,$y,$z never opened its grid"
+}
+
 
 place_block() { # place_block X Y Z ITEM
     local x=$1 y=$2 z=$3 item=$4
@@ -596,15 +640,7 @@ for item in "$COAL" "$STONE" minecraft:redstone_torch; do
 done
 ctl wait 8 >/dev/null
 TX=$((SX + 4)); TY=101; TZ=0
-ctl setblock "$TX" "$TY" "$TZ" minecraft:air >/dev/null
-ctl setblock "$TX" "$TY" "$TZ" minecraft:crafting_table >/dev/null
-ctl wait 2 >/dev/null
-ctl command "execute in minecraft:the_end run tp @s $((TX - 1)).5 $TY $((TZ)).5" >/dev/null
-ctl wait 4 >/dev/null
-ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the click"
-ctl wait 6 >/dev/null
-GRID=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
-[ "$GRID" = 10 ] || fail "the crafting table did not open its grid ($GRID grid slots)"
+open_crafting_table "$TX" "$TY" "$TZ"
 # "cTc" / "cFc" / "cTc" on the table's grid (100..108): coals at 100,102,103,105,106,108,
 # redstone torches at 101 and 107, and a stone where `rftoolsbase:machine_frame` belongs (104).
 place_one() { # place_one ITEM CELL
@@ -778,15 +814,7 @@ for item in minecraft:comparator minecraft:redstone minecraft:redstone_block "$S
 done
 ctl wait 8 >/dev/null
 TX=$((SX + 4)); TY=101; TZ=42
-ctl setblock "$TX" "$TY" "$TZ" minecraft:air >/dev/null
-ctl setblock "$TX" "$TY" "$TZ" minecraft:crafting_table >/dev/null
-ctl wait 2 >/dev/null
-ctl command "execute in minecraft:the_end run tp @s $((TX - 1)).5 $TY $((TZ)).5" >/dev/null
-ctl wait 4 >/dev/null
-ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the click"
-ctl wait 6 >/dev/null
-GRID=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
-[ "$GRID" = 10 ] || fail "the crafting table did not open its grid ($GRID grid slots)"
+open_crafting_table "$TX" "$TY" "$TZ"
 # " P " / "rAr" / " R " with a stone where `rftoolsbase:machine_base` belongs.
 place_one minecraft:comparator 101
 place_one minecraft:redstone 103
@@ -1092,15 +1120,7 @@ for item in minecraft:diamond minecraft:redstone minecraft:redstone_block; do
 done
 ctl wait 8 >/dev/null
 TX=$((SX + 4)); TY=101; TZ=78
-ctl setblock "$TX" "$TY" "$TZ" minecraft:air >/dev/null
-ctl setblock "$TX" "$TY" "$TZ" minecraft:crafting_table >/dev/null
-ctl wait 2 >/dev/null
-ctl command "execute in minecraft:the_end run tp @s $((TX - 1)).5 $TY $((TZ)).5" >/dev/null
-ctl wait 4 >/dev/null
-ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the click"
-ctl wait 6 >/dev/null
-GRID=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
-[ "$GRID" = 10 ] || fail "the crafting table did not open its grid ($GRID grid slots)"
+open_crafting_table "$TX" "$TY" "$TZ"
 D0=$(held_count minecraft:diamond); R0=$(held_count minecraft:redstone); B0=$(held_count minecraft:redstone_block)
 # " d " / "rRr" / " r ": a diamond over a redstone block, redstone around it.
 place_one minecraft:diamond 101
@@ -1499,15 +1519,7 @@ for item in minecraft:diamond minecraft:ender_pearl minecraft:stone; do
 done
 ctl wait 8 >/dev/null
 TX=$((SX + 4)); TY=101; TZ=94
-ctl setblock "$TX" "$TY" "$TZ" minecraft:air >/dev/null
-ctl setblock "$TX" "$TY" "$TZ" minecraft:crafting_table >/dev/null
-ctl wait 2 >/dev/null
-ctl command "execute in minecraft:the_end run tp @s $((TX - 1)).5 $TY $((TZ)).5" >/dev/null
-ctl wait 4 >/dev/null
-ctl interact "$TX" "$TY" "$TZ" >/dev/null || fail "the crafting table did not take the click"
-ctl wait 6 >/dev/null
-GRID=$(ctl screen | jq '[.slots[]? | select(.slot >= 100)] | length')
-[ "$GRID" = 10 ] || fail "the crafting table did not open its grid ($GRID grid slots)"
+open_crafting_table "$TX" "$TY" "$TZ"
 # "dod" / "ZFZ" / "dod": diamonds and ender pearls in the outer cells, stones where
 # `rftoolsbase:infused_enderpearl` (Z) and `rftoolsbase:machine_frame` (F) belong.
 for cell in 100 102 106 108; do place_one minecraft:diamond "$cell"; done
@@ -1561,6 +1573,432 @@ LINE=$(await_line "endergenic generator there")
 echo "  $LINE"
 echo "  12 blocks is a 5-tick flight, upstream's maximum is 4; a stone is not a generator either way"
 
+# --- the ender monitor ---------------------------------------------------
+# Upstream's `EnderMonitorTileEntity` (1.21-7.0.6): one of three modes decides which generator
+# event it reports (`MODE_LOSTPEARL`, `MODE_PEARLFIRED`, `MODE_PEARLARRIVED`), and
+# `fireFromEndergenic(mode)` arms `needPulse` only when the event is the mode it watches. The
+# next tick puts 15 on its redstone output and clears it — one tick, no more. The generator's
+# side is `fireMonitors`: the neighbour in `dir` answers when its `logic_facing` input side is
+# `dir`, which in this port (whose `facing` is the display) means a monitor at generator+`dir`
+# with `facing=dir`.
+#
+# The rig: source A at z=130 with its injector, destination B at z=133 (a 2-tick link), four
+# monitors — `arrived` on B's east side with a lamp on its display face, `lost` on B's west,
+# `arrived` on B's south but facing **north** (the wrong side: the display points at the
+# generator), and `fired` on A's west.
+ENDERMON=rftoolspower:ender_monitor
+ENDER_MON_ENTITY=rftoolspower:ender_monitor_block_entity
+LAMP=minecraft:redstone_lamp
+ENDERMON_IN=$SCRATCH/endermonitor-samples.in
+ENDERMON_SAMPLES=$SCRATCH/endermonitor-samples.txt
+MONX=$((SX + 1)); MONY=101; MONZ=133      # the `arrived` monitor
+LOSTX=$((SX - 1)); LOSTZ=133               # the `lost` monitor
+WRONGZ=134                                 # the mis-facing `arrived` monitor
+FIREDX=$((SX - 1)); FIREDZ=130             # the `fired` monitor
+LAMPX=$((SX + 2)); LAMPZ=133
+
+monitor_arena() {
+    ctl command "execute in minecraft:the_end run tp @s $SX.5 101 130.5" >/dev/null
+    ctl wait 40 >/dev/null
+    local attempt
+    for attempt in 1 2 3; do
+        ctl command "execute in minecraft:the_end run fill $((SX - 6)) 100 126 $((SX + 8)) 100 140 minecraft:stone" >/dev/null
+        ctl wait 6 >/dev/null
+        [ "$(block_name "$SX" 100 136)" = "minecraft:stone" ] && break
+        echo "  the monitor arena floor fill did not land (attempt $attempt); waiting" >&2
+        ctl wait 40 >/dev/null
+    done
+    [ "$(block_name "$SX" 100 136)" = "minecraft:stone" ] || fail "the monitor arena floor is not stone"
+    ctl command "execute in minecraft:the_end run fill $((SX - 6)) 101 126 $((SX + 8)) 108 140 minecraft:air" >/dev/null
+    ctl wait 8 >/dev/null
+    [ "$(block_name "$SX" 101 133)" = "minecraft:air" ] || fail "the monitor arena air fill did not land"
+    ctl command "gamemode creative" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl wait 4 >/dev/null
+}
+
+give_endermonitor() { # give_endermonitor [MODE] — an item, optionally carrying its mode
+    ctl command "clear @s" >/dev/null
+    if [ -n "${1:-}" ]; then
+        ctl command "give @s $ENDERMON[minecraft:block_entity_data={id:\"$ENDER_MON_ENTITY\",mode:\"$1\"}]" >/dev/null
+    else
+        ctl command "give @s $ENDERMON" >/dev/null
+    fi
+    ctl wait 8 >/dev/null
+}
+
+# A monitor placed from its item (so `state_for_placement` runs), then its display face pinned:
+# `ctl place`'s yaw is the game's, not the player's (the monitor phases found this).
+place_endermonitor() { # X Y Z FACE
+    local x=$1 y=$2 z=$3 face=$4 state dx=2
+    # Approach from the side the display faces, so the block behind the target (the generator)
+    # never shadows the floor the item is placed on.
+    [ "$face" = west ] && dx=-2
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x + dx)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select "$ENDERMON" >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at-block "$x" $((y - 1)) "$z" up >/dev/null \
+        || fail "cannot aim at the floor under $x,$y,$z"
+    place_block "$x" "$y" "$z" "$ENDERMON" \
+        || fail "ctl place $ENDERMON at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$ENDERMON" ] || fail "the ender monitor is not at $x,$y,$z"
+    state=$(ctl block "$x" "$y" "$z" | jq -r '.state')
+    echo "  placed: $state" >&2
+    case "$state" in
+        *facing="$face"*) ;;
+        *)
+            ctl command "execute in minecraft:the_end run setblock $x $y $z $ENDERMON[facing=$face,lit=false]" >/dev/null
+            ctl wait 4 >/dev/null
+            state=$(ctl block "$x" "$y" "$z" | jq -r '.state')
+            echo "  (the placement's facing was not $face; pinned to $state)" >&2
+            ;;
+    esac
+    case "$state" in
+        *facing="$face"*) ;;
+        *) fail "the ender monitor's state is '$state', expected facing=$face" ;;
+    esac
+}
+
+# The fresh `/rftoolspower endermonitor <pos> status <nonce>` line: the nonce is what proves it is
+# this call's reply (a reply that arrives a few ticks late is still the *previous* call's line).
+endermonitor_state() { # X Y Z
+    local x=$1 y=$2 z=$3 line="" attempt want
+    want=$(( ${NONCE:-0} + 1 ))
+    NONCE=$want
+    say "rftoolspower endermonitor $x $y $z status $want"
+    for attempt in $(seq 1 12); do
+        line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 "nonce=$want" || true)
+        [ -n "$line" ] && break
+        ctl wait 5 >/dev/null
+    done
+    [ -n "$line" ] || fail "no fresh /rftoolspower endermonitor reply for $x,$y,$z (nonce $want): $(ctl messages 12 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_endermonitor.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the ender monitor line did not parse: $line"
+    [ "${NONCE:-}" = "$want" ] || fail "the reply's nonce is '${NONCE:-none}', sent $want: $line"
+    echo "  $line" >&2
+    echo "  parsed: mode=$MODE facing=$FACING pulses=$PULSES last=$LAST needpulse=$NEEDPULSE out=$OUT" >&2
+}
+
+set_monitor_mode() { # X Y Z lost|fired|arrived
+    local line="" attempt
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    say "rftoolspower endermonitor $1 $2 $3 $4 $NONCE"
+    for attempt in $(seq 1 12); do
+        line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 "nonce=$NONCE" || true)
+        [ -n "$line" ] && break
+        ctl wait 5 >/dev/null
+    done
+    [ -n "$line" ] || fail "no fresh mode reply for $1,$2,$3 $4 (nonce $NONCE): $(ctl messages 12 | jq -c '.chat')"
+    echo "  $line" >&2
+}
+
+expect_monitor_mode() { [ "$MODE" = "$1" ] || fail "the monitor's mode is $MODE, expected $1"; }
+expect_monitor_pulses() {
+    [ "$PULSES" = "$1" ] || fail "the monitor has pulsed $PULSES times, expected $1"
+}
+
+# One pulse of the rig with the game frozen, so one sample is exactly one server tick.
+#
+# With the game running, a `ctl block` round trip costs about half a tick and `wait 1` adds a whole
+# one, so a one-tick window falls between two samples: the first attempt sampled the monitor every
+# other tick and read `lit=false` 24 times, while the lamp beside it (vanilla's lamp keeps its light
+# for 4 ticks after the power goes) still showed the pulse. Here every `tick step 1` is awaited
+# (`Stepping 1 tick(s)`), and the `block` read between two steps sees that tick's state, so the 16
+# samples are 16 consecutive server ticks and a one-tick pulse is exactly one `lit=true`. The
+# `state` reply's `ticks` field is the client's clock (it keeps running while the server is frozen:
+# the samples' labels are ~2 apart and are not the server tick), so it is only a cross-check.
+sample_pulse() { # X Y Z BLOCK
+    ctl command "tick freeze" >/dev/null
+    {
+        echo "command execute in minecraft:the_end run fill $SX 102 130 $((SX + 1)) 102 133 minecraft:redstone_block"
+        for _ in $(seq 1 16); do
+            echo "command tick step 1"
+            echo "state"
+            echo "block $1 $2 $3"
+        done
+        echo "command execute in minecraft:the_end run fill $SX 102 130 $((SX + 1)) 102 133 minecraft:air"
+        echo "command tick unfreeze"
+    } > "$ENDERMON_IN"
+    ctl script "$ENDERMON_IN" > "$ENDERMON_SAMPLES" 2>&1 || true
+    ctl command "tick unfreeze" >/dev/null 2>&1 || true
+    eval "$(python3 "$PORT/tools/parse_pulse_samples.py" "$ENDERMON_SAMPLES" "$4")"
+    echo "  samples of $4 at $1,$2,$3: '$PULSE_SEQUENCE' ($PULSE_LIT read lit of $PULSE_SAMPLES, over ticks $PULSE_TICKS)" >&2
+    [ "$PULSE_SAMPLES" -ge 12 ] || fail "only $PULSE_SAMPLES samples of $4 came back; the frozen sampling did not run"
+}
+
+echo "== AN: the ender monitors stand on the generators' sides and read their modes =="
+monitor_arena
+give_injector
+place_injector "$((SX + 1))" 101 130 east
+give_ender
+place_held "$SX" 101 130 "$ENDER"
+# A seeded destination: a pearl's hold costs 500 FE a tick, and a destination that cannot pay drops
+# it — which is itself a `lost` event. The differential below needs an arrival with *no* loss, so
+# every shot starts from a destination refilled with 100,000 FE.
+reset_destination() { # [ENERGY]
+    ctl command "execute in minecraft:the_end run setblock $SX 101 133 minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    give_ender "${1:-}"
+    place_held "$SX" 101 133 "$ENDER"
+}
+reset_destination 100000
+link "$SX" 101 130 "$SX" 101 133
+give_endermonitor
+place_endermonitor "$MONX" "$MONY" "$MONZ" east
+give_endermonitor
+place_endermonitor "$SX" 101 "$WRONGZ" north
+# The source's monitor is placed from an item that carries its mode (upstream's mode rides on the
+# block's item), so no command is needed to configure it.
+give_endermonitor MODE_PEARLFIRED
+place_endermonitor "$FIREDX" 101 "$FIREDZ" west
+ctl command "execute in minecraft:the_end run setblock $LAMPX 101 $LAMPZ $LAMP" >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$LAMPX" 101 "$LAMPZ")" = "$LAMP" ] || fail "the lamp did not place beside the monitor"
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_mode lost
+[ "$LAST" = none ] || fail "a fresh monitor's last mode is $LAST, expected none"
+expect_monitor_pulses 0
+[ "$OUT" = 0 ] || fail "a fresh monitor answers out=$OUT, expected 0"
+[ "$NEEDPULSE" = false ] || fail "a fresh monitor owes a pulse"
+case "$(ctl block "$MONX" "$MONY" "$MONZ" | jq -r '.state')" in
+    *lit=false*) ;;
+    *) fail "a fresh monitor's state is not lit=false" ;;
+esac
+set_monitor_mode "$MONX" "$MONY" "$MONZ" arrived
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_mode arrived
+[ "$FACING" = east ] || fail "the monitor faces '$FACING', expected its display east"
+set_monitor_mode "$SX" 101 "$WRONGZ" arrived
+endermonitor_state "$SX" 101 "$WRONGZ"
+expect_monitor_mode arrived
+[ "$FACING" = north ] || fail "the mis-facing monitor reads facing=$FACING, expected north"
+endermonitor_state "$FIREDX" 101 "$FIREDZ"
+expect_monitor_mode fired
+echo "  three monitors: arrived on B's east (with a lamp on its display face), arrived on B's south facing the generator, fired on A's west (from its item's mode, no command)"
+# The other direction: a broken configured monitor keeps its mode on the item, and placing it
+# restores it. The counters are the readout's and stay on the block, so the placed one starts at 0.
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 6 >/dev/null
+break_block "$FIREDX" 101 "$FIREDZ" minecraft:iron_pickaxe
+pick_up_item "$FIREDX" 101 "$FIREDZ" "$ENDERMON"
+DROP_LINE=$(held_item_line_for "$ENDERMON")
+[ -n "$DROP_LINE" ] || fail "no /data get reply for the picked-up ender monitor: $(ctl messages 8 | jq -c '.chat')"
+echo "  $DROP_LINE" >&2
+case "$DROP_LINE" in
+    *"id: \"$ENDER_MON_ENTITY\""*) ;;
+    *) fail "the dropped ender monitor does not name its block entity type: $DROP_LINE" ;;
+esac
+case "$DROP_LINE" in
+    *"mode: \"MODE_PEARLFIRED\""*) ;;
+    *) fail "the dropped ender monitor does not carry its mode: $DROP_LINE" ;;
+esac
+# `place_endermonitor` re-places the item this player picked up and pins the display face (the
+# placement context's yaw is the game's, not the harness's — the same trap as the first placement).
+place_endermonitor "$FIREDX" 101 "$FIREDZ" west
+endermonitor_state "$FIREDX" 101 "$FIREDZ"
+expect_monitor_mode fired
+expect_monitor_pulses 0
+[ "$LAST" = none ] || fail "the placed monitor's last mode is $LAST, expected none (the counters stay on the block)"
+echo "  the broken monitor's item carries id=$ENDER_MON_ENTITY mode=MODE_PEARLFIRED; placed back it watches 'fired' with 0 pulses"
+ctl command "gamemode creative" >/dev/null
+ctl wait 4 >/dev/null
+
+echo "== AO: an arrival pulses the arrived monitor for exactly one tick =="
+pearl_into_injector "$((SX + 1))" 101 130
+sample_pulse "$MONX" "$MONY" "$MONZ" "$ENDERMON"
+if [ "${SELFTEST_ENDERMON:-0}" = 1 ]; then
+    echo "(selftest: asserting the monitor never lit)"
+    [ "$PULSE_LIT" = 0 ] || fail "selftest: the monitor lit for $PULSE_LIT sample(s), so the one-tick assertion is alive"
+fi
+[ "$PULSE_TICK_LIT" = 1 ] \
+    || fail "the monitor's lit state was true in $PULSE_TICK_LIT game ticks of the pulse's window, expected exactly 1 ('$PULSE_SEQUENCE' over ticks $PULSE_TICKS)"
+case "$PULSE_SEQUENCE" in
+    *0) ;;
+    *) fail "the monitor was still lit at the end of the window: '$PULSE_SEQUENCE'" ;;
+esac
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_mode arrived
+expect_monitor_pulses 1
+[ "$LAST" = arrived ] || fail "the monitor's last mode is $LAST, expected arrived"
+[ "$NEEDPULSE" = false ] || fail "the monitor still owes a pulse after it fired"
+[ "$OUT" = 0 ] || fail "the monitor still answers out=$OUT after the pulse"
+case "$(ctl block "$MONX" "$MONY" "$MONZ" | jq -r '.state')" in
+    *lit=false*) ;;
+    *) fail "the monitor's state is still lit after the pulse" ;;
+esac
+endermonitor_state "$FIREDX" 101 "$FIREDZ"
+expect_monitor_mode fired
+expect_monitor_pulses 1
+[ "$LAST" = fired ] || fail "the source monitor's last mode is $LAST, expected fired"
+endermonitor_state "$SX" 101 "$WRONGZ"
+expect_monitor_pulses 0
+ender_state "$SX" 101 133
+[ "$GAINED" -gt 0 ] || fail "the destination paid nothing, so the shot did not land"
+[ "$ARRIVED" -ge 1 ] || fail "the destination did not record the arrival (arrived=$ARRIVED)"
+# A landed pearl is held and can be lost to upstream's 0.6 %-a-tick chance before this read; that is
+# a later event, not a failed landing, so the loss counter is allowed to be 1 with that reason.
+case "$REASON" in
+    none | "Random pearl discard") ;;
+    *) fail "the destination records a loss it should not have ('$REASON')" ;;
+esac
+echo "  the arrival lit the monitor for exactly one sampled tick, the source's fired monitor pulsed with it, the mis-facing one never did, and the destination gained $GAINED FE (dropped=$DROPPED, reason=$REASON)"
+# The same shot again, this time sampling the lamp on the display face: the monitor's 15 is a real
+# redstone output, not only a block state.
+reset_destination 100000
+pearl_into_injector "$((SX + 1))" 101 130
+sample_pulse "$LAMPX" 101 "$LAMPZ" "$LAMP"
+[ "$PULSE_LIT" -ge 1 ] \
+    || fail "the lamp on the monitor's display face never lit ('$PULSE_SEQUENCE')"
+case "$PULSE_SEQUENCE" in
+    *0) ;;
+    *) fail "the lamp was still lit at the end of the window: '$PULSE_SEQUENCE'" ;;
+esac
+[ "$(block_lit "$LAMPX" 101 "$LAMPZ")" = false ] || fail "the lamp is still lit after the pulse"
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_pulses 2
+endermonitor_state "$FIREDX" 101 "$FIREDZ"
+expect_monitor_pulses 2
+echo "  the second shot lit the lamp on the display face and went dark again"
+
+echo "== AP: the same shot does not pulse a monitor watching another mode =="
+set_monitor_mode "$MONX" "$MONY" "$MONZ" lost
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+MON_BEFORE=$PULSES
+endermonitor_state "$FIREDX" 101 "$FIREDZ"
+FIRED_BEFORE=$PULSES
+# A lit sample on a `lost` monitor is legal only when one event can fire it: upstream's random
+# pearl discard (0.6 % a tick while a landed pearl is held). That event is named by the drop
+# reason, so an attempt where it fired is inconclusive, not a failure — retried. An arrival that
+# lit it is the defect under test and fails at once.
+ATTEMPT=0
+INCONCLUSIVE=0
+while :; do
+    ATTEMPT=$((ATTEMPT + 1))
+    reset_destination 100000
+    pearl_into_injector "$((SX + 1))" 101 130
+    sample_pulse "$MONX" "$MONY" "$MONZ" "$ENDERMON"
+    if [ "$PULSE_LIT" = 0 ]; then
+        break
+    fi
+    ender_state "$SX" 101 133
+    if [ "$DROPPED" -ge 1 ] && [ "$REASON" = "Random pearl discard" ]; then
+        INCONCLUSIVE=$((INCONCLUSIVE + 1))
+        echo "  attempt $ATTEMPT: upstream's random discard fired the lost monitor ('$PULSE_SEQUENCE'); retrying ($INCONCLUSIVE inconclusive)" >&2
+        [ "$INCONCLUSIVE" -lt 3 ] || fail "three attempts all lost the landed pearl to the random discard; the mode gate was never sampled"
+        continue
+    fi
+    fail "a monitor set to 'lost' lit for $PULSE_LIT sample(s) on an arrival ('$PULSE_SEQUENCE', reason=$REASON)"
+done
+[ "$(block_lit "$LAMPX" 101 "$LAMPZ")" = false ] \
+    || fail "the lamp lit on a monitor watching another mode"
+ender_state "$SX" 101 133
+[ "$GAINED" -gt 0 ] || fail "the differential's shot did not land"
+[ "$ARRIVED" -ge 1 ] || fail "the differential's arrival was not recorded (arrived=$ARRIVED)"
+case "$REASON" in
+    none | "Random pearl discard") ;;
+    *) fail "the differential's shot records a loss it should not have ('$REASON')" ;;
+esac
+# One shot per attempt; the source's fired monitor proves each attempt really fired a pearl.
+endermonitor_state "$FIREDX" 101 "$FIREDZ"
+expect_monitor_pulses "$((FIRED_BEFORE + ATTEMPT))"
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_mode lost
+# The landing pays into the destination and the pearl is then held, so a discard can add a `lost`
+# pulse after a window too. Which event the counter names is what matters: `arrived` means nothing
+# was noticed (so the count did not move), `lost` means a discard was (at most one per attempt).
+PULSES_AFTER_AP=$PULSES
+if [ "$LAST" = arrived ]; then
+    [ "$PULSES_AFTER_AP" = "$MON_BEFORE" ] \
+        || fail "the lost-mode monitor moved from $MON_BEFORE to $PULSES_AFTER_AP pulses but names 'arrived'"
+else
+    [ "$LAST" = lost ] || fail "the lost-mode monitor's last mode is $LAST"
+    [ "$PULSES_AFTER_AP" -gt "$MON_BEFORE" ] && [ "$PULSES_AFTER_AP" -le "$((MON_BEFORE + ATTEMPT))" ] \
+        || fail "after $ATTEMPT landing(s) the lost-mode monitor reads $PULSES_AFTER_AP pulses, expected $MON_BEFORE..$((MON_BEFORE + ATTEMPT)) with last=lost"
+fi
+echo "  mode=lost: $ATTEMPT shot(s) left the monitor silent (lit never set over $PULSE_SAMPLES samples; pulses $MON_BEFORE -> $PULSES_AFTER_AP, last=$LAST), while every shot still landed and the source's fired monitor recorded $ATTEMPT more"
+
+echo "== AQ: a pearl lost at an idle destination pulses both arrived and lost =="
+# Reset the destination first: the previous shot left a pearl in its hold, and a random discard of
+# that pearl would pulse the `lost` monitor below before this phase's shot does.
+reset_destination
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+BASE_PULSES=$PULSES
+[ "$BASE_PULSES" -ge 2 ] \
+    || fail "the arrived monitor reads $BASE_PULSES pulses before the miss, expected at least the two arrivals"
+give_endermonitor
+place_endermonitor "$LOSTX" 101 "$LOSTZ" west
+set_monitor_mode "$LOSTX" 101 "$LOSTZ" lost
+set_monitor_mode "$MONX" "$MONY" "$MONZ" arrived
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_pulses "$BASE_PULSES"
+pearl_into_injector "$((SX + 1))" 101 130
+# Only the injector is pulsed: the destination stays idle, so the pearl has nowhere to land.
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 102 130 minecraft:redstone_block" >/dev/null
+ctl wait 3 >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 102 130 minecraft:air" >/dev/null
+ctl wait 24 >/dev/null
+ender_state "$SX" 101 133
+[ "$DROPPED" = 1 ] || fail "the destination dropped $DROPPED pearls, expected the one it lost"
+[ "$REASON" = "Pearl arrived while idle" ] || fail "the drop reason is '$REASON', expected 'Pearl arrived while idle'"
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_pulses "$((BASE_PULSES + 1))"
+MISS_PULSES=$PULSES
+[ "$LAST" = arrived ] || fail "the arrived monitor's last mode is $LAST after the miss"
+endermonitor_state "$LOSTX" 101 "$LOSTZ"
+expect_monitor_pulses 1
+[ "$LAST" = lost ] || fail "the lost monitor's last mode is $LAST, expected lost"
+endermonitor_state "$FIREDX" 101 "$FIREDZ"
+expect_monitor_pulses "$((FIRED_BEFORE + ATTEMPT + 1))"
+endermonitor_state "$SX" 101 "$WRONGZ"
+expect_monitor_pulses 0
+echo "  the miss pulsed the arrived monitor ($BASE_PULSES -> $MISS_PULSES) and the lost monitor (1); the mis-facing one stayed at 0"
+
+echo "== AR: the endermonitor command's refusals are parsed replies =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 138 minecraft:stone" >/dev/null
+ctl wait 4 >/dev/null
+say "rftoolspower endermonitor $SX 101 138 lost"
+LINE=$(await_line "ender monitor there")
+[ -n "$LINE" ] || fail "no refusal for a position with no monitor: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE"
+say "rftoolspower endermonitor $MONX $MONY $MONZ wrong"
+LINE=$(await_line "unknown mode 'wrong'")
+[ -n "$LINE" ] || fail "no refusal for an unknown mode: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE"
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_mode arrived
+expect_monitor_pulses "$((BASE_PULSES + 1))"
+echo "  a stone position and an unknown mode are refused, and the monitor's mode did not change"
+
+echo "== AS: the ender monitor's recipe needs the parent's machine base, so it crafts nothing =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+for item in minecraft:ender_pearl minecraft:redstone minecraft:redstone_torch minecraft:stone; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 8 >/dev/null
+TX2=$((SX + 4)); TY2=101; TZ2=130
+open_crafting_table "$TX2" "$TY2" "$TZ2"
+# " o " / "rAr" / "TrT": an ender pearl up, redstone beside the centre, redstone torches below,
+# and a stone where `rftoolsbase:machine_base` belongs.
+place_one minecraft:ender_pearl 101
+place_one minecraft:redstone 103
+place_one "$STONE" 104
+place_one minecraft:redstone 105
+place_one minecraft:redstone_torch 106
+place_one minecraft:redstone 107
+place_one minecraft:redstone_torch 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the ender monitor's recipe with a stone where rftoolsbase:machine_base belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the ender monitor's recipe crafted $RESULT without the parent"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  the machine base is what the monitor's recipe needs and RFToolsBase is not in this build"
+
 echo "== AM: the store and the link survive save + relaunch =="
 ctl save >/dev/null
 ctl wait 10 >/dev/null
@@ -1581,5 +2019,15 @@ KEPT_ARRIVED=$ARRIVED
 ender_state "$SX" 101 94
 [ "$DEST" = "$SX,101,97" ] || fail "after the relaunch the source's link is $DEST, expected $SX,101,97"
 echo "  after save + relaunch: B holds $KEPT_ENERGY FE (its mode-$KEPT_ARRIVED arrival) and A still links to B"
+# The ender monitors keep the mode they were set to and the pulses they gave.
+[ "$(block_name "$MONX" "$MONY" "$MONZ")" = "$ENDERMON" ] || fail "the ender monitor did not survive the relaunch"
+endermonitor_state "$MONX" "$MONY" "$MONZ"
+expect_monitor_mode arrived
+expect_monitor_pulses "$((BASE_PULSES + 1))"
+[ "$LAST" = arrived ] || fail "after the relaunch the monitor's last mode is $LAST, expected arrived"
+endermonitor_state "$LOSTX" 101 "$LOSTZ"
+expect_monitor_mode lost
+expect_monitor_pulses 1
+echo "  after save + relaunch: the arrived monitor still watches 'arrived' with $((BASE_PULSES + 1)) pulses, the lost one 'lost' with 1"
 
-echo "PASS: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+echo "PASS: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

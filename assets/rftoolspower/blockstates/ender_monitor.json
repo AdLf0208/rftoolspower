@@ -1,0 +1,40 @@
+{
+  "variants": {
+    "facing=east,lit=false": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": 90,
+      "y": 270
+    },
+    "facing=east,lit=true": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": 90,
+      "y": 270
+    },
+    "facing=north,lit=false": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": -90
+    },
+    "facing=north,lit=true": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": -90
+    },
+    "facing=south,lit=false": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": 90
+    },
+    "facing=south,lit=true": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": 90
+    },
+    "facing=west,lit=false": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": 90,
+      "y": 90
+    },
+    "facing=west,lit=true": {
+      "model": "rftoolspower:block/ender_monitor_0",
+      "x": 90,
+      "y": 90
+    }
+  }
+}

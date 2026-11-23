@@ -98,6 +98,21 @@ Two of the new recipes' ingredients — `rftoolsbase:infused_enderpearl` and the
 all), so the recipes load but cannot match; `notes.md`'s phase AK proves both patterns craft
 nothing here.
 
+Slice 5 adds the ender monitor:
+
+| File | What |
+|---|---|
+| `assets/rftoolspower/blockstates/ender_monitor.json` | the jar's `ender_monitor_0` model in four `facing` rotations (upstream's `logic_facing` display side) and both `lit` values (one model, as upstream's) |
+| `assets/rftoolspower/models/block/ender_monitor_0.json` | the jar's thin plate (`0..4/16`), its `ender_monitor` texture on the display face and the base textures on the rest |
+| `assets/rftoolspower/models/item/ender_monitor.json`, `assets/rftoolspower/items/ender_monitor.json` | the item model and the 26.3 item definition |
+| `assets/rftoolspower/textures/block/endergenic/ender_monitor.png` | the jar's own texture, byte for byte |
+| `data/rftoolspower/horizon/block/ender_monitor.json` | an iron base cube with a `facing` enum (north/south/east/west) and a boolean `lit`; hardness 2.0 / blast 2.0, pickaxe, iron sound; the plate's collision shape follows `facing` |
+| `data/rftoolspower/recipe/ender_monitor.json` | `" o "/"rAr"/"TrT"` — an ender pearl, redstone, redstone torches and `rftoolsbase:machine_base` |
+| `data/rftoolspower/advancement/recipes/misc/ender_monitor.json` | the recipe unlock, in the 26.3 predicate shape |
+| `data/rftoolspower/loot_table/blocks/ender_monitor.json` | the block drop (`copy_name` kept; the mode travels through `block_entity_data`, written by `Hooks::block_drops`) |
+| `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.ender_monitor` |
+| `data/minecraft/tags/block/…`, `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | the block in the tags and the tab |
+
 ## Patched, because 1.21.1 → 26.3 differs
 
 | File | Patch |

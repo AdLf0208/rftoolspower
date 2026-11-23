@@ -1,0 +1,19 @@
+{
+  "category": "misc",
+  "key": {
+    "A": "rftoolsbase:machine_base",
+    "T": "minecraft:redstone_torch",
+    "o": "#c:ender_pearls",
+    "r": "minecraft:redstone"
+  },
+  "pattern": [
+    " o ",
+    "rAr",
+    "TrT"
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:ender_monitor"
+  },
+  "type": "minecraft:crafting_shaped"
+}

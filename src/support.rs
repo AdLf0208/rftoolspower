@@ -20,11 +20,12 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, Endergenic, Fuel, Generator, HOLDING,
-    IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE, Monitor, NETWORK_MAX, OBSERVE_TICKS, PEARL, Pulse,
-    SideMode, Sides, Tier, as_capability, capacity as network_capacity, clamp_endergenic,
-    clamped_energy, network_valid, pearl_lost, receive as network_receive, restored, rf_per_tick,
-    rising_edge, send_amount, stored as network_stored, take as network_take,
+    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic, Fuel,
+    Generator, HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE, MONITOR_SIGNAL, Monitor,
+    MonitorMode, NETWORK_MAX, OBSERVE_TICKS, PEARL, Pulse, SideMode, Sides, Tier, as_capability,
+    capacity as network_capacity, clamp_endergenic, clamped_energy, network_valid, pearl_lost,
+    receive as network_receive, restored, rf_per_tick, rising_edge, send_amount,
+    stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -174,6 +175,18 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     if let Err(error) = r.block_entity_part(&kind, InjectorPart) {
         context.refuse(&format!(
             "rftoolspower: the pearl injector part was refused: {error}"
+        ));
+    }
+
+    // The ender monitor: a type and a Part. It has no container and no buffer — it watches one
+    // event mode of the generator it is mounted on and gives 15 for the one tick it fires.
+    let kind = r
+        .block_entity_type(ENDER_MONITOR_TYPE)
+        .blocks(&["ender_monitor"])
+        .build();
+    if let Err(error) = r.block_entity_part(&kind, EnderMonitorPart) {
+        context.refuse(&format!(
+            "rftoolspower: the ender monitor part was refused: {error}"
         ));
     }
 }
@@ -1447,6 +1460,17 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
         let mut payload = Compound::new();
         payload.insert(KEY_ENERGY.into(), Tag::Int(energy));
         entity_data_patch(&payload, ENDERGENIC_TYPE_ID)
+    } else if block == ENDER_MONITOR {
+        // Upstream's mode rides on the block's item (`EnderMonitorData` on the dropped stack):
+        // the configured mode travels, the default one has nothing worth carrying, and the
+        // readout's counters are this port's own so they stay on the block.
+        let mode = read_ender_monitor(&Tag::Compound(saved)).mode;
+        if mode == MonitorMode::LostPearl {
+            return Flow::Continue;
+        }
+        let mut payload = Compound::new();
+        payload.insert(KEY_MONITOR_MODE.into(), Tag::String(mode.saved().into()));
+        entity_data_patch(&payload, ENDER_MONITOR_TYPE_ID)
     } else {
         return Flow::Continue;
     };
@@ -1630,9 +1654,11 @@ impl BlockEntityPart for MonitorPart {
 // The command
 // ---------------------------------------------------------------------------
 
-/// The mod's commands. `info`, `monitor` and `cell` are the harness's readouts (there is no GUI in
-/// this slice); `band` sets the monitor's alarm band and `side` sets a powercell face's mode, the
-/// stand-ins for upstream's GUI sliders and its smart wrench.
+/// The mod's commands. `info`, `monitor`, `cell`, `endergenic`, `injector` and `endermonitor` are
+/// the harness's readouts (there is no GUI in this slice); `band` sets the monitor's alarm band,
+/// `side` sets a powercell face's mode, `enderlink` is the smart wrench's link and `endermonitor`
+/// (with a mode word) is the ender monitor's GUI picker — the stand-ins for what the port does
+/// not carry.
 pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
     for usage in [
         "rftoolspower info <pos:block_pos> [nonce:word]",
@@ -1643,6 +1669,7 @@ pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
         "rftoolspower endergenic <pos:block_pos> [nonce:word]",
         "rftoolspower injector <pos:block_pos> [nonce:word]",
         "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
+        "rftoolspower endermonitor <pos:block_pos> <action:word> [nonce:word]",
     ] {
         commands.push(Command::op(usage, OPERATOR_LEVEL));
     }
@@ -1726,7 +1753,15 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
     };
     if !matches!(
         subcommand,
-        "info" | "monitor" | "band" | "cell" | "side" | "endergenic" | "injector" | "enderlink"
+        "info"
+            | "monitor"
+            | "band"
+            | "cell"
+            | "side"
+            | "endergenic"
+            | "injector"
+            | "enderlink"
+            | "endermonitor"
     ) {
         return Flow::Continue;
     }
@@ -1746,6 +1781,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             "cell" | "side" => NO_CELL,
             "endergenic" | "enderlink" => NO_ENDERGENIC,
             "injector" => NO_INJECTOR,
+            "endermonitor" => NO_ENDER_MONITOR,
             _ => NO_GENERATOR,
         }));
         return Flow::Cancel;
@@ -1766,6 +1802,10 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         ),
         "endergenic" => endergenic_status_line(host, level, *pos, nonce_of(event)),
         "injector" => injector_status_line(host, level, *pos, nonce_of(event)),
+        "endermonitor" => match word_of(event, "action") {
+            None | Some("status") => ender_monitor_status_line(host, level, *pos, nonce_of(event)),
+            Some(word) => set_monitor_mode(host, level, *pos, word, nonce_of(event)),
+        },
         "enderlink" => match event.command.argument("destination") {
             Some(CommandArgumentValue::BlockPos(destination)) => {
                 set_link(host, level, *pos, *destination)
@@ -1879,6 +1919,25 @@ const KEY_LOSS: &str = "loss";
 /// What a read where no generator / no injector stands answers.
 const NO_ENDERGENIC: &str = "No RFTools Power endergenic generator there.";
 const NO_INJECTOR: &str = "No RFTools Power pearl injector there.";
+
+// The ender monitor (`EndergenicModule.ENDER_MONITOR`). Its type is named apart from its block
+// for the reason [`GENERATOR_TYPE`] is; it carries no container and no buffer.
+/// `rftoolspower:ender_monitor`.
+pub(crate) const ENDER_MONITOR: &str = "rftoolspower:ender_monitor";
+const ENDER_MONITOR_TYPE: &str = "ender_monitor_block_entity";
+/// That type's registry id, which a broken monitor's `block_entity_data` payload names.
+const ENDER_MONITOR_TYPE_ID: &str = "rftoolspower:ender_monitor_block_entity";
+/// The mode it watches (upstream's `EnderMonitorData.mode`, in its codec's spelling). The
+/// powercell's `mode` key is a different value on a different block, so this one is named apart.
+const KEY_MONITOR_MODE: &str = "mode";
+/// Upstream's saved `needPulse`, which the tick spends as its one-tick output.
+const KEY_NEED_PULSE: &str = "needPulse";
+/// The readout's pulse counter.
+const KEY_PULSES: &str = "pulses";
+/// The mode of the last event it armed for.
+const KEY_LAST: &str = "last";
+/// What a read where no ender monitor stands answers.
+const NO_ENDER_MONITOR: &str = "No RFTools Power ender monitor there.";
 
 /// A saved long, 0 when absent or of another type.
 fn long(saved: &Tag, key: &str) -> i64 {
@@ -2009,6 +2068,115 @@ pub(crate) fn write_endergenic(saved: &mut Tag, state: &Endergenic) {
     }
 }
 
+/// The mode a saved string names, or the attachment's default when the key is absent or unknown.
+fn saved_mode(saved: &Tag) -> MonitorMode {
+    text(saved, KEY_MONITOR_MODE)
+        .as_deref()
+        .and_then(MonitorMode::parse_saved)
+        .unwrap_or_default()
+}
+
+/// The ender monitor a saved compound holds (`EnderMonitorData.mode`, `needPulse`, the counters).
+pub(crate) fn read_ender_monitor(saved: &Tag) -> EnderMonitor {
+    let pulses = u32::try_from(int(saved, KEY_PULSES)).unwrap_or(0);
+    let last = text(saved, KEY_LAST)
+        .as_deref()
+        .and_then(MonitorMode::parse_saved);
+    EnderMonitor::restored(saved_mode(saved), flag(saved, KEY_NEED_PULSE), pulses, last)
+}
+
+/// Write an ender monitor back into a saved compound.
+pub(crate) fn write_ender_monitor(saved: &mut Tag, state: &EnderMonitor) {
+    set_text(saved, KEY_MONITOR_MODE, state.mode.saved());
+    set_flag(saved, KEY_NEED_PULSE, state.need_pulse);
+    set_int(
+        saved,
+        KEY_PULSES,
+        i32::try_from(state.pulses).unwrap_or(i32::MAX),
+    );
+    match state.last {
+        Some(mode) => set_text(saved, KEY_LAST, mode.saved()),
+        None => {
+            if let Tag::Compound(nbt) = &mut *saved {
+                nbt.remove(&KEY_LAST.into());
+            }
+        }
+    }
+}
+
+/// The ender monitor at `pos`, if the block there is one.
+fn ender_monitor_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+) -> Option<EnderMonitor> {
+    if block_id(&*host, level, pos).as_deref() != Some(ENDER_MONITOR) {
+        return None;
+    }
+    let entity = host.block_entity(level, pos)?;
+    let saved = entity.data(&*host)?;
+    Some(read_ender_monitor(&Tag::Compound(saved)))
+}
+
+/// Write a monitor's state back to its block entity. True when it differs from what was there.
+fn write_ender_monitor_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    state: &EnderMonitor,
+) -> bool {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return false;
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return false;
+    };
+    let mut saved = Tag::Compound(saved);
+    if read_ender_monitor(&saved) == *state {
+        return false;
+    }
+    write_ender_monitor(&mut saved, state);
+    if let Tag::Compound(data) = saved {
+        let _ = entity.replace_data(host, data);
+    }
+    let _ = entity.set_changed(&mut *host);
+    true
+}
+
+/// Something happened at the generator at `pos`: tell every ender monitor that watches it
+/// (upstream's `fireMonitors`).
+///
+/// A monitor watches the generator its **display** faces away from (upstream's
+/// `inputSide == dir.getOpposite()`), so the monitor at `pos + direction` fires when its `facing`
+/// names `direction`.
+pub(crate) fn fire_monitors(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    mode: MonitorMode,
+) {
+    for direction in Direction::ALL {
+        let normal = direction.normal();
+        let at = [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]];
+        if block_id(&*host, level, at).as_deref() != Some(ENDER_MONITOR) {
+            continue;
+        }
+        let display = level
+            .block_property(&*host, at, KEY_FACING)
+            .and_then(|name| dir_from_name(name.as_str()));
+        if display != Some(direction) {
+            // A monitor mounted on this generator but watching another mode or another block.
+            continue;
+        }
+        let Some(mut state) = ender_monitor_at(host, level, at) else {
+            continue;
+        };
+        if state.notice(mode) {
+            write_ender_monitor_at(host, level, at, &state);
+        }
+    }
+}
+
 /// The generator at `pos`, if the block there is one.
 fn endergenic_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<Endergenic> {
     if block_id(&*host, level, pos).as_deref() != Some(ENDERGENIC) {
@@ -2044,6 +2212,19 @@ fn write_endergenic_at(
     true
 }
 
+/// Something happened at the generator at `pos`: fire the monitors around it when there is a
+/// level to read them from.
+fn notify_monitors(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    mode: MonitorMode,
+) {
+    if let Some(level) = level {
+        fire_monitors(host, level, pos, mode);
+    }
+}
+
 /// One pearl arrives at the generator at `dest` (`EndergenicPearl.handleTick` →
 /// `receivePearl`). A destination that is gone or no longer a generator loses the pearl, as
 /// upstream's "where did the destination go?" does.
@@ -2051,8 +2232,14 @@ pub(crate) fn deliver_pearl(host: &mut dyn ServerHost, level: LevelRef, dest: [i
     let Some(mut state) = endergenic_at(host, level, dest) else {
         return;
     };
-    state.receive(age);
+    let gained = state.receive(age);
     write_endergenic_at(host, level, dest, &state);
+    // Upstream's `receivePearl` fires `arrived` before it branches, and a miss then also fires
+    // `lost` through `discardPearl`: an arrival outside the window pulses both monitor modes.
+    fire_monitors(host, level, dest, MonitorMode::PearlArrived);
+    if gained.is_none() {
+        fire_monitors(host, level, dest, MonitorMode::LostPearl);
+    }
 }
 
 /// A deterministic draw for the pearl-loss chance: the world time mixed with the position.
@@ -2117,17 +2304,31 @@ pub(crate) fn tick_endergenic(
     push_endergenic_energy(host, level, pos, &mut state);
     if state.holding() && pearl_lost(loss_seed(&*host, level, pos)) {
         state.discard(Loss::Chance);
+        notify_monitors(host, level, pos, MonitorMode::LostPearl);
     }
     match state.pulse(power_at(&*host, level, pos)) {
         Pulse::Start => state.start_charging(),
         Pulse::Fire => {
-            state.fire(false);
+            // Upstream's `firePearl`: a real launch fires `fired`, a generator with no
+            // destination drops the pearl and fires `lost`.
+            let fired = state.fire(false);
+            notify_monitors(
+                host,
+                level,
+                pos,
+                if fired {
+                    MonitorMode::PearlFired
+                } else {
+                    MonitorMode::LostPearl
+                },
+            );
         }
         Pulse::None => match state.charging {
             IDLE => {}
             HOLDING => {
                 if !state.hold() {
                     state.discard(Loss::NotEnoughEnergy);
+                    notify_monitors(host, level, pos, MonitorMode::LostPearl);
                 }
             }
             _ => state.charge_step(),
@@ -2194,11 +2395,23 @@ fn inject_pearl(
     };
     if state.charging == HOLDING {
         // Upstream's comment: "If the endergenic is already holding a pearl then this one is
-        // lost." The pearl is consumed and nothing is fired.
+        // lost." The pearl is consumed and nothing is fired, and no monitor is told: upstream's
+        // holding branch returns without `discardPearl`.
         return true;
     }
-    state.fire(true);
-    write_endergenic_at(host, level, generator, &state)
+    let fired = state.fire(true);
+    write_endergenic_at(host, level, generator, &state);
+    fire_monitors(
+        host,
+        level,
+        generator,
+        if fired {
+            MonitorMode::PearlFired
+        } else {
+            MonitorMode::LostPearl
+        },
+    );
+    true
 }
 
 /// One pearl-injector tick (`PearlInjectorTileEntity.tickOnServer`): a redstone rising edge
@@ -2375,6 +2588,226 @@ pub(crate) fn endergenic_battery() -> ModEnergyBuffer {
         insert_faces: [false; 6],
         extract_faces: [false; 6],
     }
+}
+
+// ---------------------------------------------------------------------------
+// The ender monitor
+// ---------------------------------------------------------------------------
+
+/// One ender-monitor tick (`EnderMonitorTileEntity.tickOnServer`): an owed pulse is 15 for this
+/// tick, 0 after it. True when the saved state moved (the engine discards a tick's edits unless
+/// it says so).
+pub(crate) fn tick_ender_monitor(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    saved: &mut Tag,
+) -> bool {
+    let before = read_ender_monitor(saved);
+    let mut state = before.clone();
+    let signal = state.tick();
+    let changed = state != before;
+    if changed {
+        write_ender_monitor(saved, &state);
+    }
+    if let Some(level) = level {
+        mirror_ender_monitor(host, level, pos, signal);
+    }
+    changed
+}
+
+/// Mirror the monitor's one-tick output into its `lit` state, and let the neighbours re-read the
+/// redstone when it moved: a lamp on the display side lights on the pulse's tick and goes dark
+/// when the next tick clears it.
+fn mirror_ender_monitor(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], signal: i32) {
+    let lit = signal > 0;
+    let current = level
+        .block_property(&*host, pos, KEY_LIT)
+        .map(|value| value.as_str() == "true");
+    if current == Some(lit) {
+        return;
+    }
+    let _ = host.set_block_property(pos, KEY_LIT, if lit { "true" } else { "false" });
+    if let Some(source) = level.block_state(&*host, pos) {
+        let _ = level.update_neighbors(host, pos, source, NeighbourUpdate::Neighbours);
+    }
+}
+
+/// A state decoded for `block_signal`, cached by ordinal: a state's properties never change.
+#[derive(Clone, Copy)]
+struct EnderMonitorFace {
+    display: Direction,
+    lit: bool,
+}
+
+static ENDER_MONITOR_FACES: LazyLock<Mutex<HashMap<BlockState, EnderMonitorFace>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Decode a serialized ender-monitor state into its display face and pulse
+/// (`rftoolspower:ender_monitor[facing=east,lit=false]`).
+pub(crate) fn parse_ender_monitor_state(text: &str) -> Option<(Direction, bool)> {
+    let (block, rest) = text.split_once('[')?;
+    if block != ENDER_MONITOR {
+        return None;
+    }
+    let mut display = None;
+    let mut lit = false;
+    for property in rest.strip_suffix(']')?.split(',') {
+        let (key, value) = property.split_once('=')?;
+        match key {
+            KEY_FACING => display = Some(dir_from_name(value)?),
+            KEY_LIT => lit = value == "true",
+            _ => {}
+        }
+    }
+    Some((display?, lit))
+}
+
+/// The decoded state, through the cache `block_signal` (asked very often) reads.
+fn ender_monitor_face(level: &dyn LevelHost, state: BlockState) -> Option<EnderMonitorFace> {
+    if let Some(hit) = ENDER_MONITOR_FACES
+        .lock()
+        .expect("the ender monitor state cache is never held across a panic")
+        .get(&state)
+    {
+        return Some(*hit);
+    }
+    let (display, lit) = parse_ender_monitor_state(&level.state_string(state)?)?;
+    let face = EnderMonitorFace { display, lit };
+    ENDER_MONITOR_FACES
+        .lock()
+        .expect("the ender monitor state cache is never held across a panic")
+        .insert(state, face);
+    Some(face)
+}
+
+/// `block_signal`: the pulse's 15 on the display side for the tick it fires, nothing elsewhere.
+///
+/// Upstream answers only `getSignal` (weak) and leaves `getDirectSignal` at 0; so does this. The
+/// port answers on the display side for the reason slice 2's monitor does: upstream's
+/// `getRedstoneOutput` names the input side while `setRedstoneState` notifies the display side,
+/// and the two disagree (recorded in `notes.md`).
+pub(crate) fn ender_monitor_signal(level: &dyn LevelHost, event: &mut BlockSignalEvent) {
+    if event.direct {
+        return;
+    }
+    let Some(face) = ender_monitor_face(level, event.state) else {
+        return;
+    };
+    if face.lit && event.face == face.display {
+        event.signal = MONITOR_SIGNAL;
+    }
+}
+
+/// `is_signal_source`: an ender monitor answers the signal query, so redstone wire connects to it.
+pub(crate) fn ender_monitor_signal_source(level: &dyn LevelHost, event: &mut IsSignalSourceEvent) {
+    if level.state_block(event.state) == Some(ENDER_MONITOR) {
+        event.source = true;
+    }
+}
+
+/// `LogicSlabBlock.getStateForPlacement`: the placer's look is the monitor's display front, so
+/// the generator it watches is the block behind it. Upstream also reads the click point for the
+/// slab's vertical mountings; at this pin the placement carries the view angles only, so the
+/// display is horizontal (recorded in `notes.md`).
+pub(crate) fn ender_monitor_placement(
+    level: &dyn LevelHost,
+    event: &StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    if level.state_block(event.state) != Some(ENDER_MONITOR) {
+        return None;
+    }
+    let display = facing_from_yaw(event.context.yaw);
+    Some(level.state_with_property(event.state, KEY_FACING, dir_name(display)))
+}
+
+/// The ender monitor's report line, as `/rftoolspower endermonitor` and a click print it.
+pub(crate) fn ender_monitor_line(
+    pos: [i32; 3],
+    state: &EnderMonitor,
+    facing: Option<Direction>,
+    out: i32,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let facing = facing.map_or("none", dir_name);
+    let last = state.last.map_or("none", MonitorMode::command_name);
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Ender Monitor at {},{},{}: mode={} facing={facing} pulses={} last={last} needpulse={} \
+         out={out} t={t}{suffix}",
+        pos[0],
+        pos[1],
+        pos[2],
+        state.mode.command_name(),
+        state.pulses,
+        state.need_pulse,
+    )
+}
+
+/// What a monitor's block state says: the display face and whether it is pulsing this tick.
+fn monitor_state_of(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> (Option<Direction>, i32) {
+    let display = level
+        .block_property(host, pos, KEY_FACING)
+        .and_then(|name| dir_from_name(name.as_str()));
+    let lit = level
+        .block_property(host, pos, KEY_LIT)
+        .is_some_and(|value| value.as_str() == "true");
+    (display, if lit { MONITOR_SIGNAL } else { 0 })
+}
+
+/// The monitor at `pos` as `/rftoolspower endermonitor` prints it, or [`NO_ENDER_MONITOR`].
+pub(crate) fn ender_monitor_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    let Some(state) = ender_monitor_at(host, level, pos) else {
+        return NO_ENDER_MONITOR.to_owned();
+    };
+    let (facing, out) = monitor_state_of(&*host, level, pos);
+    let t = level.game_time(&*host).unwrap_or(0);
+    ender_monitor_line(pos, &state, facing, out, t, nonce)
+}
+
+/// Set a monitor's mode, the harness's stand-in for upstream's GUI picker (`setMode`). The reply is
+/// the status line (with the caller's nonce), so a later read can prove it is fresh.
+pub(crate) fn set_monitor_mode(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    word: &str,
+    nonce: Option<&str>,
+) -> String {
+    let Some(mut state) = ender_monitor_at(host, level, pos) else {
+        return NO_ENDER_MONITOR.to_owned();
+    };
+    let Some(mode) = MonitorMode::parse_command(word) else {
+        return format!(
+            "Ender Monitor at {},{},{}: unknown mode '{word}' (lost|fired|arrived|status)",
+            pos[0], pos[1], pos[2]
+        );
+    };
+    state.mode = mode;
+    write_ender_monitor_at(host, level, pos, &state);
+    ender_monitor_status_line(host, level, pos, nonce)
+}
+
+/// A click on an ender monitor reads its status (there is no GUI in this slice).
+pub(crate) fn ender_monitor_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    if block_id(&*host, level, click.pos).as_deref() != Some(ENDER_MONITOR) {
+        return None;
+    }
+    let line = ender_monitor_status_line(host, level, click.pos, None);
+    if let Some(player) = host.player(click.player) {
+        let _ = player.action_bar(host, Text::literal(line));
+    }
+    Some(InteractionResult::Success)
 }
 
 /// A click on the endergenic reads its status (there is no GUI in this slice).
@@ -2650,6 +3083,79 @@ impl BlockEntityPart for InjectorPart {
     }
 }
 
+/// The ender monitor: it ticks out the one-tick pulse the generator fires at it, and a click
+/// reads its mode and counters.
+pub(crate) struct EnderMonitorPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for EnderMonitorPart {
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseItemOnEvent<'_>,
+    ) -> Option<InteractionResult> {
+        ender_monitor_click(host, event.click)
+    }
+
+    fn use_without_item(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseWithoutItemEvent<'_>,
+    ) -> Option<InteractionResult> {
+        ender_monitor_click(host, event.click)
+    }
+
+    /// The placer's look is the display front; the generator it watches is behind it.
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        ender_monitor_placement(level, event)
+    }
+
+    /// The pulse's 15 on the display side, for the one tick it fires.
+    fn block_signal(&self, level: &dyn LevelHost, event: &mut BlockSignalEvent) {
+        ender_monitor_signal(level, event);
+    }
+
+    /// A monitor answers the signal query, so wire connects to it.
+    fn is_signal_source(&self, level: &dyn LevelHost, event: &mut IsSignalSourceEvent) {
+        ender_monitor_signal_source(level, event);
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for EnderMonitorPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound — watching lost pearls, no pulse.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: it ticks. Never clear a value an earlier mod set.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: spend an owed pulse as 15, and mirror it into `lit`.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let changed = tick_ender_monitor(host, level, pos, &mut saved);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2903,10 +3409,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_eight_the_harness_types() {
+    fn the_commands_are_the_nine_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 8);
+        assert_eq!(commands.len(), 9);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -2940,9 +3446,118 @@ mod tests {
             commands[7].usage, "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
             "the wrench's link, as a command"
         );
+        assert_eq!(
+            commands[8].usage,
+            "rftoolspower endermonitor <pos:block_pos> <action:word> [nonce:word]",
+            "the monitor's readout is `status <nonce>`; a mode word sets its GUI picker"
+        );
         for command in &commands {
             assert_eq!(command.level, OPERATOR_LEVEL);
         }
+    }
+
+    // --- the ender monitor ---------------------------------------------------
+
+    #[test]
+    fn the_ender_monitor_state_reads_back_from_the_compound_it_wrote() {
+        let mut saved = compound();
+        assert_eq!(
+            read_ender_monitor(&saved),
+            EnderMonitor::new(),
+            "a fresh monitor watches lost pearls"
+        );
+        let mut state = EnderMonitor::new();
+        state.mode = MonitorMode::PearlArrived;
+        state.need_pulse = true;
+        state.pulses = 4;
+        state.last = Some(MonitorMode::PearlArrived);
+        write_ender_monitor(&mut saved, &state);
+        assert_eq!(read_ender_monitor(&saved), state);
+        assert_eq!(
+            saved.get(KEY_MONITOR_MODE),
+            Some(&Tag::String("MODE_PEARLARRIVED".into())),
+            "the mode is saved under upstream's serialised name"
+        );
+        assert_eq!(saved.get(KEY_NEED_PULSE), Some(&Tag::Byte(1)));
+        assert_eq!(saved.get(KEY_PULSES), Some(&Tag::Int(4)));
+    }
+
+    #[test]
+    fn a_monitor_with_no_last_mode_carries_no_stale_key() {
+        let mut saved = compound();
+        let mut state = EnderMonitor::new();
+        state.pulses = 1;
+        state.last = Some(MonitorMode::PearlFired);
+        write_ender_monitor(&mut saved, &state);
+        write_ender_monitor(&mut saved, &EnderMonitor::new());
+        assert_eq!(
+            saved.get(KEY_LAST),
+            None,
+            "a monitor that never fired carries no last mode"
+        );
+    }
+
+    #[test]
+    fn a_doctored_monitor_save_reads_back_as_the_default_mode() {
+        let mut saved = compound();
+        set_text(&mut saved, KEY_MONITOR_MODE, "MODE_MADEUP");
+        set_int(&mut saved, KEY_PULSES, -3);
+        set_text(&mut saved, KEY_LAST, "MODE_PEARLARRIVED");
+        let state = read_ender_monitor(&saved);
+        assert_eq!(
+            state.mode,
+            MonitorMode::LostPearl,
+            "an unknown mode falls back to upstream's default"
+        );
+        assert_eq!(state.pulses, 0, "a negative counter is 0");
+        assert_eq!(state.last, None, "no pulse, no last mode");
+    }
+
+    #[test]
+    fn the_ender_monitor_readout_is_the_line_the_e2e_asserts() {
+        let mut state = EnderMonitor::new();
+        state.mode = MonitorMode::PearlArrived;
+        state.pulses = 1;
+        state.last = Some(MonitorMode::PearlArrived);
+        assert_eq!(
+            ender_monitor_line(
+                [304, 101, 97],
+                &state,
+                Some(Direction::East),
+                0,
+                15,
+                Some("3")
+            ),
+            "Ender Monitor at 304,101,97: mode=arrived facing=east pulses=1 last=arrived \
+             needpulse=false out=0 t=15 nonce=3"
+        );
+        assert_eq!(
+            ender_monitor_line([304, 101, 94], &EnderMonitor::new(), None, 0, 0, None),
+            "Ender Monitor at 304,101,94: mode=lost facing=none pulses=0 last=none \
+             needpulse=false out=0 t=0"
+        );
+    }
+
+    #[test]
+    fn the_ender_monitor_state_string_decodes_its_face_and_pulse() {
+        assert_eq!(
+            parse_ender_monitor_state("rftoolspower:ender_monitor[facing=east,lit=true]"),
+            Some((Direction::East, true)),
+            "the display face and the pulse this tick"
+        );
+        assert_eq!(
+            parse_ender_monitor_state("rftoolspower:ender_monitor[facing=north,lit=false]"),
+            Some((Direction::North, false))
+        );
+        assert_eq!(
+            parse_ender_monitor_state("rftoolspower:power_monitor[facing=east,level=3,lit=true]"),
+            None,
+            "another block's state is not an ender monitor"
+        );
+        assert_eq!(
+            parse_ender_monitor_state("rftoolspower:ender_monitor"),
+            None
+        );
     }
 
     #[test]
@@ -3244,6 +3859,33 @@ mod tests {
             "the payload names the block entity type it is placed as"
         );
         assert_eq!(read_endergenic(&payload).energy, 3_000);
+    }
+
+    #[test]
+    fn a_broken_monitors_mode_rides_on_its_item_tagged_with_its_type() {
+        let mut payload = Compound::new();
+        payload.insert(
+            KEY_MONITOR_MODE.into(),
+            Tag::String(MonitorMode::PearlFired.saved().into()),
+        );
+        let patch = Tag::Compound(entity_data_patch(&payload, ENDER_MONITOR_TYPE_ID));
+        let Some(Tag::Compound(payload)) = patch.get(BLOCK_ENTITY_DATA) else {
+            panic!("the patch names the vanilla component");
+        };
+        let payload = Tag::Compound(payload.clone());
+        assert_eq!(
+            payload.get("id"),
+            Some(&Tag::String(ENDER_MONITOR_TYPE_ID.into())),
+            "the payload names the block entity type it is placed as"
+        );
+        let restored = read_ender_monitor(&payload);
+        assert_eq!(restored.mode, MonitorMode::PearlFired);
+        assert!(!restored.need_pulse, "no event is owed by a placed item");
+        assert_eq!(
+            restored.pulses, 0,
+            "the readout's counters stay on the block"
+        );
+        assert_eq!(restored.last, None);
     }
 
     #[test]

@@ -1,10 +1,11 @@
-# RFTools Power for Horizon — the Coal Generator, the Power Monitor, the Powercell and the Endergenic
+# RFTools Power for Horizon — the Coal Generator, the Power Monitor, the Powercell, the Endergenic
+# and the Ender Monitor
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.3**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.4**.
 
-Four families so far:
+Five families so far:
 
 **The Coal Generator** (slice 1)
 
@@ -52,8 +53,18 @@ Four families so far:
 - the buffer is **5,000,000 FE** and pushes out up to **20,000 FE a tick**, keeping a **2,000 FE**
   reserve to hold pearls with;
 - a link is a **2-tick flight** for a three-block gap, the injector holds **18 pearls**, and the
-  smart wrench's link is `/rftoolspower enderlink <pos> <dest>`;
-- the ender monitor is the next slice (`notes.md`, gap 10).
+  smart wrench's link is `/rftoolspower enderlink <pos> <dest>`.
+
+**The Ender Monitor** (slice 5)
+
+- watches **one** of the generator's three events — a lost pearl, a launch, an arrival — chosen by
+  its mode (the item carries it; the command sets it);
+- answers the event it watches with **15 on its display face for exactly one tick**, and its `lit`
+  state mirrors that tick;
+- keeps its mode on its own item when broken;
+- reads and sets the mode through
+  `/rftoolspower endermonitor <pos> status|MODE [nonce]` — the harness's stand-in for upstream's
+  GUI picker.
 
 ## Build
 
@@ -69,8 +80,8 @@ packed.
 
 | Path | What |
 |---|---|
-| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the cell's tiers/faces/network/budgets, the endergenic's window/table/flight/hold) with their unit tests |
-| `src/support.rs` | the glue: both block entity Parts, the container and buffer declarations, the ticks, the click, the drops, the redstone, the commands |
+| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the cell's tiers/faces/network/budgets, the endergenic's window/table/flight/hold, the ender monitor's mode gate and one-tick pulse) with their unit tests |
+| `src/support.rs` | the glue: every block entity Part, the container and buffer declarations, the ticks, the clicks, the drops, the redstone, the `fireMonitors` notice and the commands |
 | `src/lib.rs` | the one `impl mod_api::Hooks` |
 | `assets/`, `data/` | the carried content, built by `tools/assemble_content.py` |
 | `tools/e2e.sh` | the in-game leg (phases A–AM) |
