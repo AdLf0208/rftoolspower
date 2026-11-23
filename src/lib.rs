@@ -1,8 +1,9 @@
-//! RFTools Power — five machines, as one `impl Hooks` at the crate root.
+//! RFTools Power — six machines, as one `impl Hooks` at the crate root.
 //!
 //! The carried content is this package's own `assets/` and `data/` (`rftoolspower:coalgenerator`,
-//! `power_monitor`, `cell1`/`cell2`, `endergenic`, `pearl_injector`, `ender_monitor` and their
-//! items, models and recipes); the behaviour is [`support`]:
+//! `power_monitor`, `cell1`/`cell2`, `endergenic`, `pearl_injector`, `ender_monitor`,
+//! `blazing_generator`, `blazing_agitator` and their items, models and recipes); the behaviour is
+//! [`support`]:
 //!
 //! - a [`BlockEntityPart`] on the coal generator ticks it on the server, mirrors the burn into the
 //!   block's `lit` state, takes fuel from its one slot, declares the 500,000 FE buffer through the
@@ -17,8 +18,12 @@
 //!   landed pearl for 500 FE a tick, and notifies the ender monitors around it; the pearl injector
 //!   fires one pearl a rising edge at the generator it points at;
 //! - the ender monitor arms on the one event its mode names and answers 15 for exactly one tick.
+//! - the blazing generator ramps each rod slot's rate a 150th of the gap to its own quality
+//!   ceiling; the blazing agitator's 3×3 box mutates rods it holds — their quality and duration
+//!   climb by the square of a factor built from the neighbouring rods, their clock runs down, and
+//!   a finished rod moves to one of nine output slots unless its slot is locked.
 //!
-//! `/rftoolspower info|monitor|powerlevel|band|cell|side|endergenic|injector|enderlink|endermonitor`
+//! `/rftoolspower info|monitor|powerlevel|band|cell|side|endergenic|injector|enderlink|endermonitor|blazing|agitator|agitatelock`
 //! serves the harness and is the stand-in for the GUIs and the smart wrench this tier does not
 //! carry.
 //!
@@ -38,8 +43,8 @@ struct Mod;
 impl Hooks for Mod {
     /// Declare the generator's block entity type, its Part, its one fuel slot and its buffer; the
     /// monitor's; the power level's; the two powercells' Part and network energy capability; the
-    /// endergenic's Part and buffer; the injector's Part and eighteen pearl slots; and the ender
-    /// monitor's Part.
+    /// endergenic's Part and buffer; the injector's Part and eighteen pearl slots; the ender
+    /// monitor's Part; and the blazing generator's and agitator's Parts, slots and buffers.
     fn register(&self, r: &mut dyn Registrar, context: &RegistrationContext) {
         support::declare(r, context);
     }
@@ -69,9 +74,9 @@ impl Hooks for Mod {
         support::run_command(host, event)
     }
 
-    /// A click on the blazing generator never uses the held item (upstream opens its GUI): the
-    /// block's own use takes the rod or refuses the item, and a block in the hand is not placed
-    /// against the machine.
+    /// A click on the blazing generator or the blazing agitator never uses the held item
+    /// (upstream opens a GUI): the click takes a rod or refuses the item, and a block in the hand
+    /// is not placed against the machine.
     fn right_click_block(
         &self,
         host: mod_api::HostSide<'_>,

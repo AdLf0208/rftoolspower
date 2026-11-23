@@ -103,12 +103,29 @@
 #  BE a stone is refused as a rod, the `blazing` refusal parses, and the carried recipe needs the
 #     parent's machine frame and the absent `#c:rods/blaze` tag, so it crafts nothing here
 #
+#  BF an agitator placed with a store reads empty (nine slots, nine locks off) and three clicks fill
+#     slots 0..2 with the rod's own `blazing_rod_data` (time 600)
+#  BG three rods in a row agitate exactly as the adjacency algorithm folds them: quality and duration
+#     climb by adjacency^2 (0.5176/0.5523/0.5176 a tick at the artefact's 0.2275/0.235 factors, not
+#     a factor of 1), the clocks run down, and the 50,000 buffer spends exactly 10 FE a tick
+#  BH a rod alone rises 0.484 a tick (its factor is 0.22); SELFTEST_AGITATOR=1 asserts the brief's
+#     10 a tick and fails
+#  BI a finished rod moves to the first free output slot, and a locked slot keeps its rod
+#  BJ a vanilla blaze rod becomes a blazing rod; a rod already infused (steps 10) is refused and
+#     stays in the server's inventory
+#  BK the buffer takes exactly 100 FE a tick from a neighbour (the insert cap) and spends 10
+#  BL a finished rod's component reaches the output box and a hopper under it pulls the rod out
+#  BM the store, the locks and the rods survive save + relaunch
+#  BN the agitator's refusals parse, a stone is refused as a rod, and the carried recipe needs the
+#     parent's machine frame and the absent `#c:rods/blaze` tag
+#
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
 # of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF;
 # SELFTEST_ENDERMON=1 inverts AO (the monitor must not have lit);
 # SELFTEST_POWERLEVEL=1 inverts the power level's 5 (it asserts the brief's mistaken 4);
-# SELFTEST_BLAZING=1 asserts a rod at its ceiling makes no FE (AZ inverted) and exits non-zero.
+# SELFTEST_BLAZING=1 asserts a rod at its ceiling makes no FE (AZ inverted) and exits non-zero;
+# SELFTEST_AGITATOR=1 asserts a rod alone rises the brief's 10 a tick (BH inverted) and exits 1.
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -126,6 +143,7 @@ SELFTEST_MONITOR=${SELFTEST_MONITOR:-0}
 SELFTEST_ENDERMON=${SELFTEST_ENDERMON:-0}
 SELFTEST_POWERLEVEL=${SELFTEST_POWERLEVEL:-0}
 SELFTEST_BLAZING=${SELFTEST_BLAZING:-0}
+SELFTEST_AGITATOR=${SELFTEST_AGITATOR:-0}
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
 WORLD=RFToolsPowerE2E
@@ -149,6 +167,7 @@ COAL=minecraft:coal
 CHARCOAL=minecraft:charcoal
 COAL_BLOCK=minecraft:coal_block
 STONE=minecraft:stone
+AGITATOR=rftoolspower:blazing_agitator
 
 [ -n "$CTL" ] || { echo "set CTL= to the horizon-ctl of this pin (launcher-game.sh env)" >&2; exit 1; }
 [ -x "$CTL" ] || { echo "missing horizon-ctl: $CTL" >&2; exit 1; }
@@ -198,7 +217,7 @@ launch() { # launch [WORLD]
     rm -f "$SOCK"
     cd "$SCRATCH"
     local args=(--game "$GAME" --world "$world" --seed 20261105 --creative --offscreen
-                --wait --resources "$RES")
+                --wait --game-dir "$SCRATCH/game" --resources "$RES")
     "$CTL" --socket "$SOCK" launch "${args[@]}" >/dev/null
     ctl wait-ready 180
     ctl wait 40
@@ -613,6 +632,14 @@ hold_rod() { # hold_rod DURATION [QUALITY]
     ctl wait 2 >/dev/null
 }
 
+hold_rod_time() { # hold_rod_time TIME [DURATION] — a rod whose agitation clock is nearly out
+    ctl command "item replace entity @s hotbar.0 with $ROD_ITEM[rftoolspower:blazing_rod_data={steps:64,time:$1,quality:60000,duration:${2:-20}}] 1" >/dev/null \
+        || fail "the game refused the rod with its component"
+    ctl wait 4 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+}
+
 click_held() { # click_held X Y Z — right-click with whatever hotbar slot 1 holds
     local x=$1 y=$2 z=$3
     ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
@@ -649,6 +676,93 @@ expect_bz_rod() { # expect_bz_rod SLOT ITEM|empty
     local rod
     eval "rod=\$BZ_ROD$1"
     [ "$rod" = "$2" ] || fail "blazing slot $1 holds '$rod', expected '$2'"
+}
+
+# --- the blazing agitator (slice 8) --------------------------------------
+# A slab, `RotationType.NONE`: no state to pin, and the click is the only way a rod goes in (the
+# GUI is not carried). The readout names every slot's own rod data, which is what the fold needs.
+place_agitator() { # place_agitator X Y Z — a fresh agitator from the hotbar
+    local x=$1 y=$2 z=$3 aim
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    hold "$AGITATOR"
+    aim=$(ctl look-at-block "$x" $((y - 1)) "$z" up 2>&1) \
+        || fail "cannot aim at the floor under $x,$y,$z: $aim"
+    place_block "$x" "$y" "$z" "$AGITATOR" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$AGITATOR" ] || fail "the agitator did not place at $x,$y,$z"
+    echo "  placed: $(ctl block "$x" "$y" "$z" | jq -r '.state')" >&2
+}
+
+place_agitator_kept() { # place_agitator_kept X Y Z — the agitator item the player already carries
+    local x=$1 y=$2 z=$3
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select "$AGITATOR" >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at-block "$x" $((y - 1)) "$z" up >/dev/null || fail "cannot aim at the floor under $x,$y,$z"
+    place_block "$x" "$y" "$z" "$AGITATOR" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$AGITATOR" ] || fail "the carried agitator did not place at $x,$y,$z"
+}
+
+# An agitator with `FE` in its own store: the machine's item carries `block_entity_data`, which
+# the block entity reads back on placement (the buffer clamps it to 50,000).
+energised_agitator() { # energised_agitator X Y Z FE
+    ctl command "give @s $AGITATOR[minecraft:block_entity_data={id:\"rftoolspower:blazing_agitator_block_entity\",energy:$4}]" >/dev/null
+    ctl wait 6 >/dev/null
+    place_agitator_kept "$1" "$2" "$3"
+}
+
+# A right click on the agitator's top face: the slab's upper surface is below the eye at y=101.
+click_agitator() { # click_agitator X Y Z
+    ctl command "execute in minecraft:the_end run tp @s $(($1 - 2)).5 101 $3.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at "$1.5" "$2.25" "$3.5" >/dev/null || fail "cannot aim at the agitator at $1,$2,$3"
+    ctl interact "$1" "$2" "$3" up >/dev/null
+    ctl wait 10 >/dev/null
+}
+
+# `/rftoolspower agitator X Y Z <nonce>`: the line, then the parsed fields (AG_*).
+agitator() { # agitator X Y Z
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower agitator $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower agitator reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_agitator.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the agitator line did not parse: $line"
+    echo "  $line" >&2
+}
+
+expect_ag_energy() { [ "$AG_ENERGY" = "$1" ] || fail "the agitator holds $AG_ENERGY FE, expected $1"; }
+expect_ag_rod() { # expect_ag_rod SLOT ITEM|empty
+    local held
+    eval "held=\$AG_ROD$1"
+    [ "$held" = "$2" ] || fail "agitator slot $1 holds '$held', expected '$2'"
+}
+expect_ag_out() { # expect_ag_out SLOT ITEM|empty
+    local held
+    eval "held=\$AG_OUT$1"
+    [ "$held" = "$2" ] || fail "agitator output $1 holds '$held', expected '$2'"
+}
+expect_ag_lock() { # expect_ag_lock SLOT 0|1
+    local locked
+    eval "locked=\$AG_LOCK$1"
+    [ "$locked" = "$2" ] || fail "agitator slot $1's lock is $locked, expected $2"
+}
+
+# The 3×3 box folded from the two replies' own values over the ticks their `t=` names.
+ag_fold() { # ag_fold T0 T1 TIME0 QUALITY0 DURATION0 TIME1 QUALITY1 DURATION1
+    eval "$(python3 "$PORT/tools/parse_agitator.py" --fold "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8")"
 }
 
 echo "== launch (The End arena, the package's own content and code) =="
@@ -2572,4 +2686,357 @@ ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  the machine frame and the absent #c:rods/blaze tag are the recipe's limit here"
 
-echo "PASS: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+# --- the blazing agitator (slice 8) --------------------------------------
+echo "== BF: an agitator with a store fills its 3x3 box from clicks =="
+# BE left the player in creative for its crafting table, and vanilla's creative rule keeps the
+# clicked stack in the hand (`ItemPlace`), so the rod phases run in survival.
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 6 >/dev/null
+energised_agitator "$SX" 101 146 40000
+agitator "$SX" 101 146
+# The store has already spent a few ticks' worth between the placement and this read (it runs as
+# soon as it has 10 FE), so the seed is an upper bound, not an equality.
+python3 - "$AG_ENERGY" <<'SEEDED' || fail "the agitator holds $AG_ENERGY FE, expected just under the 40,000 seeded"
+import sys
+sys.exit(0 if 39000 <= int(sys.argv[1]) <= 40000 else 1)
+SEEDED
+[ "$AG_READY" = 1 ] || fail "a 40,000 FE agitator is not ready ($AG_READY)"
+for slot in 0 1 2 3 4 5 6 7 8; do
+    expect_ag_rod "$slot" empty
+    expect_ag_lock "$slot" 0
+done
+for _ in 1 2 3; do
+    hold_rod 600
+    click_agitator "$SX" 101 146
+done
+agitator "$SX" 101 146
+for slot in 0 1 2; do
+    expect_ag_rod "$slot" "$ROD_ITEM"
+    expect_ag_out "$slot" empty
+done
+SERVER_INV=$(server_inventory)
+if printf '%s' "$SERVER_INV" | grep -q "rftoolspower:blazing_rod"; then
+    fail "the server still holds a rod after the three clicks: $SERVER_INV"
+fi
+# A rod whose clock started at 600 and is still running: it has been agitated since it landed.
+python3 - "$AG_TIME0" <<'TIME600' || fail "slot 0's clock reads $AG_TIME0, expected just under 600"
+import sys
+sys.exit(0 if 0.0 < 600.0 - float(sys.argv[1]) < 60.0 else 1)
+TIME600
+echo "  three clicks filled slots 0..2: time $AG_TIME0/$AG_TIME1/$AG_TIME2, quality $AG_QUALITY0 (the store is being spent)"
+
+echo "== BG: three rods in a row agitate at the adjacency square, and a tick costs 10 FE =="
+agitator "$SX" 101 146
+E0=$AG_ENERGY; T0=$AG_T
+A_TIME0=$AG_TIME0,$AG_TIME1,$AG_TIME2,-,-,-,-,-,-
+A_QUALITY0=$AG_QUALITY0,$AG_QUALITY1,$AG_QUALITY2,-,-,-,-,-,-
+A_DURATION0=$AG_DURATION0,$AG_DURATION1,$AG_DURATION2,-,-,-,-,-,-
+Q_LEFT0=$AG_QUALITY0; Q_MIDDLE0=$AG_QUALITY1
+ctl wait 40 >/dev/null
+agitator "$SX" 101 146
+E1=$AG_ENERGY; T1=$AG_T
+DT=$((T1 - T0)); DE=$((E0 - E1))
+A_TIME1=$AG_TIME0,$AG_TIME1,$AG_TIME2,-,-,-,-,-,-
+A_QUALITY1=$AG_QUALITY0,$AG_QUALITY1,$AG_QUALITY2,-,-,-,-,-,-
+A_DURATION1=$AG_DURATION0,$AG_DURATION1,$AG_DURATION2,-,-,-,-,-,-
+echo "  over $DT ticks: $E0 -> $E1 FE (-$DE), quality $Q_LEFT0/$Q_MIDDLE0 -> $AG_QUALITY0/$AG_QUALITY1" >&2
+[ "$DT" -ge 20 ] || fail "only $DT ticks passed; the window is too small to assert"
+[ "$DE" = $((10 * DT)) ] || fail "the store fell $DE over $DT ticks, expected $((10 * DT)) (10 FE a tick)"
+ag_fold "$T0" "$T1" "$A_TIME0" "$A_QUALITY0" "$A_DURATION0" "$A_TIME1" "$A_QUALITY1" "$A_DURATION1"
+echo "  the fold: $FOLD_QUALITY (error $FOLD_ERROR against the reply's own values)" >&2
+python3 - "$FOLD_ERROR" <<'FOLDOK' || fail "the rods are not the adjacency algorithm's fold (largest delta $FOLD_ERROR over $FOLD_TICKS ticks)"
+import sys
+sys.exit(0 if float(sys.argv[1]) < 0.0001 else 1)
+FOLDOK
+python3 - "$Q_LEFT0" "$AG_QUALITY0" "$FOLD_TICKS" <<'ADJACENCY' \
+    || fail "slot 0's quality rose $((0)) — it is not adjacency² × 10 a tick"
+import sys
+first, now, ticks = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+rise = now - first
+# The brief's claim (a factor of 1) would be 10 a tick; the artefact's edge rod is 0.2275² × 10.
+sys.exit(0 if 0.0 < rise < 10.0 * ticks * 0.1 else 1)
+ADJACENCY
+echo "  the three rods' quality/duration rose and their clocks fell exactly as the adjacency algorithm folds"
+
+echo "== BH: a rod alone is agitated by its own factor (the brief's 1 is wrong) =="
+energised_agitator "$SX" 101 152 5000
+hold_rod 600
+click_agitator "$SX" 101 152
+agitator "$SX" 101 152
+L_T0=$AG_T; L_TIME0=$AG_TIME0,-,-,-,-,-,-,-,-; L_QUALITY0=$AG_QUALITY0,-,-,-,-,-,-,-,-
+L_DURATION0=$AG_DURATION0,-,-,-,-,-,-,-,-
+L_Q0=$AG_QUALITY0
+ctl wait 30 >/dev/null
+agitator "$SX" 101 152
+L_T1=$AG_T
+L_TIME1=$AG_TIME0,-,-,-,-,-,-,-,-; L_QUALITY1=$AG_QUALITY0,-,-,-,-,-,-,-,-
+L_DURATION1=$AG_DURATION0,-,-,-,-,-,-,-,-
+ag_fold "$L_T0" "$L_T1" "$L_TIME0" "$L_QUALITY0" "$L_DURATION0" "$L_TIME1" "$L_QUALITY1" "$L_DURATION1"
+echo "  the lone rod: quality $L_Q0 -> $AG_QUALITY0 in $FOLD_TICKS ticks (fold $FOLD_QUALITY, error $FOLD_ERROR)" >&2
+python3 - "$FOLD_ERROR" <<'FOLDOK1' || fail "the lone rod is not the adjacency algorithm's fold (delta $FOLD_ERROR)"
+import sys
+sys.exit(0 if float(sys.argv[1]) < 0.0001 else 1)
+FOLDOK1
+if [ "$SELFTEST_AGITATOR" = 1 ]; then
+    echo "(selftest: asserting a rod alone rises 10 a tick, the brief's factor of 1)"
+    python3 - "$L_Q0" "$AG_QUALITY0" "$FOLD_TICKS" <<'BRIEFRISE' \
+        || fail "selftest: the lone rod's quality rose $(python3 -c "print(round($AG_QUALITY0 - $L_Q0, 3))") in $FOLD_TICKS ticks (0.22² × 10 = 0.484 a tick), not the brief's 10 a tick ($((10 * FOLD_TICKS))) — the assertion is alive"
+import sys
+first, now, ticks = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+rise = now - first
+sys.exit(0 if abs(rise - 10.0 * ticks) < 0.5 else 1)
+BRIEFRISE
+fi
+python3 - "$L_Q0" "$AG_QUALITY0" "$FOLD_TICKS" <<'LONE' || fail "the lone rod's rise is not a quarter of a lone rod's factor"
+import sys
+first, now, ticks = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+rise = now - first
+expected = 0.22 * 0.22 * 10.0 * ticks
+sys.exit(0 if abs(rise - expected) < 0.05 * max(1.0, expected) else 1)
+LONE
+[ "$AG_READY" = 1 ] || fail "the lone-rod agitator ran out of FE"
+echo "  a rod alone rises 0.484 a tick (0.22² × 10), not the brief's 10: its factor is 0.22, not 1"
+
+echo "== BI: a finished rod moves to the output box unless its slot is locked =="
+energised_agitator "$SX" 101 154 5000
+say "rftoolspower agitatelock $SX 101 154 2 on $((NONCE + 1))"
+NONCE=$((NONCE + 1))
+LINE=$(await_line "nonce=$NONCE")
+[ -n "$LINE" ] || fail "no fresh agitatelock reply: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE" >&2
+eval "$(python3 "$PORT/tools/parse_agitator.py" "$LINE")"
+[ "${ok:-0}" = 1 ] || fail "the agitatelock echo did not parse: $LINE"
+expect_ag_lock 2 1
+hold_rod_time 0.05
+click_agitator "$SX" 101 154
+hold_rod_time 0.05
+click_agitator "$SX" 101 154
+# Slots 0 and 1 hold the two short rods; slot 2 is empty and locked (its lock is the differential).
+MOVED=0
+for _ in $(seq 1 30); do
+    agitator "$SX" 101 154
+    [ "$AG_ROD0" = empty ] && [ "$AG_OUT0" = "$ROD_ITEM" ] && { MOVED=1; break; }
+    ctl wait 5 >/dev/null
+done
+[ "$MOVED" = 1 ] || fail "neither short rod left its slot (slot0 '$AG_ROD0', out0 '$AG_OUT0')"
+[ "$AG_OUT1" = "$ROD_ITEM" ] || fail "the second short rod did not reach output slot 1 ('$AG_OUT1')"
+expect_ag_lock 2 1
+echo "  both finished rods moved to the output box in order and the locked slot 2 kept its lock"
+
+# The locked slot keeps a *rod*: put a spent rod into it and watch it stay.
+say "rftoolspower agitatelock $SX 101 154 0 on $((NONCE + 1))"
+NONCE=$((NONCE + 1))
+LINE=$(await_line "nonce=$NONCE")
+[ -n "$LINE" ] || fail "no fresh agitatelock reply for slot 0: $(ctl messages 8 | jq -c '.chat')"
+eval "$(python3 "$PORT/tools/parse_agitator.py" "$LINE")"
+expect_ag_lock 0 1
+hold_rod_time 0.01
+click_agitator "$SX" 101 154
+KEPT=0
+for _ in $(seq 1 30); do
+    agitator "$SX" 101 154
+    [ "$AG_ROD0" = "$ROD_ITEM" ] && { KEPT=1; break; }
+    ctl wait 5 >/dev/null
+done
+[ "$KEPT" = 1 ] || fail "the rod clicked into the locked slot 0 never arrived ('$AG_ROD0')"
+ctl wait 20 >/dev/null
+agitator "$SX" 101 154
+expect_ag_rod 0 "$ROD_ITEM"
+python3 - "$AG_TIME0" <<'SPENT' || fail "the locked slot's rod is not spent (time $AG_TIME0)"
+import sys
+sys.exit(0 if float(sys.argv[1]) <= 0.0 else 1)
+SPENT
+echo "  a spent rod stays in its locked slot ($AG_ROD0, time $AG_TIME0) while an unlocked one moves out"
+
+echo "== BJ: a blaze rod becomes a blazing rod, and an infused rod is refused =="
+energised_agitator "$SX" 101 156 5000
+hold minecraft:blaze_rod
+click_agitator "$SX" 101 156
+CONVERTED=0
+for _ in $(seq 1 20); do
+    agitator "$SX" 101 156
+    [ "$AG_ROD0" = "$ROD_ITEM" ] && { CONVERTED=1; break; }
+    ctl wait 5 >/dev/null
+done
+[ "$CONVERTED" = 1 ] || fail "the clicked blaze rod never became a blazing rod ('$AG_ROD0')"
+echo "  a vanilla blaze rod became a blazing rod in slot 0"
+# A blazing rod that has already been infused (steps < 64) is not valid on the left side.
+ctl command "item replace entity @s hotbar.0 with $ROD_ITEM[rftoolspower:blazing_rod_data={steps:10,time:600,quality:60000,duration:20}] 1" >/dev/null
+ctl wait 4 >/dev/null
+ctl select 1 >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $(($SX - 2)).5 101 156.5" >/dev/null
+ctl wait 6 >/dev/null
+ctl look-at "$SX.5" 101.25 156.5 >/dev/null || fail "cannot aim at the agitator at $SX,101,156"
+ctl interact "$SX" 101 156 up >/dev/null
+ctl wait 10 >/dev/null
+agitator "$SX" 101 156
+expect_ag_rod 1 empty
+SERVER_INV=$(server_inventory)
+printf '%s' "$SERVER_INV" | grep -Eq 'steps: *10' \
+    || fail "the refused infused rod is not in the server's inventory: $SERVER_INV"
+echo "  an already-infused rod (steps 10) was refused and stayed in the server's inventory"
+
+echo "== BK: the agitator takes 100 FE a tick from a neighbour and spends 10 =="
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",energy:100000}]" >/dev/null
+ctl wait 6 >/dev/null
+place_kept "$((SX + 1))" 101 160
+energised_agitator "$SX" 101 160 0
+# Each store's rate is measured against its own reply's tick (a store still moving is not
+# conserved across two reads several ticks apart — the cell slice's trap 3).
+agitator "$SX" 101 160
+A_E0=$AG_ENERGY
+A_T0=$AG_T
+info "$((SX + 1))" 101 160
+G_E0=$ENERGY
+G_T0=$T
+ctl wait 40 >/dev/null
+agitator "$SX" 101 160
+A_DT=$((AG_T - A_T0))
+A_E1=$AG_ENERGY
+info "$((SX + 1))" 101 160
+G_DT=$((T - G_T0))
+G_E1=$ENERGY
+G_DE=$((G_E0 - G_E1))
+A_DE=$((A_E1 - A_E0))
+echo "  over $A_DT agitator / $G_DT generator ticks: generator $G_E0 -> $G_E1 (-$G_DE), agitator $A_E0 -> $A_E1 (+$A_DE)" >&2
+[ "$A_DT" -ge 20 ] || fail "only $A_DT ticks passed; the window is too small to assert"
+[ "$G_DE" = $((100 * G_DT)) ] || fail "the generator lost $G_DE FE over $G_DT ticks, expected $((100 * G_DT)) (the 100-a-tick insert cap)"
+[ "$A_DE" = $((90 * A_DT)) ] || fail "the agitator gained $A_DE FE over $A_DT ticks, expected $((90 * A_DT)) (100 in, 10 spent)"
+echo "  the buffer takes exactly 100 FE a tick and spends 10, so an idle box still nets 90"
+
+echo "== BL: a finished rod's component reaches the output box and leaves with it =="
+energised_agitator "$SX" 101 162 5000
+hold_rod_time 5
+click_agitator "$SX" 101 162
+agitator "$SX" 101 162
+[ "$AG_ROD0" = "$ROD_ITEM" ] || fail "the short rod did not land in slot 0 ('$AG_ROD0')"
+Q_BEFORE=$AG_QUALITY0
+python3 - "$Q_BEFORE" <<'ROSE' || fail "the short rod's quality did not rise in its slot ($Q_BEFORE)"
+import sys
+sys.exit(0 if float(sys.argv[1]) > 60000.0 else 1)
+ROSE
+OUT=0
+for _ in $(seq 1 40); do
+    agitator "$SX" 101 162
+    [ "$AG_ROD0" = empty ] && [ "$AG_OUT0" = "$ROD_ITEM" ] && { OUT=1; break; }
+    ctl wait 10 >/dev/null
+done
+[ "$OUT" = 1 ] || fail "the finished rod never reached output slot 0 ('$AG_OUT0')"
+# A hopper under the agitator pulls the output slot out; its own inventory proves the item, and its
+# `rftoolspower:blazing_rod_data` proves the component the agitator wrote.
+ctl command "execute in minecraft:the_end run setblock $SX 100 162 minecraft:hopper[facing=down]" >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$SX" 100 162)" = "minecraft:hopper" ] || fail "the hopper did not place under the agitator"
+PULLED=0
+for _ in $(seq 1 30); do
+    ctl command "data get block $SX 100 162 Items" >/dev/null
+    ctl wait 4 >/dev/null
+    LINE=$(await_line 'has the following block data')
+    case "$LINE" in
+        *rftoolspower:blazing_rod_data*) PULLED=1; break ;;
+    esac
+    ctl wait 10 >/dev/null
+done
+[ "$PULLED" = 1 ] || fail "the hopper holds no blazing rod with its data: $LINE"
+echo "  the hopper's Items: $(printf '%s' "$LINE" | cut -c1-220)" >&2
+agitator "$SX" 101 162
+expect_ag_out 0 empty
+echo "  the agitated rod with its component left the agitator for the hopper"
+
+echo "== BM: the store, the locks and the rods survive save + relaunch =="
+say "rftoolspower agitatelock $SX 101 146 4 on $((NONCE + 1))"
+NONCE=$((NONCE + 1))
+LINE=$(await_line "nonce=$NONCE")
+[ -n "$LINE" ] || fail "no fresh agitatelock reply before the save: $(ctl messages 8 | jq -c '.chat')"
+eval "$(python3 "$PORT/tools/parse_agitator.py" "$LINE")"
+expect_ag_lock 4 1
+agitator "$SX" 101 146
+SAVED_ENERGY=$AG_ENERGY; SAVED_QUALITY=$AG_QUALITY0
+ctl save >/dev/null
+ctl wait 10 >/dev/null
+ctl quit >/dev/null 2>&1 || true
+sleep 2
+launch
+ctl command "execute in minecraft:the_end run tp @s $((SX + 1)).5 101 146.5" >/dev/null
+ctl wait 30 >/dev/null
+[ "$(block_name "$SX" 101 146)" = "$AGITATOR" ] || fail "the agitator did not survive the relaunch"
+agitator "$SX" 101 146
+expect_ag_rod 0 "$ROD_ITEM"
+expect_ag_lock 4 1
+[ "$AG_ENERGY" -gt 0 ] || fail "the store is empty after the relaunch (was $SAVED_ENERGY)"
+python3 - "$SAVED_QUALITY" "$AG_QUALITY0" <<'KEPTQUAL' || fail "after the relaunch slot 0's quality is $AG_QUALITY0, was $SAVED_QUALITY before the save"
+import sys
+sys.exit(0 if float(sys.argv[2]) >= float(sys.argv[1]) else 1)
+KEPTQUAL
+echo "  after save + relaunch: $AG_ENERGY FE, slot 0 still a rod at quality $AG_QUALITY0, lock 4 set"
+
+echo "== BN: the agitator's refusals are parsed replies, and its recipe needs the parent =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 168 minecraft:stone" >/dev/null
+ctl wait 4 >/dev/null
+say "rftoolspower agitator $SX 101 168"
+LINE=$(await_line "blazing agitator there")
+[ -n "$LINE" ] || fail "no refusal for a position with no agitator: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE" >&2
+say "rftoolspower agitatelock $SX 101 146 9 on"
+LINE=$(await_line "slot 9 is not one of 0..8")
+[ -n "$LINE" ] || fail "no refusal for slot 9: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE" >&2
+say "rftoolspower agitatelock $SX 101 146 3 maybe"
+LINE=$(await_line "unknown lock 'maybe'")
+[ -n "$LINE" ] || fail "no refusal for the lock word 'maybe': $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE" >&2
+# A stone is not a rod: the server keeps it and no slot takes it.
+energised_agitator "$SX" 101 170 5000
+ctl command "item replace entity @s hotbar.0 with $STONE 1" >/dev/null
+ctl wait 4 >/dev/null
+ctl select 1 >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $(($SX - 2)).5 101 170.5" >/dev/null
+ctl wait 6 >/dev/null
+ctl look-at "$SX.5" 101.25 170.5 >/dev/null || fail "cannot aim at the agitator at $SX,101,170"
+ctl interact "$SX" 101 170 up >/dev/null
+ctl wait 10 >/dev/null
+agitator "$SX" 101 170
+for slot in 0 1 2 3 4 5 6 7 8; do
+    expect_ag_rod "$slot" empty
+done
+SERVER_INV=$(server_inventory)
+case "$SERVER_INV" in
+    *'"minecraft:stone"'*) ;;
+    *) fail "the server lost the stone: a non-rod click must change nothing ($SERVER_INV)" ;;
+esac
+for cell in "$((SX - 1)) 101 170" "$SX 102 170" "$SX 101 171"; do
+    [ "$(block_name $cell)" = "minecraft:air" ] \
+        || fail "the refused stone was placed against the agitator at $cell ($(block_name $cell))"
+done
+echo "  a stone is refused as a rod, kept on the server and nothing is placed against the machine"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+TX4=$((SX + 4)); TY4=101; TZ4=160
+open_crafting_table "$TX4" "$TY4" "$TZ4"
+for item in minecraft:blaze_rod minecraft:glass "minecraft:iron_ingot" "$STONE"; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 10 >/dev/null
+# "XXX" / "GFG" / "iii": blaze rods where `#c:rods/blaze` belongs, glass where `#c:glass_blocks`,
+# iron ingots at `i`, and a stone where `rftoolsbase:machine_frame` belongs.
+place_one minecraft:blaze_rod 100
+place_one minecraft:blaze_rod 101
+place_one minecraft:blaze_rod 102
+place_one minecraft:glass 103
+place_one "$STONE" 104
+place_one minecraft:glass 105
+place_one minecraft:iron_ingot 106
+place_one minecraft:iron_ingot 107
+place_one minecraft:iron_ingot 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the agitator's recipe with a stone where rftoolsbase:machine_frame belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the agitator's recipe crafted $RESULT without the parent"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  the machine frame and the absent #c:rods/blaze tag are the recipe's limit here"
+
+echo "PASS: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

@@ -90,6 +90,20 @@ Seven families so far:
   acts on the machine (upstream opens its GUI there);
 - reads out through `/rftoolspower blazing <pos> [nonce]`.
 
+**The Blazing Agitator** (slice 8)
+
+- a **3×3 box** of rods plus **nine output slots**; a click puts a rod in the first empty input slot
+  and a plain blaze rod is converted to a blazing rod on the next tick;
+- each rod's **quality and duration climb by the square of a factor built from its neighbours** —
+  `quality += adjacency² × 10`, `duration += adjacency²`, `time -= adjacency/5` — with `−0.03` for
+  every neighbour that is empty or outside the box, so a lone rod's factor is **0.22** and a full
+  box's centre is **0.25** (never 1);
+- a finished rod moves to the first free output slot unless its slot is **locked**
+  (`/rftoolspower agitatelock <pos> <slot> on|off`);
+- the buffer is **50,000 FE**, takes **100 FE a tick** through the energy capability and spends
+  **10 a tick** while it runs;
+- reads out through `/rftoolspower agitator <pos> [nonce]`.
+
 ## Build
 
 ```sh
@@ -104,11 +118,11 @@ packed.
 
 | Path | What |
 |---|---|
-| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the power level's 0–9 ratio/cadence, the cell's tiers/faces/network/budgets, the endergenic's window/table/flight/hold, the ender monitor's mode gate and one-tick pulse, the blazing generator's rod/ramp/burn and its 1,000,000 FE clamp) with their unit tests |
+| `src/runtime.rs` | the pure rules (fuel, burn, FE, clamps, restore, the monitor's ratio/band/counter, the power level's 0–9 ratio/cadence, the cell's tiers/faces/network/budgets, the endergenic's window/table/flight/hold, the ender monitor's mode gate and one-tick pulse, the blazing generator's rod/ramp/burn and its 1,000,000 FE clamp, the agitator's adjacency algorithm and locks) with their unit tests |
 | `src/support.rs` | the glue: every block entity Part, the container and buffer declarations, the ticks, the clicks, the drops, the redstone, the `fireMonitors` notice, the blazing rod's item component and the commands |
 | `src/lib.rs` | the one `impl mod_api::Hooks` |
 | `assets/`, `data/` | the carried content, built by `tools/assemble_content.py` |
-| `tools/e2e.sh` | the in-game leg (phases A–BE) |
+| `tools/e2e.sh` | the in-game leg (phases A–BN) |
 | `tools/build-e2e-game.sh`, `tools/harness-receiver/` | the e2e-only energy receiver the push is proven against (never in the `.hmod`) |
 | `notes.md` | the slices, the evidence, the gaps |
 | `FINDINGS.md` | the upstream behaviour extracted (analysis only) |

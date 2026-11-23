@@ -1,7 +1,8 @@
 # RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
-# powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor)
+# powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor;
+# slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator)
 
-> **Current state (2026-11-23): slice 7, package 0.1.6 at pin
+> **Current state (2026-11-23): slice 8, package 0.1.7 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
 > generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
 > (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
@@ -18,11 +19,17 @@
 > slice 7 adds the **blazing generator** with its **blazing rod**: four rod slots whose rates each
 > climb a 150th of the gap to their own ceiling (60 FE a tick for a 60,000-quality rod) over a
 > 1,000,000 FE buffer with a 20,000 FE a tick push, the rod's whole state kept in the mod's own
-> `rftoolspower:blazing_rod_data` item component. Where
+> `rftoolspower:blazing_rod_data` item component; and slice 8 adds the **blazing agitator**: a 3×3
+> box of rods whose quality and duration climb by the square of a factor built from the
+> **neighbouring** rods, whose agitation clock runs down, and whose finished rods move to one of
+> nine output slots unless their slot is **locked** — over a 50,000 FE buffer that takes 100 FE a
+> tick and spends 10. Where
 > upstream's smart wrench is needed (the link, the cell's face modes), the harness uses commands —
 > `/rftoolspower enderlink`, `/rftoolspower side` — and never a fake item; the monitor's GUI picker
 > is `/rftoolspower endermonitor <pos> <mode|status> [nonce]`, and the power level's readout is
-> `/rftoolspower powerlevel <pos> [nonce]`.
+> `/rftoolspower powerlevel <pos> [nonce]`; the agitator's readout is
+> `/rftoolspower agitator <pos> [nonce]` and its lock checkbox is
+> `/rftoolspower agitatelock <pos> <slot> on|off [nonce]`.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -46,8 +53,8 @@ to the campaign's maintainer approval (ARCHITECTURE.md §8).
 
 Status: **ported-partial** — the coal generator (A–M), the power monitor plus the generator's
 energy push (N–T), the powercell (U–AD), the endergenic pair (AE–AM), the ender monitor (AN–AS),
-the power level display (AT–AW) and the blazing generator with its blazing rod (AX–BE) are
-implemented and verified in game at the current pin. The gap list below is the rest of the mod.
+the power level display (AT–AW), the blazing generator with its blazing rod (AX–BE) and the blazing
+agitator (BF–BN) are implemented and verified in game at the current pin. The gap list below is the rest of the mod.
 
 ## What the powercell binds to (the 2026-11-21 parent-surface ruling)
 
@@ -1125,6 +1132,216 @@ assumption that either lands at the 400th tick.
 | the GUI, the rod's tooltip, the agitator and the infuser | not ported (gap 11; the agitator and infuser mutate a rod and are the next slice) |
 | the renderer and TOP/Jade | not ported (gap 6/11) |
 
+## Slice 8 — the blazing agitator (package 0.1.7)
+
+Gap line it comes from (`## Gaps` below): **gap 11** — *"Still open in this family: the **blazing
+agitator** (3×3 rod box, the adjacency algorithm, 9 output slots, the `AgitatorData` locks, 50,000 FE
+/ 100 in / 10 used a tick) and the **blazing infuser** (3 slots, the six catalysts, the 10-tick
+counter, …) — both **mutate** a rod …"*. This slice takes the **agitator**; the **infuser** stays
+(the catalyst table is recorded below from the artefact, but it was not carried). Tier: still
+**machines** — a block entity with a server tick, an 18-slot container, an energy buffer and saved
+locks. No GUI, no renderer, no item Part beyond the store/locks clamp.
+
+### The adjacency algorithm, as read (`BlazingAgitatorAlgorithm.java`, 1.21_neo @ `e44463ca`)
+
+```
+qualityFactor(rod)        = 0 without a blazing rod, else
+                            min((duration × 20 / 10000 + quality × 60000 / 150000000) / 2, 40)
+qualityFactorDiff(this, n) = -0.03 when n is outside the 3×3 or holds no blazing rod
+                            else max(-0.03, qualityFactor(n) − qualityFactor(this))
+adjacency(i)              = max(1 + Σ diff(left, right, top, bottom), 0.01) / 4
+time     -= adjacency / 5
+quality  += adjacency² × 10 × (1 + infuse/10)
+duration += adjacency² × (1 + infuse/10)
+```
+
+`i` is the box index (`x = i % 3`, `y = i / 3`), the four neighbours are `i∓1` and `i∓3`, and the
+slots are visited in index order with each write visible to the later slots — so a rod agitated early
+in a tick is the *newer* neighbour the later ones see (upstream mutates the `ItemStack`s in place).
+The single-precision factors: a **lone** rod `0.22` (`1 − 4 × 0.03 = 0.88`, a quarter), three in a
+row `0.2275 / 0.235 / 0.2275`, a full box `0.235 / 0.2425 / 0.25`. The `0.01` floor is unreachable
+(four penalties still sum to 0.88) and is kept for fidelity.
+
+### The infuser's catalyst table, as read (not carried this slice)
+
+`BlazingInfuserTileEntity.getCatalystImprovement`: redstone `(40, 0)`, glowstone dust `(10, 30)`,
+quartz `(0, 40)`, `rftoolsbase:dimensional_shard` `(60, 60)`, nether star `(120, 120)`, ghast tear
+`(80, 80)` — as percentages of a whole 64-step stack: `quality += quality × f/(100 × 64)` and
+`duration += duration × f/(100 × 64)` per catalyst, one catalyst consumed per run. Its counter
+starts at 10 and resets after it goes below 0, so the first operation is on the **11th** tick and
+then every 11 (not every 10 — the brief's number is the field, not the period). Recorded for the
+next slice.
+
+### What it does
+
+- **The block.** `rftoolspower:blazing_agitator`: upstream's `Properties.of().strength(2.0f)
+  .sound(METAL)` with `RotationType.NONE` — **no block state at all** — and a slab shape
+  (`Shapes.box(0, 0, 0, 1, 0.5, 1)`).
+- **The box.** Nine input slots (index 0..8 = the 3×3 grid) and nine output slots (9..17). One item
+  a slot. A click puts a valid rod in the first empty input slot; upstream's GUI is not carried.
+- **What is a rod.** `isValidBlazingRod`: a `minecraft:blaze_rod`, or a blazing rod whose
+  `steps >= 64` (a rod already infused is refused). A blaze rod in a slot is **converted** to a
+  fresh blazing rod (default data) on the next tick and is not agitated that tick.
+- **The tick** (`tickServer` → `tickRods`): if enabled and the store holds 10 FE, spend 10 and
+  agitate; a rod with `time > 0` gets the three writes above; a rod with `time <= 0` moves to the
+  first free output slot unless its slot is **locked**, and a full output box leaves it in place.
+- **The store.** **50,000 FE**, taken in at **100 FE a tick** through the energy capability (every
+  face) and spent at **10 a tick** while the machine runs — even with an empty box (upstream's
+  order: the cost is paid before the slots are visited).
+- **The locks.** Nine booleans, all false on a fresh agitator (`AgitatorData` with an empty list).
+  Saved as `lock0..lock8` bytes; the GUI's checkbox is `/rftoolspower agitatelock <pos> <slot>
+  on|off [nonce]`.
+- **The item.** A broken agitator carries its **store and its locks** (`block_entity_data` names
+  `rftoolspower:blazing_agitator_block_entity`), clamped to the buffer when placed. Its rods do not
+  travel (the engine keeps container items apart from the payload — gap 8's shape).
+- **The click.** Owned by the global `right_click_block` (API 21), as the blazing generator's is: a
+  rod goes in, anything else is refused with a line, an empty hand reads the machine out, and no
+  block is placed against the machine.
+- **The readout.** `/rftoolspower agitator <pos> [nonce]` prints `energy/capacity`, `ready`, the
+  nine `time`/`quality`/`duration` triplets (`-` without a rod), the nine locks as a bit string, the
+  nine rods and the nine outputs, and `t`.
+
+### Numbers and where they came from
+
+| Number | Value | Source |
+|---|---|---|
+| capacity | 50,000 FE | `AGITATOR_MAXENERGY` (`blazingAgitatorMaxPower`) |
+| input a side a tick | 100 FE | `AGITATOR_ENERGY_INPUT_PERTICK` (`blazingAgitatorRFPerTick`) |
+| used a tick | 10 FE | `AGITATOR_USE_PER_TICK` (`blazingAgitatorUsePerTick`) |
+| slots | 9 in + 9 out, one item each | `BUFFER_SIZE = 9`, the two 3×3 boxes, `slotLimit(1)` |
+| the empty/out-of-box penalty | −0.03 | `calculateQualityFactorDiff` |
+| the factor's floor | 0.01 | `calculateAdjacencyFactor` |
+| the quality factor's cap | 40 | `calculateQualityFactor` |
+| the clock | `time -= adjacency / 5` | `tickBlazingRod` |
+| quality / duration gain | `adjacency² × 10 × …` / `adjacency² × …` | `tickBlazingRod` |
+| block hardness | 2.0 / 2.0, pickaxe, iron sound | the block's own `Properties` |
+| recipe | `"XXX"/"GFG"/"iii"` — `#c:rods/blaze`, `#c:glass_blocks`, `rftoolsbase:machine_frame`, `#c:ingots/iron` | `BlazingModule.initDatagen` |
+| infuser catalysts (not carried) | 40/0, 10/30, 0/40, 60/60, 120/120, 80/80 | `BlazingInfuserTileEntity.getCatalystImprovement` |
+
+### The brief's numbers, checked against the artefact
+
+`quality += adjacency² × 10 × (1 + factor/10)` and `duration += adjacency² × (1 + factor/10)` are
+the artefact's own lines, and `time` does count down. **"A rod alone, factor 1" is wrong:** the
+factor is `max(1 + Σ diff, 0.01) / 4` with `-0.03` for each empty neighbour, so a **lone rod is
+0.22** and the largest possible factor is **0.25** (a full box of equal rods). The self-test is built
+on that difference: it asserts the brief's 10 a tick and fails (see below).
+
+### Red → green
+
+The agitator's rules were stubbed `todo!()` behind their tests; the failing run is
+`ports/_shared/evidence/rftoolspower/red-agitator.log`:
+
+```
+test result: FAILED. 113 passed; 12 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+not yet implemented: Agitator::adjacency_factor is not written yet
+not yet implemented: Agitator::tick is not written yet
+not yet implemented: Agitator::quality_factor is not written yet
+not yet implemented: clamp_agitator is not written yet
+```
+
+Green: **131 passed; 0 failed** (`sdk-test.log`, which prints the package sha). The twelve runtime
+tests pin: a default rod's quality factor (12.02) and the 40 cap, zero for an empty/foreign/blaze-rod
+slot; the lone rod's 0.22 in four different slots; the row's 0.2275/0.235/0.2275 and the full box's
+0.235/0.2425/0.25; a better neighbour raising the factor (3.2275) while a worse one is only the empty
+penalty; one tick's three writes and its 10 FE; the energy gate and the disabled machine; the blaze
+rod's conversion (and no agitation that tick); the first free output slot (past a foreign item); a
+full output box keeping the rod; a locked slot keeping it while an unlocked one moves; a clock that
+runs out mid-tick waiting for the next; a foreign item untouched and penalised like an empty slot;
+and the 50,000 clamp. Six in `support`: the eighteen-slot container (9 in, 9 out, every face), the
+buffer's 50,000/100/nothing-out, the store and locks round trip with the clamp, the slot-write
+decision (leave/clear/write), the exact readout line, and the two commands.
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `native-build` reported `Compiling rftoolspower (1 of 1)` and the
+two-mod e2e build is `native-0a875da-08885a9d3eb8` (`rfpowerharness` 0.1.0, `rftoolspower` **0.1.7**,
+both naming the same source hash).
+
+| log | verdict |
+|---|---|
+| `e2e-agitator.log` | **PASS**, `EXIT:0` — phases A–BN (the whole port), `PACKAGE … sha256=15cc6d27… bytes=177048` |
+| `e2e-agitator-selftest.log` | `FAIL: selftest: the lone rod's quality rose 16.953 in 35 ticks (0.22² × 10 = 0.484 a tick), not the brief's 10 a tick (350) — the assertion is alive`, `EXIT:1` |
+| `e2e-agitator-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` (the unmodded Nightly) |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=23 ok=23 missing-exit=0 bad-exit=0`.
+
+The parsed assertions, each from a `ctl` reply:
+
+| phase | what it asserts (observed) |
+|---|---|
+| BF | an agitator placed from an item carrying 40,000 FE reads `ready true` with nine empty slots and `locks=000000000`; three clicks fill slots 0..2 with `time=594.27/596.30/598.53` and `quality=60064.1/60042.9/60016.9` (they were clicked in a few seconds apart and agitate from the moment they land); the **server's** inventory holds no rod afterwards |
+| BG | over **47** game ticks (`t=8868 → 8915`) the store fell 38,770 → 38,300 (**470 = 10 × 47**), and the fold of the whole 3×3 box over that window matched the reply's own `time`/`quality`/`duration` lists with `FOLD_ERROR=0.000000`. The first tick's rates are 0.5176 / 0.5523 / 0.5176 (the 0.2275 / 0.235 / 0.2275 factors); the qualities themselves carry the accumulated history the fold follows, because a rod agitated earlier in a tick is the newer neighbour the later ones see |
+| BH | a rod alone: the fold matches again and its rise is 0.484 a tick (factor 0.22); `SELFTEST_AGITATOR=1` asserts 10 a tick and fails, naming 16.953 in 35 ticks |
+| BI | `agitatelock … 2 on` echoes `locks=001000000`; two short rods finish and move to output slots 0 and 1 in order; a rod clicked into the locked slot 0 stays there with its clock ≤ 0 |
+| BJ | a plain `minecraft:blaze_rod` becomes a `rftoolspower:blazing_rod` in its slot; a rod carrying `steps:10` is refused and stays in the **server's** inventory |
+| BK | beside a doctored 100,000 FE coal generator: over the same **51** ticks the buffer gained **4,590 = 90 × 51** (100 in, 10 spent) while the generator lost **5,100 = 100 × 51** — the 100-a-tick insert cap, each measured against its own reply's `t=` |
+| BL | a rod with a 5-tick clock rises in its slot (`quality > 60000`), moves to output 0, and a hopper under the agitator holds it with `rftoolspower:blazing_rod_data` in its `Items` |
+| BM | after save + quit + relaunch: the store still holds FE, slot 0 is still a rod at `quality ≥` its pre-save value, and lock 4 is still set |
+| BN | the refusals are parsed replies (`No RFTools Power blazing agitator there.`, `slot 9 is not one of 0..8`, `unknown lock 'maybe' (on|off)`); a stone is refused as a rod, kept on the server, and no block is placed against the machine; the carried recipe with a stone where `rftoolsbase:machine_frame` belongs crafts nothing |
+
+Counterfactual: `SELFTEST_AGITATOR=1` inverts BH (the brief's 10 a tick) and the leg fails as
+designed, so BH's number can fail; BG's own differential is the fold against the brief's 10 (a
+379.2 delta on the same window), BI's is the locked/unlocked pair, and BK's is the two rates (90 in
+the buffer, 100 out of the generator). The control leg proves BF is not vacuous.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **`Tag::Double` carries f64 *bits*, and the rod's `number()` cast them straight to f32.** A rod
+   given with `time:0.05` (SNBT's double) read **4,587,366,470,488,424,448 ticks** and never
+   finished. No unit test or `check` saw it: the field is only written by the *reader* when a rod's
+   data changes, and only the in-game readout prints it. Fixed (`f64::from_bits`) with a unit test;
+   the failing run is `ports/_shared/evidence/rftoolspower/e2e-double-bits-red.log` (BI's readouts, before the fix).
+2. **Creative keeps the clicked stack in the hand** (slice 1's trap, hit again because BE leaves the
+   player in creative for its crafting table): BF's three rods all went in and the hand still held
+   one. The rod phases now switch to survival and clear first, and the hand check reads the
+   **server's** inventory.
+3. **A store that is already running cannot be asserted as an equality.** A 40,000 FE seed reads
+   39,920 by the time the first reply arrives (8 ticks × 10 FE): the seed is an upper bound, and
+   every rate is measured against the reply's own `t=` (the cell slice's trap 3).
+4. **The generator's window is not the agitator's window.** Two reads of two stores several ticks
+   apart are not comparable (6,300 vs the expected 4,800 FE). Each store now has its own Δt from its
+   own reply.
+5. **`hold_rod`'s argument is the rod's *duration*, not its agitation clock.** `duration:0.05` gives
+   a rod that burns a twentieth of a tick but agitates for 600 ticks; `hold_rod_time` gives the
+   clock instead (BI and BL need a rod that *finishes agitating*).
+6. **`ctl interact X Y Z up` reaches a slab's upper face**; the block is half-height and its centre
+   is at y+0.25, below the eye — `ctl look-at` + `interact … up` is the reliable pair.
+
+### Upstream defects fixed (slice 8)
+
+None adopted: the algorithm, the penalty, the cap, the clock, the locks and the order are upstream's
+own. Three *documented deviations*:
+
+- **No GUI.** Upstream's box is a menu with a lock checkbox per slot; here a click fills the first
+  empty slot and `/rftoolspower agitatelock` sets a lock.
+- **The infusable factor is 0.** No upgrade slot in this port, so `(1 + factor/10) = 1` (gap 3).
+- **A foreign item is never touched.** Upstream's `tickRods` writes a `blazing_rod_data` component
+  onto *any* non-blaze-rod stack in an input slot (its `getAgitationTimeLeft` falls back to the
+  default row); this port leaves it alone. A neighbour that is no rod still costs the −0.03
+  penalty, which is upstream's own effect.
+
+### Coverage of the blazing agitator family (slice 8)
+
+| family | state |
+|---|---|
+| `blazing_agitator`: block, item, the jar's single-variant blockstate, its slab model and side texture, tags, creative tab, lang | tested (BF: placed from its item, stateless, read back; BN: a stone is refused against it) |
+| the 3×3 box and its nine output slots, one item a slot | tested (BF three clicks fill 0..2; BI the outputs fill in order; unit tests pin the container) |
+| the adjacency algorithm: the −0.03 penalty, the quality factor, its 40 cap, the ¼ | tested (BG: the whole box's fold to < 1e-4; unit tests pin 0.22 / 0.2275 / 0.235 / 0.2425 / 0.25 and the better/worse neighbour) |
+| `quality += adjacency² × 10`, `duration += adjacency²` | tested (BG/BH: the fold over 48 and 39 ticks, and the brief's 10 is excluded) |
+| the clock `time -= adjacency/5` | tested (BG/BH: the same fold's `time` list) |
+| 10 FE a tick while it runs | tested (BG: 470 = 10 × 47; the unit test pins the empty box too) |
+| 100 FE a tick in through the capability | tested (BK: +4,590 buffer over 51 ticks from a 2,000-a-tick neighbour, −5,100 out of it) |
+| the 50,000 buffer and its clamp | tested (the unit test and BF's seeded read; BM after the relaunch) |
+| the `AgitatorData` locks | tested (BI: an unlocked finished rod moves, a locked one stays; BM: lock 4 survives a relaunch) |
+| the blaze-rod conversion, the `steps >= 64` rule | tested (BJ: a blaze rod becomes a blazing rod; a `steps:10` rod is refused) |
+| the store and the locks on the broken item | tested (the unit test's clamp; the payload names `rftoolspower:blazing_agitator_block_entity`) |
+| persistence of the store, the locks and the rods | tested (BM: save + quit + relaunch) |
+| the `agitator` / `agitatelock` commands and their refusals | tested (BF–BM every line parsed by `tools/parse_agitator.py`; BN the three refusals) |
+| the recipe | `blocked(rftoolsbase:machine_frame-absent, #c:rods/blaze-absent, #c:glass_blocks-absent, #c:ingots/iron-absent)` (BN proves the pattern crafts nothing) |
+| the GUI, the per-slot lock checkbox, the renderer, TOP/Jade | not ported (no GUI or renderer at this tier; the commands are the stand-ins) |
+| the blazing infuser (3 slots, the six catalysts, the 11-tick counter) | not ported (next slice; the catalyst table is recorded above) |
+| the infusable factor in the three writes | not ported (gap 3: no upgrade slot) |
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
@@ -1291,34 +1508,38 @@ assumption that either lands at the 400th tick.
 | the smart wrench, the GUI, the powercell card, `cell3` | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–7; slice 7 also used the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`)
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–8; slice 8 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`const fn`/`expect`-with-reason habits)
 
-## Verification (slice 7 run)
+## Verification (slice 8 run)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **113 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **131 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 162,363 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.6 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 177,048 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.7 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `177048 bytes, SHA-256 15cc6d27…` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
-| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 122 entries |
-| `tools/assemble_content.py --check` | `ok: 145 entries re-derive exactly` |
-| the leg | `PASS` + `EXIT:0`; `SELFTEST_BLAZING=1` `EXIT:1`; control `EXIT:1`; `--strict` 20/20 |
+| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 131 entries |
+| `tools/assemble_content.py --check` | `ok: 154 entries re-derive exactly` |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST_AGITATOR=1` `EXIT:1`; control `EXIT:1`; `--strict` 23/23 |
 
-The red proof for slice 7's rules is `ports/_shared/evidence/rftoolspower/red-blazing.log`:
-`test result: FAILED. 94 passed; 10 failed`, every failure `not yet implemented`.
+The red proof for slice 8's rules is `ports/_shared/evidence/rftoolspower/red-agitator.log`:
+`test result: FAILED. 113 passed; 12 failed`, every failure `not yet implemented`. The green
+`sdk-test.log` was regenerated **after** the 0.1.7 build, so its `PACKAGE` line names `15cc6d27…` /
+177,048 B. The `Tag::Double` defect (trap 1) is red in the leg instead: BI's readouts in the pre-fix
+run (`e2e-double-bits-red.log`) printed `time=4587366470488424448.000000`.
 
-## Artifact (0.1.6)
+## Artifact (0.1.7)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 162,363 B | `7fe0e23708d8473564c53494f983c01bb9373fafdb8d551f7b8db5df0ae59a7c` | 122 |
+| `rftoolspower.hmod` (port root) | 177,048 B | `15cc6d27279638fb67003d7a9492eb8dd21f87b1273025a433c4712121212bbd` | 131 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1 (including `package matches the
-tree`), and the three legs ran on these bytes (their `PACKAGE` lines name them). The 0.1.5
+tree`), and the three legs ran on these bytes (their `PACKAGE` lines name them). The 0.1.6
+artifact (162,363 B, `7fe0e237…`, 122 entries) is the slice-7 record; the 0.1.5
 artifact (141,168 B, `26485b9a…`, 105 entries) is the slice-6 record; the 0.1.4 (134,377 B,
 `e1c60156…`, 96 entries), 0.1.3 (122,516 B, `ab452bd8…`, 87 entries), 0.1.2 (100,317 B,
 `989543d7…`, 69 entries) and 0.1.1 records are kept in this file.

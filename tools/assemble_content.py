@@ -221,6 +221,7 @@ LANG = {
     "block.rftoolspower.ender_monitor": "Ender Monitor",
     "block.rftoolspower.pearl_injector": "Pearl Injector",
     "block.rftoolspower.blazing_generator": "Blazing Generator",
+    "block.rftoolspower.blazing_agitator": "Blazing Agitator",
     "item.rftoolspower.power_core1": "Power Core (Low)",
     "item.rftoolspower.blazing_rod": "Blazing Rod",
     "itemGroup.rftoolspower": "RFTools Power",
@@ -239,6 +240,7 @@ CREATIVE_TAB = {
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
         "rftoolspower:blazing_generator",
+        "rftoolspower:blazing_agitator",
         "rftoolspower:blazing_rod",
         "rftoolspower:power_core1",
     ],
@@ -256,6 +258,7 @@ TAGS = {
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
         "rftoolspower:blazing_generator",
+        "rftoolspower:blazing_agitator",
     ],
     "data/minecraft/tags/block/needs_iron_tool.json": [
         "rftoolspower:coalgenerator",
@@ -267,6 +270,7 @@ TAGS = {
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
         "rftoolspower:blazing_generator",
+        "rftoolspower:blazing_agitator",
     ],
 }
 
@@ -440,6 +444,22 @@ BLAZING_DECL = {
 ROD_DECL = {
     "template": "minecraft:blaze_rod",
     "components": {"!minecraft:cooking_fuel": {}},
+}
+
+# --- the blazing agitator (`BlazingAgitatorTileEntity`): a slab, `RotationType.NONE`, so it has no
+# state at all. Its model is vanilla's slab with McJty's two base textures and its own side.
+AGITATOR = "blazing_agitator"
+AGITATOR_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "shapes": {"default": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]},
+    "collision_shapes": {"default": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]},
+    "item": True,
 }
 
 
@@ -806,6 +826,38 @@ def build(out: Path) -> None:
             read_jar(POWER, f"assets/rftoolspower/textures/item/{texture}"),
         )
     write(out / f"data/rftoolspower/horizon/item/{ROD}.json", ROD_DECL)
+
+    # --- the blazing agitator: the jar's single-variant blockstate, its slab model with the base
+    # textures re-pointed into this namespace (a package stands alone), and its own item.
+    write(
+        out / f"assets/rftoolspower/blockstates/{AGITATOR}.json",
+        json.loads(read_jar(POWER, f"assets/rftoolspower/blockstates/{AGITATOR}.json")),
+    )
+    model = json.loads(read_jar(POWER, f"assets/rftoolspower/models/block/{AGITATOR}.json"))
+    model["textures"] = {
+        key: value.replace("rftoolsbase:block/base/", "rftoolspower:block/base/")
+        for key, value in model["textures"].items()
+    }
+    write(out / f"assets/rftoolspower/models/block/{AGITATOR}.json", model)
+    write(
+        out / f"assets/rftoolspower/models/item/{AGITATOR}.json",
+        {"parent": f"rftoolspower:block/{AGITATOR}"},
+    )
+    write(
+        out / f"assets/rftoolspower/items/{AGITATOR}.json",
+        {"model": {"model": f"rftoolspower:item/{AGITATOR}", "type": "minecraft:model"}},
+    )
+    binary(
+        out / f"assets/rftoolspower/textures/block/blazing/{AGITATOR}_side.png",
+        read_jar(POWER, f"assets/rftoolspower/textures/block/blazing/{AGITATOR}_side.png"),
+    )
+    write(out / f"data/rftoolspower/horizon/block/{AGITATOR}.json", AGITATOR_DECL)
+    write(out / f"data/rftoolspower/loot_table/blocks/{AGITATOR}.json", plain_loot(AGITATOR))
+    write(out / f"data/rftoolspower/recipe/{AGITATOR}.json", patched_recipe(AGITATOR))
+    write(
+        out / f"data/rftoolspower/advancement/recipes/misc/{AGITATOR}.json",
+        json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{AGITATOR}.json")),
+    )
 
 
 def ingredient(value: object) -> object:

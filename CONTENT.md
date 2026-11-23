@@ -171,6 +171,26 @@ The `blazing` blockstate's `up`/`down` variants are the jar's: the placement hoo
 horizontal front (the pin's placement context carries the placer's view angles, not its height), the
 same limit the pearl injector records; `setblock … [facing=up]` still draws what the jar draws.
 
+## Slice 8 — the blazing agitator
+
+| File | What |
+|---|---|
+| `assets/rftoolspower/blockstates/blazing_agitator.json` | the jar's own single-variant blockstate, byte for byte |
+| `assets/rftoolspower/models/block/blazing_agitator.json` | the jar's `minecraft:block/slab` model, with `rftoolsbase:block/base/…` re-pointed at this package's copies |
+| `assets/rftoolspower/models/item/blazing_agitator.json`, `assets/rftoolspower/items/blazing_agitator.json` | the item model (parent: the block) and its item definition |
+| `assets/rftoolspower/textures/block/blazing/blazing_agitator_side.png` | the jar's own side texture, byte for byte |
+| `data/rftoolspower/horizon/block/blazing_agitator.json` | an iron machine with **no state at all** (`RotationType.NONE`), a slab shape and collision box (`Shapes.box(0, 0, 0, 1, 0.5, 1)`), hardness 2.0 / blast 2.0, pickaxe, iron sound |
+| `data/rftoolspower/loot_table/blocks/blazing_agitator.json` | `copy_name` only; the store and the nine locks travel through `minecraft:block_entity_data` |
+| `data/rftoolspower/recipe/blazing_agitator.json` | `"XXX"/"GFG"/"iii"` — `#c:rods/blaze`, `#c:glass_blocks`, `rftoolsbase:machine_frame` and `#c:ingots/iron` |
+| `data/rftoolspower/advancement/recipes/misc/blazing_agitator.json` | the recipe unlock, in the 26.3 predicate shape |
+| `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.blazing_agitator` |
+| `data/minecraft/tags/block/…`, `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | the block in the pickaxe and needs-iron-tool tags, in the tab |
+
+The agitator's GUI texture (`blazing_agitator.png`) and its `.gui` file are **not** carried: no menu
+in this tier. Its `rftoolspower:agitator_data` component is upstream's **block** attachment (the nine
+locks); here the locks are the saved `lock0..lock8` bytes of the block entity's compound, which is
+what `minecraft:block_entity_data` carries on a broken agitator's item.
+
 ## Patched, because 1.21.1 → 26.3 differs (slice 7)
 
 | File | Patch |
@@ -180,6 +200,15 @@ same limit the pearl injector records; `setblock … [facing=up]` still draws wh
 | `blazing_rod`'s item | `!minecraft:cooking_fuel` — the blaze-rod template is fuel, upstream's rod is not |
 | the recipe | `{"item": X}` → bare ids, `{"tag": T}` → `#T`; `#c:rods/blaze` is **not** a 26.3 tag, so the recipe loads with an unresolved-tag error and can never match here (`phase BE` proves the pattern crafts nothing) |
 | the lang | only the two names; upstream's tooltip (`power … RF/t`, `duration … ticks`) and GUI strings are not carried, because nothing reads them at this tier |
+
+## Patched, because 1.21.1 → 26.3 differs (slice 8)
+
+| File | Patch |
+|---|---|
+| the agitator's model | `rftoolsbase:block/base/…` → `rftoolspower:block/base/…` (the base textures travel in this package) |
+| the loot table | `copy_components` removed as above; the store and the locks ride on `minecraft:block_entity_data` |
+| the recipe | `{"item": X}` → bare ids, `{"tag": T}` → `#T`; `#c:rods/blaze`, `#c:glass_blocks` and `#c:ingots/iron` are **not** 26.3 tags, so it loads with unresolved-tag errors and can never match here (`phase BN` proves the pattern crafts nothing) |
+| the lang | only the block's name; upstream's header/gold tooltip lines are not carried, because nothing reads them at this tier |
 
 ## What the content cannot do alone
 
@@ -197,6 +226,9 @@ same limit the pearl injector records; `setblock … [facing=up]` still draws wh
 - **The `lit` overlay** (see above): the block is dark or lit by its state, not by a glow layer.
 - **The GUI textures** (`assets/rftoolspower/textures/gui/coalgenerator.png`) are not carried: there
   is no menu in this slice.
+- **The blazing agitator's recipe needs `rftoolsbase:machine_frame`** and the absent
+  `#c:rods/blaze`/`#c:glass_blocks`/`#c:ingots/iron` tags: with only this package the pattern crafts
+  nothing (`phase BN`).
 - **The blazing generator's recipe needs the parent twice** — `rftoolsbase:machine_frame` and
   `rftoolsbase:infused_diamond` — and its rods name the `#c:rods/blaze` tag, which 26.3 does not
   ship: with only this package the pattern crafts nothing (`phase BE`). Its loot keeps the store

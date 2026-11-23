@@ -1447,6 +1447,251 @@ pub fn clamp_blazing(energy: i32) -> i32 {
     energy.clamp(0, BLAZING_CAPACITY)
 }
 
+// ---------------------------------------------------------------------------
+// The blazing agitator (`BlazingAgitatorTileEntity`, `BlazingAgitatorAlgorithm`, `AgitatorData`)
+// ---------------------------------------------------------------------------
+
+/// The rod slots of an agitator's 3×3 box (`BlazingAgitatorTileEntity.BUFFER_SIZE`).
+pub const AGITATOR_SLOTS: usize = 9;
+/// The box's width: slot `i` sits at `i % 3, i / 3` (`calculateAdjacencyFactor`).
+pub const AGITATOR_COLUMNS: usize = 3;
+/// The output box's size — the second `BUFFER_SIZE` slots (`moveToOutput`).
+pub const AGITATOR_OUTPUTS: usize = AGITATOR_SLOTS;
+/// The agitator's buffer (`BlazingConfiguration.AGITATOR_MAXENERGY`, `blazingAgitatorMaxPower`).
+pub const AGITATOR_CAPACITY: i32 = 50_000;
+/// FE one face takes in a tick (`AGITATOR_ENERGY_INPUT_PERTICK`, `blazingAgitatorRFPerTick`).
+pub const AGITATOR_INSERT_PER_TICK: i32 = 100;
+/// FE the machine spends a tick while it runs (`AGITATOR_USE_PER_TICK`, `blazingAgitatorUsePerTick`).
+pub const AGITATOR_USE_PER_TICK: i32 = 10;
+/// What a neighbour that is empty, outside the box, or no rod adds (`-.03f`).
+pub const ADJACENCY_PENALTY: f32 = -0.03;
+/// `calculateAdjacencyFactor`'s floor before the quarter is taken (`if (factor < 0.01f)`).
+pub const ADJACENCY_FLOOR: f32 = 0.01;
+/// The factor is a quarter of the sum (`return factor / 4`).
+pub const ADJACENCY_DIVISOR: f32 = 4.0;
+/// The quality factor's ceiling (`Math.min(…, 40.0f)`).
+pub const QUALITY_FACTOR_CAP: f32 = 40.0;
+/// The quality factor's duration divisor (`duration * START_DURATION / 10000.0f`).
+pub const QUALITY_FACTOR_DURATION_DIVISOR: f32 = 10_000.0;
+/// The quality factor's quality divisor (`quality * START_QUALITY / 150000000.0f`).
+pub const QUALITY_FACTOR_QUALITY_DIVISOR: f32 = 150_000_000.0;
+/// Agitation lasts `adjacency / 5` ticks a tick (`timeLeft -= adjacencyFactor / 5`).
+pub const AGITATION_PER_TICK: f32 = 5.0;
+/// Quality rises by this much a tick at factor 1 (`quality += adjacency² × 10 × …`).
+pub const QUALITY_GAIN: f32 = 10.0;
+/// The infusable factor's divisor (`1 + infuseFactor/10.0f`).
+pub const INFUSION_DIVISOR: f32 = 10.0;
+/// The infusable factor this port carries: no upgrade slot, so `0` (gap 3).
+pub const INFUSE_NONE: f32 = 0.0;
+
+/// What one slot of an agitator's box holds (`IBlazingRod.isValid` plus the blaze-rod branch).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RodSlot {
+    /// Nothing in the slot.
+    Empty,
+    /// An item that is not a rod. It occupies its slot — so its neighbours get the empty-slot
+    /// penalty, exactly as upstream's invalid `BlazingRodStack` does — and the tick never touches
+    /// it.
+    Foreign,
+    /// A `minecraft:blaze_rod`: the tick turns it into a fresh blazing rod and does not agitate it
+    /// that tick (`tickRods`'s first branch).
+    BlazeRod,
+    /// A blazing rod and its own data (`BlazingRodData`).
+    Rod(Rod),
+}
+
+impl RodSlot {
+    /// `IBlazingRod.isValid`: only a blazing rod takes part in the adjacency algorithm.
+    #[must_use]
+    pub const fn is_rod(self) -> bool {
+        matches!(self, Self::Rod(_))
+    }
+
+    /// The rod's data, or `None` for a slot the algorithm treats as empty.
+    #[must_use]
+    pub const fn rod(self) -> Option<Rod> {
+        match self {
+            Self::Rod(rod) => Some(rod),
+            _ => None,
+        }
+    }
+}
+
+/// An agitator's saved state: its store and the nine `AgitatorData` locks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Agitator {
+    /// The store, an int in the saved compound (`energyStorage`).
+    pub energy: i32,
+    /// Which input slots keep their finished rod (`locked[y*3 + x]`, all false on a fresh one).
+    pub locks: [bool; AGITATOR_SLOTS],
+}
+
+impl Default for Agitator {
+    fn default() -> Self {
+        Self {
+            energy: 0,
+            locks: [false; AGITATOR_SLOTS],
+        }
+    }
+}
+
+/// What one tick moved out of the box and whether the machine ran.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Agitation {
+    /// `true` when the store paid the 10 FE and the rods were agitated.
+    pub active: bool,
+    /// True when a slot's model changed (a conversion, an agitation, or a move).
+    pub changed: bool,
+    /// The rods that left their slot for an output slot this tick, with their slot index.
+    pub moved: Vec<(usize, Rod)>,
+}
+
+impl Agitator {
+    /// `calculateQualityFactor`: a rod's own contribution, in the algorithm's units.
+    ///
+    /// `min((duration * START_DURATION / 10000 + quality * START_QUALITY / 150000000) / 2, 40)`,
+    /// and `0` for a slot without a blazing rod (`if (stack.isValid())`).
+    #[must_use]
+    pub fn quality_factor(slot: RodSlot) -> f32 {
+        let Some(rod) = slot.rod() else {
+            return 0.0;
+        };
+        // Upstream's literal order, one rounding per operation: `a * START / 10000.0f`.
+        let duration = rod.duration * ROD_START_DURATION / QUALITY_FACTOR_DURATION_DIVISOR;
+        let quality = rod.quality * ROD_START_QUALITY / QUALITY_FACTOR_QUALITY_DIVISOR;
+        ((duration + quality) / 2.0).min(QUALITY_FACTOR_CAP)
+    }
+
+    /// `calculateAdjacencyFactor`: a quarter of one plus the neighbours' differences.
+    ///
+    /// Each of the four neighbours adds `-0.03` when it is outside the 3×3 or holds no blazing
+    /// rod, else `max(-0.03, its quality factor - this one's)`; the sum is floored at `0.01` and
+    /// divided by four.
+    ///
+    /// The floor is upstream's own and the arithmetic cannot reach it (four penalties still sum
+    /// to 0.88), so it is kept for fidelity rather than dropped as dead code.
+    #[must_use]
+    pub fn adjacency_factor(box_rods: &[RodSlot; AGITATOR_SLOTS], index: usize) -> f32 {
+        let this = Self::quality_factor(box_rods[index]);
+        let x = (index % AGITATOR_COLUMNS) as i32;
+        let y = (index / AGITATOR_COLUMNS) as i32;
+        let slot = index as i32;
+        let columns = AGITATOR_COLUMNS as i32;
+        let neighbours = [
+            (slot - 1, x - 1, y),
+            (slot + 1, x + 1, y),
+            (slot - columns, x, y - 1),
+            (slot + columns, x, y + 1),
+        ];
+        let mut factor = 1.0_f32;
+        for (neighbour, nx, ny) in neighbours {
+            factor += neighbour_difference(box_rods, this, neighbour, nx, ny);
+        }
+        if factor < ADJACENCY_FLOOR {
+            factor = ADJACENCY_FLOOR;
+        }
+        factor / ADJACENCY_DIVISOR
+    }
+
+    /// `moveToOutput`: the first free output slot takes the rod; `false` when the box is full.
+    pub fn move_to_output(rod: Rod, outputs: &mut [RodSlot; AGITATOR_OUTPUTS]) -> bool {
+        let Some(free) = outputs.iter().position(|slot| *slot == RodSlot::Empty) else {
+            return false;
+        };
+        outputs[free] = RodSlot::Rod(rod);
+        true
+    }
+
+    /// One server tick (`tickServer` → `tickRods`): pay the 10 FE, convert a blaze rod, agitate a
+    /// rod that still has time, and move a finished, unlocked one to the output box.
+    ///
+    /// The rods are visited in slot order and the slot is written back before the next one is
+    /// worked on, so a rod agitated early in the tick is the *newer* neighbour the later slots'
+    /// factors see — upstream mutates the stacks in the same order.
+    pub fn tick(
+        &mut self,
+        enabled: bool,
+        box_rods: &mut [RodSlot; AGITATOR_SLOTS],
+        outputs: &mut [RodSlot; AGITATOR_OUTPUTS],
+    ) -> Agitation {
+        let mut agitation = Agitation::default();
+        if !enabled || self.energy < AGITATOR_USE_PER_TICK {
+            return agitation;
+        }
+        // `energyStorage.consumeEnergy(AGITATOR_USE_PER_TICK)` — paid before the slots are read,
+        // so an empty box runs the machine as well.
+        self.energy -= AGITATOR_USE_PER_TICK;
+        agitation.active = true;
+        for index in 0..AGITATOR_SLOTS {
+            match box_rods[index] {
+                RodSlot::BlazeRod => {
+                    // `new ItemStack(BLAZING_ROD)`: the default row, and not agitated this tick.
+                    box_rods[index] = RodSlot::Rod(Rod::default());
+                    agitation.changed = true;
+                }
+                RodSlot::Rod(mut rod) => {
+                    if rod.time > 0.0 {
+                        let factor = Self::adjacency_factor(box_rods, index);
+                        agitate(&mut rod, factor, INFUSE_NONE);
+                        box_rods[index] = RodSlot::Rod(rod);
+                        agitation.changed = true;
+                    } else if !self.locks[index] && Self::move_to_output(rod, outputs) {
+                        box_rods[index] = RodSlot::Empty;
+                        agitation.moved.push((index, rod));
+                        agitation.changed = true;
+                    }
+                }
+                RodSlot::Empty | RodSlot::Foreign => {}
+            }
+        }
+        agitation
+    }
+}
+
+/// `calculateQualityFactorDiff`: how much a neighbour adds to a slot's factor.
+///
+/// `-0.03` when the neighbour is outside the 3×3 box or holds no blazing rod; otherwise its
+/// quality factor's distance from this slot's, floored at the same penalty.
+fn neighbour_difference(
+    box_rods: &[RodSlot; AGITATOR_SLOTS],
+    this: f32,
+    neighbour: i32,
+    x: i32,
+    y: i32,
+) -> f32 {
+    let column = AGITATOR_COLUMNS as i32;
+    if x < 0 || y < 0 || x >= column || y >= column {
+        return ADJACENCY_PENALTY;
+    }
+    let Ok(neighbour) = usize::try_from(neighbour) else {
+        return ADJACENCY_PENALTY;
+    };
+    let Some(slot) = box_rods.get(neighbour) else {
+        return ADJACENCY_PENALTY;
+    };
+    if !slot.is_rod() {
+        return ADJACENCY_PENALTY;
+    }
+    (Agitator::quality_factor(*slot) - this).max(ADJACENCY_PENALTY)
+}
+
+/// `tickBlazingRod`'s three writes: the clock runs down, quality climbs, duration grows.
+///
+/// `time -= factor/5`, `quality += factor² × 10 × (1 + infuse/10)`,
+/// `duration += factor² × (1 + infuse/10)` — the infusable factor is 0 here (gap 3).
+fn agitate(rod: &mut Rod, factor: f32, infuse: f32) {
+    let improvement = 1.0 + infuse / INFUSION_DIVISOR;
+    rod.time -= factor / AGITATION_PER_TICK;
+    rod.quality += factor * factor * QUALITY_GAIN * improvement;
+    rod.duration += factor * factor * improvement;
+}
+
+/// A store read back from a saved compound, clamped to the agitator's buffer.
+#[must_use]
+pub fn clamp_agitator(energy: i32) -> i32 {
+    energy.clamp(0, AGITATOR_CAPACITY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2819,5 +3064,322 @@ mod tests {
             blazing.slots[0].ticks, 390,
             "a reload would restart the 400"
         );
+    }
+
+    // -- the blazing agitator -------------------------------------------------
+
+    /// A 3×3 box with default rods at the given slots.
+    fn box_with(slots: &[usize]) -> [RodSlot; AGITATOR_SLOTS] {
+        let mut box_rods = [RodSlot::Empty; AGITATOR_SLOTS];
+        for &slot in slots {
+            box_rods[slot] = RodSlot::Rod(Rod::default());
+        }
+        box_rods
+    }
+
+    /// An agitator that can pay for a few ticks.
+    fn paid() -> Agitator {
+        Agitator {
+            energy: 1_000,
+            ..Agitator::default()
+        }
+    }
+
+    #[test]
+    fn a_rods_quality_factor_is_its_duration_and_quality_folded() {
+        // (20 × 20 / 10000 + 60000 × 60000 / 150000000) / 2 = (0.04 + 24)/2.
+        let factor = Agitator::quality_factor(RodSlot::Rod(Rod::default()));
+        assert!(
+            (factor - 12.02).abs() < 1e-4,
+            "a default rod's quality factor is 12.02, got {factor}"
+        );
+        for slot in [RodSlot::Empty, RodSlot::Foreign, RodSlot::BlazeRod] {
+            assert_eq!(
+                Agitator::quality_factor(slot),
+                0.0,
+                "only a blazing rod has a quality factor: {slot:?}"
+            );
+        }
+        let better = Agitator::quality_factor(RodSlot::Rod(Rod {
+            quality: 120_000.0,
+            ..Rod::default()
+        }));
+        assert!(
+            (better - 24.02).abs() < 1e-3,
+            "120,000 quality is (0.04 + 48)/2 = 24.02, got {better}"
+        );
+        let capped = Agitator::quality_factor(RodSlot::Rod(Rod {
+            quality: 300_000.0,
+            duration: 10_000.0,
+            ..Rod::default()
+        }));
+        assert_eq!(
+            capped, QUALITY_FACTOR_CAP,
+            "Math.min(…, 40.0f) caps a 70 factor at 40"
+        );
+    }
+
+    #[test]
+    fn the_adjacency_factor_penalises_empty_and_out_of_box_neighbours() {
+        // A lone rod is 1 − 4 × 0.03 = 0.88 before the quarter, wherever it sits.
+        for slot in [0, 1, 4, 8] {
+            let factor = Agitator::adjacency_factor(&box_with(&[slot]), slot);
+            assert!(
+                (factor - 0.22).abs() < 1e-6,
+                "a lone rod at slot {slot} has a factor of 0.22, got {factor}"
+            );
+        }
+        // Three in a row: the middle has two rods (difference 0) and two empty slots.
+        let row = box_with(&[0, 1, 2]);
+        let left = Agitator::adjacency_factor(&row, 0);
+        let middle = Agitator::adjacency_factor(&row, 1);
+        let right = Agitator::adjacency_factor(&row, 2);
+        assert!(
+            (left - 0.2275).abs() < 1e-6,
+            "the row's left end is 0.2275, got {left}"
+        );
+        assert!(
+            (middle - 0.235).abs() < 1e-6,
+            "the row's middle is 0.235, got {middle}"
+        );
+        assert!(
+            (right - 0.2275).abs() < 1e-6,
+            "the row's right end is 0.2275, got {right}"
+        );
+        assert!(middle > left, "two neighbours beat one");
+        // A full box: the centre sees four equal rods, a quarter of 1.
+        let full = [RodSlot::Rod(Rod::default()); AGITATOR_SLOTS];
+        assert!((Agitator::adjacency_factor(&full, 4) - 0.25).abs() < 1e-6);
+        assert!((Agitator::adjacency_factor(&full, 1) - 0.2425).abs() < 1e-6);
+        assert!((Agitator::adjacency_factor(&full, 0) - 0.235).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_better_neighbour_raises_the_factor_and_a_worse_one_is_only_penalised() {
+        let weak = RodSlot::Rod(Rod::default());
+        let strong = RodSlot::Rod(Rod {
+            quality: 120_000.0,
+            ..Rod::default()
+        });
+        let mut box_rods = [RodSlot::Empty; AGITATOR_SLOTS];
+        box_rods[0] = weak;
+        box_rods[1] = strong;
+        // 1 + (24.02 − 12.02) − 3 × 0.03 = 12.91, a quarter of it.
+        let raised = Agitator::adjacency_factor(&box_rods, 0);
+        assert!(
+            (raised - 3.2275).abs() < 1e-4,
+            "a rod beside a better one gets 3.2275, got {raised}"
+        );
+        box_rods[1] = weak;
+        let equal = Agitator::adjacency_factor(&box_rods, 0);
+        assert!(
+            (equal - 0.2275).abs() < 1e-6,
+            "an equal neighbour adds nothing, got {equal}"
+        );
+        // The strong rod's own factor cannot go below the empty-slot penalty.
+        box_rods[1] = strong;
+        let worse = Agitator::adjacency_factor(&box_rods, 1);
+        assert!(
+            (worse - 0.22).abs() < 1e-6,
+            "a worse neighbour is floored at −0.03, so 0.88/4 = 0.22, got {worse}"
+        );
+    }
+
+    #[test]
+    fn a_tick_spends_ten_fe_and_agitates_at_the_adjacency_square() {
+        let mut agitator = paid();
+        let mut box_rods = box_with(&[0, 1, 2]);
+        let mut outputs = [RodSlot::Empty; AGITATOR_OUTPUTS];
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        assert!(tick.active, "a store that can pay 10 FE runs the machine");
+        assert!(tick.changed);
+        assert!(tick.moved.is_empty());
+        assert_eq!(agitator.energy, 990, "a tick costs exactly 10 FE");
+        let left = box_rods[0].rod().expect("the left rod stays");
+        // 0.2275² × 10 = 0.5175625, 0.2275² = 0.05175625, 0.2275/5 = 0.0455.
+        assert!(
+            (left.quality - (ROD_START_QUALITY + 0.517_562_6)).abs() < 1e-4,
+            "the end's quality gains adjacency² × 10: {left:?}"
+        );
+        assert!(
+            (left.duration - (ROD_START_DURATION + 0.051_756_3)).abs() < 1e-3,
+            "the end's duration gains adjacency²: {left:?}"
+        );
+        assert!(
+            (left.time - (ROD_START_TIME - 0.0455)).abs() < 1e-3,
+            "the end's time falls by adjacency/5: {left:?}"
+        );
+        let middle = box_rods[1].rod().expect("the middle rod stays");
+        assert!(
+            (middle.quality - (ROD_START_QUALITY + 0.552_250_1)).abs() < 1e-3,
+            "the middle gains adjacency² × 10 = 0.55225: {middle:?}"
+        );
+        assert!(
+            middle.quality > left.quality,
+            "two neighbours agitate harder than one"
+        );
+        let right = box_rods[2].rod().expect("the right rod stays");
+        assert!(
+            right.quality > left.quality,
+            "the right end sees the agitated middle and gains a little more than the left"
+        );
+        assert!(right.time < ROD_START_TIME, "every rod's clock runs");
+    }
+
+    #[test]
+    fn a_store_that_cannot_pay_ten_fe_stops_the_machine() {
+        let mut agitator = Agitator {
+            energy: AGITATOR_USE_PER_TICK - 1,
+            ..Agitator::default()
+        };
+        let mut box_rods = box_with(&[0]);
+        let mut outputs = [RodSlot::Empty; AGITATOR_OUTPUTS];
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        assert!(!tick.active);
+        assert_eq!(agitator.energy, 9, "no FE is taken without ten to pay");
+        assert_eq!(
+            box_rods[0],
+            RodSlot::Rod(Rod::default()),
+            "the rod is untouched"
+        );
+        // A disabled machine (upstream's redstone mode, `IGNORED` here) spends nothing.
+        agitator.energy = 1_000;
+        assert!(!agitator.tick(false, &mut box_rods, &mut outputs).active);
+        assert_eq!(agitator.energy, 1_000);
+        assert_eq!(box_rods[0], RodSlot::Rod(Rod::default()));
+        // An empty box still pays: upstream spends the FE before visiting the slots.
+        let mut empty = [RodSlot::Empty; AGITATOR_SLOTS];
+        assert!(agitator.tick(true, &mut empty, &mut outputs).active);
+        assert_eq!(agitator.energy, 990);
+    }
+
+    #[test]
+    fn a_blaze_rod_becomes_a_fresh_blazing_rod_and_is_not_agitated_that_tick() {
+        let mut agitator = paid();
+        let mut box_rods = [RodSlot::Empty; AGITATOR_SLOTS];
+        box_rods[4] = RodSlot::BlazeRod;
+        let mut outputs = [RodSlot::Empty; AGITATOR_OUTPUTS];
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        assert!(tick.changed);
+        assert_eq!(
+            box_rods[4],
+            RodSlot::Rod(Rod::default()),
+            "a blaze rod becomes a default blazing rod, unagitated"
+        );
+    }
+
+    #[test]
+    fn a_finished_rod_moves_to_the_first_free_output_slot() {
+        let mut agitator = paid();
+        let spent = Rod {
+            time: 0.0,
+            ..Rod::default()
+        };
+        let mut box_rods = box_with(&[0]);
+        box_rods[0] = RodSlot::Rod(spent);
+        let mut outputs = [RodSlot::Empty; AGITATOR_OUTPUTS];
+        outputs[0] = RodSlot::Foreign;
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        assert_eq!(box_rods[0], RodSlot::Empty, "the input slot is emptied");
+        assert_eq!(
+            outputs[1],
+            RodSlot::Rod(spent),
+            "the first free output slot takes it, past the foreign item"
+        );
+        assert_eq!(tick.moved, vec![(0, spent)]);
+    }
+
+    #[test]
+    fn a_full_output_box_keeps_its_finished_rod_in_the_slot() {
+        let mut agitator = paid();
+        let spent = Rod {
+            time: 0.0,
+            ..Rod::default()
+        };
+        let mut box_rods = box_with(&[0]);
+        box_rods[0] = RodSlot::Rod(spent);
+        let mut outputs = [RodSlot::Rod(spent); AGITATOR_OUTPUTS];
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        assert_eq!(
+            box_rods[0],
+            RodSlot::Rod(spent),
+            "with no room the rod waits in its slot"
+        );
+        assert!(tick.moved.is_empty());
+    }
+
+    #[test]
+    fn a_locked_slot_keeps_its_finished_rod() {
+        let spent = Rod {
+            time: 0.0,
+            ..Rod::default()
+        };
+        let mut agitator = paid();
+        agitator.locks[0] = true;
+        let mut box_rods = box_with(&[0, 1]);
+        box_rods[0] = RodSlot::Rod(spent);
+        box_rods[1] = RodSlot::Rod(spent);
+        let mut outputs = [RodSlot::Empty; AGITATOR_OUTPUTS];
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        assert_eq!(
+            box_rods[0],
+            RodSlot::Rod(spent),
+            "a locked slot keeps its rod"
+        );
+        assert_eq!(box_rods[1], RodSlot::Empty, "an unlocked one moves");
+        assert_eq!(outputs[0], RodSlot::Rod(spent));
+        assert_eq!(tick.moved, vec![(1, spent)]);
+    }
+
+    #[test]
+    fn a_rod_whose_time_runs_out_this_tick_waits_for_the_next_one() {
+        let mut agitator = paid();
+        let almost = Rod {
+            time: 0.02,
+            ..Rod::default()
+        };
+        let mut box_rods = [RodSlot::Empty; AGITATOR_SLOTS];
+        box_rods[0] = RodSlot::Rod(almost);
+        let mut outputs = [RodSlot::Empty; AGITATOR_OUTPUTS];
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        let held = box_rods[0].rod().expect("the rod is still in its slot");
+        assert!(
+            held.time < 0.0,
+            "the tick agitated it past its end: {}",
+            held.time
+        );
+        assert!(tick.moved.is_empty(), "the move happens on the next tick");
+        let tick = agitator.tick(true, &mut box_rods, &mut outputs);
+        assert_eq!(box_rods[0], RodSlot::Empty);
+        assert_eq!(outputs[0], RodSlot::Rod(held));
+        assert_eq!(tick.moved, vec![(0, held)]);
+    }
+
+    #[test]
+    fn a_foreign_item_is_left_alone_and_penalised_like_an_empty_slot() {
+        let mut box_rods = [RodSlot::Empty; AGITATOR_SLOTS];
+        box_rods[0] = RodSlot::Foreign;
+        box_rods[1] = RodSlot::Rod(Rod::default());
+        let with_stone = Agitator::adjacency_factor(&box_rods, 1);
+        let alone = Agitator::adjacency_factor(&box_with(&[1]), 1);
+        assert_eq!(
+            with_stone, alone,
+            "an occupied slot that is no rod costs the same as an empty one"
+        );
+        let mut agitator = paid();
+        let mut outputs = [RodSlot::Empty; AGITATOR_OUTPUTS];
+        agitator.tick(true, &mut box_rods, &mut outputs);
+        assert_eq!(
+            box_rods[0],
+            RodSlot::Foreign,
+            "the tick never touches another item"
+        );
+    }
+
+    #[test]
+    fn the_agitators_store_clamps_at_fifty_thousand() {
+        assert_eq!(clamp_agitator(999_999), AGITATOR_CAPACITY);
+        assert_eq!(clamp_agitator(-5), 0);
+        assert_eq!(clamp_agitator(12_345), 12_345);
     }
 }

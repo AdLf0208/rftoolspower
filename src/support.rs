@@ -12,19 +12,21 @@ use mod_api::{
     self, BlockClick, BlockDropsEvent, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
     BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, BlockSide, BlockSignalEvent,
     BlockState, Command, CommandArgumentValue, Component, Compound, Direction, ENERGY,
-    EnergyHandler, Flow, Host, HostSide, HostTransaction, InteractionResult, IsSignalSourceEvent,
-    ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, ModContainer,
-    ModEnergyBuffer, NeighbourUpdate, OnBlockPlacedByEvent, Registrar, RegistrationContext,
-    RightClickBlockEvent, RunModCommandEvent, ServerHost, StateForPlacementEvent, Tag, Text,
-    Transaction, UseItemOnEvent, UseWithoutItemEvent,
+    EnergyHandler, Flow, Host, HostSide, HostTransaction, Identifier, InteractionResult,
+    IsSignalSourceEvent, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef,
+    LevelSide, ModContainer, ModEnergyBuffer, NeighbourUpdate, OnBlockPlacedByEvent, Registrar,
+    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
+    StateForPlacementEvent, Tag, Text, Transaction, UseItemOnEvent, UseWithoutItemEvent,
 };
 
 use crate::runtime::{
-    BLAZING_CAPACITY, BLAZING_SLOTS, Blazing, BlazingSlot, CAPACITY, Cell, ENDERGENIC_CAPACITY,
-    EXTRACT_PER_TICK, EnderMonitor, Endergenic, FIRST_POWER_OBSERVE_TICKS, Fuel, Generator,
-    HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE, MONITOR_SIGNAL, Monitor, MonitorMode,
-    NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse, Rod, SideMode, Sides, Tier,
-    as_capability, capacity as network_capacity, clamp_blazing, clamp_endergenic, clamped_energy,
+    AGITATOR_CAPACITY, AGITATOR_INSERT_PER_TICK, AGITATOR_OUTPUTS, AGITATOR_SLOTS,
+    AGITATOR_USE_PER_TICK, Agitator, BLAZING_CAPACITY, BLAZING_SLOTS, Blazing, BlazingSlot,
+    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic,
+    FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE,
+    MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse,
+    ROD_START_STEPS, Rod, RodSlot, SideMode, Sides, Tier, as_capability,
+    capacity as network_capacity, clamp_agitator, clamp_blazing, clamp_endergenic, clamped_energy,
     network_valid, pearl_lost, receive as network_receive, restored, rf_per_tick, rising_edge,
     send_amount, stored as network_stored, take as network_take,
 };
@@ -228,6 +230,23 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     if let Err(error) = r.block_entity_part(&kind, BlazingPart) {
         context.refuse(&format!(
             "rftoolspower: the blazing generator part was refused: {error}"
+        ));
+    }
+
+    // The blazing agitator: a type, its eighteen slots (nine in, nine out), its 50,000 FE buffer
+    // and its Part. Its item carries the store and the locks through `block_entity_data`.
+    let kind = r
+        .block_entity_type(AGITATOR_TYPE)
+        .blocks(&["blazing_agitator"])
+        .build();
+    let block = r.block_key(AGITATOR);
+    r.block_container(&block, agitator_container());
+    r.block_energy(&block, agitator_battery());
+    let item = r.item_key(AGITATOR);
+    r.item_part(item, AgitatorItemPart);
+    if let Err(error) = r.block_entity_part(&kind, AgitatorPart) {
+        context.refuse(&format!(
+            "rftoolspower: the blazing agitator part was refused: {error}"
         ));
     }
 }
@@ -1717,6 +1736,15 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
         let mut payload = Compound::new();
         payload.insert(KEY_ENERGY.into(), Tag::Int(energy));
         entity_data_patch(&payload, BLAZING_TYPE_ID)
+    } else if block == AGITATOR {
+        // Upstream's loot copies `mcjtylib:item_energy` and `rftoolspower:agitator_data`: the
+        // store and the nine locks travel, the rods in the box do not (the engine keeps container
+        // items apart from this payload).
+        let state = read_agitator(&Tag::Compound(saved.clone()));
+        if state.energy == 0 && !state.locks.iter().any(|locked| *locked) {
+            return Flow::Continue;
+        }
+        entity_data_patch(&saved, AGITATOR_TYPE_ID)
     } else if block == ENDER_MONITOR {
         // Upstream's mode rides on the block's item (`EnderMonitorData` on the dropped stack):
         // the configured mode travels, the default one has nothing worth carrying, and the
@@ -2034,9 +2062,11 @@ impl Component for RodData {
 fn number(saved: &Tag, key: &str) -> Option<f32> {
     match saved.get(key)? {
         Tag::Float(bits) => Some(f32::from_bits(*bits)),
+        // A `Double` carries f64 *bits*, not a value (the slice-8 leg read a 0.05 clock as
+        // 4.58e18 ticks when this arm cast the raw bits).
+        Tag::Double(bits) => Some(f64::from_bits(*bits) as f32),
         Tag::Int(value) => Some(*value as f32),
         Tag::Long(value) => Some(*value as f32),
-        Tag::Double(value) => Some(*value as f32),
         _ => None,
     }
 }
@@ -2327,10 +2357,15 @@ pub(crate) fn on_right_click_block(
     let Some(level) = host.level(click.dimension.key().id()) else {
         return Flow::Continue;
     };
-    if block_id(&*host, level, click.pos).as_deref() != Some(BLAZING) {
+    let block = block_id(&*host, level, click.pos);
+    let handled = match block.as_deref() {
+        Some(BLAZING) => blazing_click(host, click, click.stack),
+        Some(AGITATOR) => agitator_click(host, click, click.stack),
+        _ => return Flow::Continue,
+    };
+    if handled.is_none() {
         return Flow::Continue;
     }
-    blazing_click(host, click, click.stack);
     *event.cancellation_result = InteractionResult::Success;
     event.cancelled = true;
     Flow::Cancel
@@ -2364,7 +2399,7 @@ pub(crate) fn blazing_click(
         }
         return Some(InteractionResult::Success);
     }
-    let free = free_rod_slot(host, level, click.pos);
+    let free = free_rod_slot(host, level, click.pos, BLAZING_SLOTS);
     let Some(slot) = free else {
         if let Some(player) = host.player(click.player) {
             let _ = player.action_bar(host, Text::literal("all four blazing rod slots are full"));
@@ -2383,10 +2418,15 @@ pub(crate) fn blazing_click(
     Some(InteractionResult::Success)
 }
 
-/// The first rod slot with nothing in it, if any.
-fn free_rod_slot(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<usize> {
+/// The first rod slot with nothing in it, `slots` slots wide.
+fn free_rod_slot(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    slots: usize,
+) -> Option<usize> {
     let entity = host.block_entity(level, pos)?;
-    (ROD_SLOT_FIRST..BLAZING_SLOTS).find(|slot| {
+    (ROD_SLOT_FIRST..slots).find(|slot| {
         entity
             .item_slot(&*host, *slot as u32)
             .ok()
@@ -2432,6 +2472,406 @@ pub(crate) fn insert_rod_from_hand(
 }
 
 // ---------------------------------------------------------------------------
+// The blazing agitator (`BlazingAgitatorTileEntity`, `BlazingAgitatorAlgorithm`, `AgitatorData`)
+// ---------------------------------------------------------------------------
+
+/// `rftoolspower:blazing_agitator` (`BlazingModule.BLAZING_AGITATOR`).
+pub(crate) const AGITATOR: &str = "rftoolspower:blazing_agitator";
+/// Its block entity type, named apart from its block for the reason [`GENERATOR_TYPE`] is.
+const AGITATOR_TYPE: &str = "blazing_agitator_block_entity";
+/// That type's registry id, which a broken agitator's payload names.
+const AGITATOR_TYPE_ID: &str = "rftoolspower:blazing_agitator_block_entity";
+/// A plain blaze rod: the box takes it and turns it into a blazing rod (`isValidBlazingRod`).
+const BLAZE_ROD: &str = "minecraft:blaze_rod";
+/// One saved lock per input slot (`AgitatorData.locked`).
+const KEY_LOCK: &str = "lock";
+/// What a read where no agitator stands answers.
+const NO_AGITATOR: &str = "No RFTools Power blazing agitator there.";
+
+/// The agitator's container: nine rod slots and nine output slots (upstream's two 3×3 boxes).
+pub(crate) fn agitator_container() -> ModContainer {
+    let all: Vec<usize> = (0..AGITATOR_SLOTS + AGITATOR_OUTPUTS).collect();
+    ModContainer {
+        slots: all.len(),
+        faces: std::array::from_fn(|_| all.clone()),
+        inputs: (0..AGITATOR_SLOTS).collect(),
+        outputs: (AGITATOR_SLOTS..AGITATOR_SLOTS + AGITATOR_OUTPUTS).collect(),
+        menu: None,
+    }
+}
+
+/// The agitator's buffer: upstream's `GenericEnergyStorage(this, true, 50000, 100)` — it takes
+/// [`AGITATOR_INSERT_PER_TICK`] an insert on any face and gives nothing out (it has no output).
+pub(crate) fn agitator_battery() -> ModEnergyBuffer {
+    ModEnergyBuffer {
+        capacity: AGITATOR_CAPACITY,
+        max_insert: AGITATOR_INSERT_PER_TICK,
+        max_extract: 0,
+        insert_faces: [true; 6],
+        extract_faces: [false; 6],
+    }
+}
+
+/// The agitator's saved state: its store and the nine locks (`saveAdditional` + `AgitatorData`).
+pub(crate) fn read_agitator(saved: &Tag) -> Agitator {
+    let mut agitator = Agitator {
+        energy: clamp_agitator(int(saved, KEY_ENERGY)),
+        ..Agitator::default()
+    };
+    for (slot, locked) in agitator.locks.iter_mut().enumerate() {
+        *locked = flag(saved, &format!("{KEY_LOCK}{slot}"));
+    }
+    agitator
+}
+
+/// Write the agitator back into a saved compound.
+pub(crate) fn write_agitator(saved: &mut Tag, state: &Agitator) {
+    set_int(saved, KEY_ENERGY, state.energy);
+    for (slot, locked) in state.locks.iter().enumerate() {
+        set_flag(saved, &format!("{KEY_LOCK}{slot}"), *locked);
+    }
+}
+
+/// A blazing-rod stack carrying `rod`, built from the item registry (`new ItemStack(BLAZING_ROD)`
+/// then `setPowerQuality`-style writes). `None` when the item is not registered here.
+fn rod_stack(host: &dyn Host, rod: Rod) -> Option<ItemStack> {
+    let key = host.item_key(&Identifier::parse(BLAZING_ROD).ok()?)?;
+    let mut stack = ItemStack::of(key);
+    stack.set(&RodData, rod).ok()?;
+    Some(stack)
+}
+
+/// What one slot of the agitator's box holds, read from its item.
+fn rod_slot(host: &dyn Host, stack: Option<&ItemStack>) -> RodSlot {
+    let Some(stack) = stack else {
+        return RodSlot::Empty;
+    };
+    match item_id(host, stack).as_str() {
+        BLAZING_ROD => RodSlot::Rod(rod_of(stack)),
+        BLAZE_ROD => RodSlot::BlazeRod,
+        _ => RodSlot::Foreign,
+    }
+}
+
+/// What the tick wants the container to do with one slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SlotWrite {
+    /// Nothing: the item stays, the rod's data is already what the tick left it.
+    Leave,
+    /// The slot loses its rod (the tick moved it to an output slot).
+    Clear,
+    /// The slot's rod, with the data the tick wrote.
+    Rod(Rod),
+}
+
+/// Compare a slot's model after the tick with what it held before.
+///
+/// A slot whose model is unchanged is left alone (no stack is rebuilt every tick), a rod that
+/// went to the output box clears its slot, and an agitated rod's new data goes back onto a fresh
+/// blazing-rod stack. An item that is no rod is never touched: the tick's model for such a slot
+/// is always [`RodSlot::Foreign`], so the last arm cannot fire for it.
+fn slot_write(current: RodSlot, model: RodSlot) -> SlotWrite {
+    if current == model {
+        return SlotWrite::Leave;
+    }
+    match model {
+        RodSlot::Rod(rod) => SlotWrite::Rod(rod),
+        RodSlot::Empty if current.is_rod() => SlotWrite::Clear,
+        _ => SlotWrite::Leave,
+    }
+}
+
+/// One agitator tick (`tickServer` → `tickRods`): pay the 10 FE, convert, agitate and move.
+///
+/// True when the saved payload or a slot moved (the tick's reply decides whether this Part's
+/// edits are applied at all).
+pub(crate) fn tick_agitator(
+    host: &mut dyn ServerHost,
+    saved: &mut Tag,
+    items: &mut Vec<Option<ItemStack>>,
+) -> bool {
+    let before = read_agitator(saved);
+    let mut state = before;
+    let total = AGITATOR_SLOTS + AGITATOR_OUTPUTS;
+    if items.len() != total {
+        items.resize(total, None);
+    }
+    let mut box_rods: [RodSlot; AGITATOR_SLOTS] =
+        std::array::from_fn(|slot| rod_slot(&*host, items[slot].as_ref()));
+    let mut outputs: [RodSlot; AGITATOR_OUTPUTS] =
+        std::array::from_fn(|slot| rod_slot(&*host, items[AGITATOR_SLOTS + slot].as_ref()));
+    let agitation = state.tick(true, &mut box_rods, &mut outputs);
+    let mut changed = agitation.changed || state != before;
+    for (slot, model) in box_rods.iter().enumerate() {
+        let current = rod_slot(&*host, items[slot].as_ref());
+        match slot_write(current, *model) {
+            SlotWrite::Leave => {}
+            SlotWrite::Clear => {
+                items[slot] = None;
+                changed = true;
+            }
+            SlotWrite::Rod(rod) => {
+                if let Some(stack) = rod_stack(&*host, rod) {
+                    items[slot] = Some(stack);
+                    changed = true;
+                }
+            }
+        }
+    }
+    for (slot, model) in outputs.iter().enumerate() {
+        let index = AGITATOR_SLOTS + slot;
+        let current = rod_slot(&*host, items[index].as_ref());
+        match slot_write(current, *model) {
+            SlotWrite::Leave => {}
+            SlotWrite::Clear => {
+                items[index] = None;
+                changed = true;
+            }
+            SlotWrite::Rod(rod) => {
+                if let Some(stack) = rod_stack(&*host, rod) {
+                    items[index] = Some(stack);
+                    changed = true;
+                }
+            }
+        }
+    }
+    write_agitator(saved, &state);
+    changed
+}
+
+/// The agitator's line, as `/rftoolspower agitator` and a click print it.
+pub(crate) fn agitator_line(
+    pos: [i32; 3],
+    state: &Agitator,
+    slots: &[Option<Rod>; AGITATOR_SLOTS],
+    rods: &[Option<String>; AGITATOR_SLOTS],
+    outputs: &[Option<String>; AGITATOR_OUTPUTS],
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let list = |pick: fn(&Rod) -> f32| -> String {
+        slots
+            .iter()
+            .map(|slot| slot.map_or("-".to_owned(), |rod| format!("{:.6}", pick(&rod))))
+            .collect::<Vec<String>>()
+            .join(",")
+    };
+    let locks: String = state
+        .locks
+        .iter()
+        .map(|locked| if *locked { '1' } else { '0' })
+        .collect();
+    let names = |slots: &[Option<String>]| -> String {
+        slots
+            .iter()
+            .map(|slot| slot.as_deref().unwrap_or("empty"))
+            .collect::<Vec<&str>>()
+            .join(",")
+    };
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Blazing Agitator at {},{},{}: {}/{} FE (ready {}, time={}, quality={}, duration={}, \
+         locks={locks}, rods={}, out={}, t={t}{suffix})",
+        pos[0],
+        pos[1],
+        pos[2],
+        state.energy,
+        AGITATOR_CAPACITY,
+        state.energy >= AGITATOR_USE_PER_TICK,
+        list(|rod| rod.time),
+        list(|rod| rod.quality),
+        list(|rod| rod.duration),
+        names(rods),
+        names(outputs),
+    )
+}
+
+/// The slots an agitator block entity holds, as [`agitator_line`] wants them.
+type AgitatorSlots = (
+    [Option<Rod>; AGITATOR_SLOTS],
+    [Option<String>; AGITATOR_SLOTS],
+    [Option<String>; AGITATOR_OUTPUTS],
+);
+
+/// Read the nine input rods and the nine output items off a block entity.
+fn agitator_slots(host: &mut dyn ServerHost, entity: mod_api::BlockEntityRef) -> AgitatorSlots {
+    let stack = |host: &mut dyn ServerHost, slot: usize| -> Option<ItemStack> {
+        entity.item_slot(&*host, slot as u32).ok().flatten()
+    };
+    let rods: [Option<String>; AGITATOR_SLOTS] =
+        std::array::from_fn(|slot| stack(host, slot).map(|held| item_id(&*host, &held)));
+    let outputs: [Option<String>; AGITATOR_OUTPUTS] = std::array::from_fn(|slot| {
+        stack(host, AGITATOR_SLOTS + slot).map(|held| item_id(&*host, &held))
+    });
+    let slots: [Option<Rod>; AGITATOR_SLOTS] = std::array::from_fn(|slot| {
+        stack(host, slot)
+            .filter(|held| item_id(&*host, held) == BLAZING_ROD)
+            .map(|held| rod_of(&held))
+    });
+    (slots, rods, outputs)
+}
+
+/// The line `/rftoolspower agitator <pos>` prints for the block at `pos`.
+pub(crate) fn agitator_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(AGITATOR) {
+        return NO_AGITATOR.to_owned();
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_AGITATOR.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_AGITATOR.to_owned();
+    };
+    let (slots, rods, outputs) = agitator_slots(host, entity);
+    let t = level.game_time(&*host).unwrap_or(0);
+    agitator_line(
+        pos,
+        &read_agitator(&Tag::Compound(saved)),
+        &slots,
+        &rods,
+        &outputs,
+        t,
+        nonce,
+    )
+}
+
+/// `/rftoolspower agitatelock <pos> <slot> <on|off>`: the GUI's lock checkbox, and the echo.
+pub(crate) fn set_agitator_lock(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    slot: i32,
+    word: &str,
+    nonce: Option<&str>,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(AGITATOR) {
+        return NO_AGITATOR.to_owned();
+    }
+    let Some(index) = usize::try_from(slot)
+        .ok()
+        .filter(|slot| *slot < AGITATOR_SLOTS)
+    else {
+        return format!(
+            "Blazing Agitator at {},{},{}: slot {slot} is not one of 0..{}",
+            pos[0],
+            pos[1],
+            pos[2],
+            AGITATOR_SLOTS - 1
+        );
+    };
+    let locked = match word {
+        "on" => true,
+        "off" => false,
+        other => {
+            return format!(
+                "Blazing Agitator at {},{},{}: unknown lock '{other}' (on|off)",
+                pos[0], pos[1], pos[2]
+            );
+        }
+    };
+    let Some(mut state) = agitator_at(host, level, pos) else {
+        return NO_AGITATOR.to_owned();
+    };
+    state.locks[index] = locked;
+    write_agitator_at(host, level, pos, &state);
+    agitator_status_line(host, level, pos, nonce)
+}
+
+/// The agitator's saved state at `pos`, if that block is one.
+fn agitator_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<Agitator> {
+    if block_id(&*host, level, pos).as_deref() != Some(AGITATOR) {
+        return None;
+    }
+    let entity = host.block_entity(level, pos)?;
+    let saved = entity.data(&*host)?;
+    Some(read_agitator(&Tag::Compound(saved)))
+}
+
+/// Write the agitator's state back; false when it did not change.
+fn write_agitator_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    state: &Agitator,
+) -> bool {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return false;
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return false;
+    };
+    let mut saved = Tag::Compound(saved);
+    if read_agitator(&saved) == *state {
+        return false;
+    }
+    write_agitator(&mut saved, state);
+    if let Tag::Compound(data) = saved {
+        let _ = entity.replace_data(host, data);
+    }
+    let _ = entity.set_changed(&mut *host);
+    true
+}
+
+/// `PlayerInteractEvent.RightClickBlock`: an agitator takes every click as its own — a valid rod
+/// goes into the first empty slot of the 3×3 box, anything else is refused with a line, an empty
+/// hand reads the machine out — and nothing else acts (upstream opens its GUI).
+pub(crate) fn agitator_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+    held: Option<&ItemStack>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    if block_id(&*host, level, click.pos).as_deref() != Some(AGITATOR) {
+        return None;
+    }
+    let Some(held) = held.filter(|stack| stack.count() > 0) else {
+        let line = agitator_status_line(host, level, click.pos, None);
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal(line));
+        }
+        return Some(InteractionResult::Success);
+    };
+    // `isValidBlazingRod`: a blaze rod, or a blazing rod that has not been infused yet.
+    let valid = {
+        let id = item_id(&*host, held);
+        id == BLAZE_ROD || (id == BLAZING_ROD && rod_of(held).steps >= ROD_START_STEPS)
+    };
+    if !valid {
+        let refused = item_id(&*host, held);
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(
+                host,
+                Text::literal(format!(
+                    "{refused} is not a blazing rod with infusion steps left"
+                )),
+            );
+        }
+        return Some(InteractionResult::Success);
+    }
+    let Some(slot) = free_rod_slot(host, level, click.pos, AGITATOR_SLOTS) else {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal("all nine blazing rod slots are full"));
+        }
+        return Some(InteractionResult::Success);
+    };
+    let hand = ItemPlace::PlayerHand {
+        player: click.player,
+        hand: click.hand,
+    };
+    if insert_rod_from_hand(host, level, click.pos, held, &hand, slot) == 0
+        && let Some(player) = host.player(click.player)
+    {
+        let _ = player.action_bar(host, Text::literal("the rod did not go in"));
+    }
+    Some(InteractionResult::Success)
+}
+
+// ---------------------------------------------------------------------------
 // The command
 // ---------------------------------------------------------------------------
 
@@ -2453,6 +2893,8 @@ pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
         "rftoolspower enderlink <pos:block_pos> <destination:block_pos>",
         "rftoolspower endermonitor <pos:block_pos> <action:word> [nonce:word]",
         "rftoolspower blazing <pos:block_pos> [nonce:word]",
+        "rftoolspower agitator <pos:block_pos> [nonce:word]",
+        "rftoolspower agitatelock <pos:block_pos> <slot:integer> <lock:word> [nonce:word]",
     ] {
         commands.push(Command::op(usage, OPERATOR_LEVEL));
     }
@@ -2547,6 +2989,8 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             | "enderlink"
             | "endermonitor"
             | "blazing"
+            | "agitator"
+            | "agitatelock"
     ) {
         return Flow::Continue;
     }
@@ -2569,6 +3013,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             "injector" => NO_INJECTOR,
             "endermonitor" => NO_ENDER_MONITOR,
             "blazing" => NO_BLAZING,
+            "agitator" | "agitatelock" => NO_AGITATOR,
             _ => NO_GENERATOR,
         }));
         return Flow::Cancel;
@@ -2591,6 +3036,15 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         "endergenic" => endergenic_status_line(host, level, *pos, nonce_of(event)),
         "injector" => injector_status_line(host, level, *pos, nonce_of(event)),
         "blazing" => blazing_status_line(host, level, *pos, nonce_of(event)),
+        "agitator" => agitator_status_line(host, level, *pos, nonce_of(event)),
+        "agitatelock" => set_agitator_lock(
+            host,
+            level,
+            *pos,
+            integer_of(event, "slot"),
+            word_of(event, "lock").unwrap_or_default(),
+            nonce_of(event),
+        ),
         "endermonitor" => match word_of(event, "action") {
             None | Some("status") => ender_monitor_status_line(host, level, *pos, nonce_of(event)),
             Some(word) => set_monitor_mode(host, level, *pos, word, nonce_of(event)),
@@ -3971,32 +4425,55 @@ pub(crate) struct BlazingItemPart;
 #[mod_api::horizon_part]
 impl ItemPart for BlazingItemPart {
     fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
-        let Some(level) = event
-            .placer
-            .and_then(|player| player.level(&*host))
-            .or_else(|| in_place_level(host))
-        else {
-            return;
-        };
-        if block_id(&*host, level, event.pos).as_deref() != Some(BLAZING) {
-            return;
-        }
-        let Some(entity) = host.block_entity(level, event.pos) else {
-            return;
-        };
-        let Some(saved) = entity.data(&*host) else {
-            return;
-        };
-        let mut saved = Tag::Compound(saved);
-        let stored = int(&saved, KEY_ENERGY);
-        let clamped = clamp_blazing(stored);
-        if clamped == stored {
-            return;
-        }
-        set_int(&mut saved, KEY_ENERGY, clamped);
-        if let Tag::Compound(data) = saved {
-            let _ = entity.replace_data(host, data);
-        }
+        clamp_placed_energy(host, event, BLAZING, clamp_blazing);
+    }
+}
+
+/// A blazing agitator's own item: it carries its store (upstream's loot copies
+/// `mcjtylib:item_energy`) and its nine locks (`rftoolspower:agitator_data`), clamped back to the
+/// buffer when it is placed again.
+pub(crate) struct AgitatorItemPart;
+
+#[mod_api::horizon_part]
+impl ItemPart for AgitatorItemPart {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        clamp_placed_energy(host, event, AGITATOR, clamp_agitator);
+    }
+}
+
+/// Clamp a placed machine's `block_entity_data` store to its own buffer (`applyImplicitComponents`
+/// then `GenericEnergyStorage.applyImplicitComponents`).
+fn clamp_placed_energy(
+    host: &mut dyn ServerHost,
+    event: &OnBlockPlacedByEvent<'_>,
+    block: &str,
+    clamp: impl Fn(i32) -> i32,
+) {
+    let Some(level) = event
+        .placer
+        .and_then(|player| player.level(&*host))
+        .or_else(|| in_place_level(host))
+    else {
+        return;
+    };
+    if block_id(&*host, level, event.pos).as_deref() != Some(block) {
+        return;
+    }
+    let Some(entity) = host.block_entity(level, event.pos) else {
+        return;
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return;
+    };
+    let mut saved = Tag::Compound(saved);
+    let stored = int(&saved, KEY_ENERGY);
+    let clamped = clamp(stored);
+    if clamped == stored {
+        return;
+    }
+    set_int(&mut saved, KEY_ENERGY, clamped);
+    if let Tag::Compound(data) = saved {
+        let _ = entity.replace_data(host, data);
     }
 }
 
@@ -4026,6 +4503,49 @@ impl BlockEntityPart for BlazingPart {
         let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
         let items = &mut event.entity.items;
         let changed = tick_blazing(host, level, pos, &mut saved, items);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
+/// The blazing agitator: it ticks, a click puts a rod in the first empty slot of its 3×3 box.
+/// Upstream's `RotationType.NONE`: the block has no facing, so there is no placement hook.
+pub(crate) struct AgitatorPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for AgitatorPart {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for AgitatorPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound; the tick fills it.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: it ticks.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: the 10 FE, the conversion, the agitation and the output box.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        if event.entity.items.len() != AGITATOR_SLOTS + AGITATOR_OUTPUTS {
+            event
+                .entity
+                .items
+                .resize(AGITATOR_SLOTS + AGITATOR_OUTPUTS, None);
+        }
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let items = &mut event.entity.items;
+        let changed = tick_agitator(host, &mut saved, items);
         if let Tag::Compound(nbt) = saved {
             event.entity.nbt = nbt;
         }
@@ -4350,10 +4870,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_eleven_the_harness_types() {
+    fn the_commands_are_the_thirteen_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 11);
+        assert_eq!(commands.len(), 13);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -4395,6 +4915,19 @@ mod tests {
             commands[9].usage,
             "rftoolspower endermonitor <pos:block_pos> <action:word> [nonce:word]",
             "the monitor's readout is `status <nonce>`; a mode word sets its GUI picker"
+        );
+        assert_eq!(
+            commands[10].usage, "rftoolspower blazing <pos:block_pos> [nonce:word]",
+            "the blazing generator's readout"
+        );
+        assert_eq!(
+            commands[11].usage, "rftoolspower agitator <pos:block_pos> [nonce:word]",
+            "the agitator's readout"
+        );
+        assert_eq!(
+            commands[12].usage,
+            "rftoolspower agitatelock <pos:block_pos> <slot:integer> <lock:word> [nonce:word]",
+            "the GUI's lock checkbox, as a command"
         );
         for command in &commands {
             assert_eq!(command.level, OPERATOR_LEVEL);
@@ -4919,6 +5452,11 @@ mod tests {
         let decoded = RodData.decode(&partial).expect("a compound decodes");
         assert_eq!(decoded.duration, 3.0);
         assert_eq!(decoded.quality, Rod::default().quality);
+        // SNBT's `0.05` (no `f`) is a double, and a `Double` tag carries f64 *bits* — the slice-8
+        // e2e caught this arm handing the raw bits to the clock, which read 4.58e18 ticks.
+        let from_double = Tag::compound([("time", Tag::Double(0.05_f64.to_bits()))]);
+        let decoded = RodData.decode(&from_double).expect("a compound decodes");
+        assert_eq!(decoded.time, 0.05);
         assert_eq!(RodData.decode(&Tag::Int(1)), None, "not a rod's data");
     }
 
@@ -4979,5 +5517,158 @@ mod tests {
         declare_component(&mut types);
         declare_component(&mut types);
         assert_eq!(types, vec![ROD_DATA.to_owned()], "registered once");
+    }
+
+    #[test]
+    fn the_agitator_has_nine_rod_slots_and_nine_output_slots() {
+        let container = agitator_container();
+        assert_eq!(container.slots, 18, "two 3×3 boxes");
+        assert_eq!(container.inputs, (0..9).collect::<Vec<usize>>());
+        assert_eq!(container.outputs, (9..18).collect::<Vec<usize>>());
+        assert_eq!(
+            container.faces,
+            std::array::from_fn(|_| (0..18).collect::<Vec<usize>>()),
+            "automation reaches the box from every face, as upstream's ITEMS_AUTOMATION does"
+        );
+        assert_eq!(container.menu, None, "no GUI in this slice");
+    }
+
+    #[test]
+    fn the_agitator_buffer_is_fifty_thousand_and_takes_a_hundred_a_tick() {
+        let battery = agitator_battery();
+        assert_eq!(
+            battery.capacity, AGITATOR_CAPACITY,
+            "blazingAgitatorMaxPower"
+        );
+        assert_eq!(
+            battery.max_insert, AGITATOR_INSERT_PER_TICK,
+            "blazingAgitatorRFPerTick is what one insert moves"
+        );
+        assert_eq!(battery.max_extract, 0, "the agitator gives nothing out");
+        assert_eq!(battery.insert_faces, [true; 6], "every face takes FE in");
+        assert_eq!(battery.extract_faces, [false; 6]);
+    }
+
+    #[test]
+    fn the_agitators_store_and_locks_read_back_from_the_compound_it_wrote() {
+        let mut saved = compound();
+        let mut state = Agitator {
+            energy: 4_321,
+            ..Agitator::default()
+        };
+        state.locks[0] = true;
+        state.locks[4] = true;
+        write_agitator(&mut saved, &state);
+        assert_eq!(read_agitator(&saved), state);
+        assert_eq!(
+            saved.get("lock4"),
+            Some(&Tag::Byte(1)),
+            "a lock is vanilla's byte"
+        );
+        assert_eq!(saved.get("lock1"), Some(&Tag::Byte(0)));
+        let mut doctored = compound();
+        set_int(&mut doctored, "energy", 999_999);
+        assert_eq!(
+            read_agitator(&doctored).energy,
+            AGITATOR_CAPACITY,
+            "a doctored store is clamped"
+        );
+        let mut negative = compound();
+        set_int(&mut negative, "energy", -5);
+        assert_eq!(read_agitator(&negative).energy, 0);
+    }
+
+    #[test]
+    fn a_slot_write_leaves_a_foreign_item_alone() {
+        let rod = Rod::default();
+        let spent = Rod {
+            time: 0.0,
+            ..Rod::default()
+        };
+        // Unchanged: nothing is rebuilt (an agitated rod's data is written once, not every tick).
+        assert_eq!(
+            slot_write(RodSlot::Rod(rod), RodSlot::Rod(rod)),
+            SlotWrite::Leave
+        );
+        assert_eq!(slot_write(RodSlot::Empty, RodSlot::Empty), SlotWrite::Leave);
+        assert_eq!(
+            slot_write(RodSlot::Foreign, RodSlot::Foreign),
+            SlotWrite::Leave,
+            "the tick never touches another item"
+        );
+        assert_eq!(
+            slot_write(RodSlot::BlazeRod, RodSlot::Rod(rod)),
+            SlotWrite::Rod(rod),
+            "a converted blaze rod becomes a blazing rod"
+        );
+        assert_eq!(
+            slot_write(RodSlot::Rod(spent), RodSlot::Empty),
+            SlotWrite::Clear,
+            "a rod that moved to the output box clears its slot"
+        );
+        assert_eq!(
+            slot_write(RodSlot::Rod(spent), RodSlot::Rod(rod)),
+            SlotWrite::Rod(rod)
+        );
+    }
+
+    #[test]
+    fn the_agitator_line_is_the_line_the_e2e_asserts() {
+        let mut state = Agitator {
+            energy: 4_990,
+            ..Agitator::default()
+        };
+        state.locks[3] = true;
+        let mut slots = [None; AGITATOR_SLOTS];
+        slots[0] = Some(Rod::default());
+        slots[1] = Some(Rod {
+            quality: 60_000.5,
+            time: 599.5,
+            duration: 20.0625,
+            ..Rod::default()
+        });
+        let mut rods: [Option<String>; AGITATOR_SLOTS] = std::array::from_fn(|_| None);
+        rods[0] = Some(BLAZING_ROD.to_owned());
+        rods[1] = Some(BLAZING_ROD.to_owned());
+        let mut outputs: [Option<String>; AGITATOR_OUTPUTS] = std::array::from_fn(|_| None);
+        outputs[0] = Some(BLAZING_ROD.to_owned());
+        let line = agitator_line(
+            [302, 101, 150],
+            &state,
+            &slots,
+            &rods,
+            &outputs,
+            9_001,
+            Some("n2"),
+        );
+        assert_eq!(
+            line,
+            "Blazing Agitator at 302,101,150: 4990/50000 FE (ready true, \
+             time=600.000000,599.500000,-,-,-,-,-,-,-, \
+             quality=60000.000000,60000.500000,-,-,-,-,-,-,-, \
+             duration=20.000000,20.062500,-,-,-,-,-,-,-, \
+             locks=000100000, \
+             rods=rftoolspower:blazing_rod,rftoolspower:blazing_rod,empty,empty,empty,empty,empty,empty,empty, \
+             out=rftoolspower:blazing_rod,empty,empty,empty,empty,empty,empty,empty,empty, \
+             t=9001 nonce=n2)"
+        );
+    }
+
+    #[test]
+    fn the_agitator_commands_are_declared_at_the_operator_level() {
+        let mut commands = Vec::new();
+        declare_commands(&mut commands);
+        let agitator: Vec<&str> = commands
+            .iter()
+            .map(|command| command.usage.as_str())
+            .filter(|usage| usage.contains("agitat"))
+            .collect();
+        assert_eq!(
+            agitator,
+            vec![
+                "rftoolspower agitator <pos:block_pos> [nonce:word]",
+                "rftoolspower agitatelock <pos:block_pos> <slot:integer> <lock:word> [nonce:word]",
+            ]
+        );
     }
 }
