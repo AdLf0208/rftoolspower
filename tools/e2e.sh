@@ -119,13 +119,26 @@
 #  BN the agitator's refusals parse, a stone is refused as a rod, and the carried recipe needs the
 #     parent's machine frame and the absent `#c:rods/blaze` tag
 #
+#  BO a rod in an energised infuser with no catalyst does not move: over a window the counter wraps
+#     but steps, quality, duration and the store are unchanged (the differential for BP)
+#  BP one nether star infuses exactly once — steps 64 -> 63, quality 60,000 -> 61,125, duration
+#     20 -> 20.375, the store -10 and the catalyst consumed — and the two replies' counters and
+#     ticks close an 11-tick period (the field is 10, the period 11)
+#  BQ redstone raises quality by 375 (+40 %) and leaves duration alone: the per-catalyst differential
+#  BR a hopper feeding nether stars runs the machine over a window where a 10-tick period would
+#     predict a different count: the runs equal floor((dt + 10 - counter0)/11), each costs one star
+#     and 10 FE, and the quality/duration fold is the single-precision per-run percentage
+#  BS the infuser's refusals parse, a stone is refused as neither rod nor catalyst, and the carried
+#     recipe needs the parent's dimensional shard and machine frame
+#
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
 # of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF;
 # SELFTEST_ENDERMON=1 inverts AO (the monitor must not have lit);
 # SELFTEST_POWERLEVEL=1 inverts the power level's 5 (it asserts the brief's mistaken 4);
 # SELFTEST_BLAZING=1 asserts a rod at its ceiling makes no FE (AZ inverted) and exits non-zero;
-# SELFTEST_AGITATOR=1 asserts a rod alone rises the brief's 10 a tick (BH inverted) and exits 1.
+# SELFTEST_AGITATOR=1 asserts a rod alone rises the brief's 10 a tick (BH inverted) and exits 1;
+# SELFTEST_INFUSER=1 asserts the brief's old 10-tick infuser period (BR inverted) and exits 1.
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -144,6 +157,7 @@ SELFTEST_ENDERMON=${SELFTEST_ENDERMON:-0}
 SELFTEST_POWERLEVEL=${SELFTEST_POWERLEVEL:-0}
 SELFTEST_BLAZING=${SELFTEST_BLAZING:-0}
 SELFTEST_AGITATOR=${SELFTEST_AGITATOR:-0}
+SELFTEST_INFUSER=${SELFTEST_INFUSER:-0}
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
 WORLD=RFToolsPowerE2E
@@ -168,6 +182,7 @@ CHARCOAL=minecraft:charcoal
 COAL_BLOCK=minecraft:coal_block
 STONE=minecraft:stone
 AGITATOR=rftoolspower:blazing_agitator
+INFUSER=rftoolspower:blazing_infuser
 
 [ -n "$CTL" ] || { echo "set CTL= to the horizon-ctl of this pin (launcher-game.sh env)" >&2; exit 1; }
 [ -x "$CTL" ] || { echo "missing horizon-ctl: $CTL" >&2; exit 1; }
@@ -763,6 +778,93 @@ expect_ag_lock() { # expect_ag_lock SLOT 0|1
 # The 3×3 box folded from the two replies' own values over the ticks their `t=` names.
 ag_fold() { # ag_fold T0 T1 TIME0 QUALITY0 DURATION0 TIME1 QUALITY1 DURATION1
     eval "$(python3 "$PORT/tools/parse_agitator.py" --fold "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8")"
+}
+
+# --- the blazing infuser (slice 9) ---------------------------------------
+# A full cube with a six-way `facing`. The GUI is not carried, so a click is the only way a rod or a
+# catalyst goes in; the readout names the counter, which is what makes the 11-tick period solvable
+# from two replies (`parse_infuser.py --period`).
+place_infuser() { # place_infuser X Y Z — a fresh infuser from the hotbar
+    local x=$1 y=$2 z=$3 aim
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    hold "$INFUSER"
+    aim=$(ctl look-at-block "$x" $((y - 1)) "$z" up 2>&1) \
+        || fail "cannot aim at the floor under $x,$y,$z: $aim"
+    place_block "$x" "$y" "$z" "$INFUSER" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$INFUSER" ] || fail "the infuser did not place at $x,$y,$z"
+    # The placement's yaw is the game's, not the player's (the monitor/injector trap): pin the front
+    # so a change in the placement context cannot silently repoint the machine.
+    ctl command "execute in minecraft:the_end run setblock $x $y $z $INFUSER[facing=north]" >/dev/null
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$INFUSER" ] || fail "the infuser vanished from $x,$y,$z"
+    echo "  placed: $(ctl block "$x" "$y" "$z" | jq -r '.state')" >&2
+}
+
+place_infuser_kept() { # place_infuser_kept X Y Z — the infuser item the player already carries
+    local x=$1 y=$2 z=$3
+    ctl command "execute in minecraft:the_end run setblock $x $y $z minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select "$INFUSER" >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at-block "$x" $((y - 1)) "$z" up >/dev/null || fail "cannot aim at the floor under $x,$y,$z"
+    place_block "$x" "$y" "$z" "$INFUSER" \
+        || fail "ctl place at $x,$y,$z failed: $PLACE_REPLY"
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$INFUSER" ] || fail "the carried infuser did not place at $x,$y,$z"
+    ctl command "execute in minecraft:the_end run setblock $x $y $z $INFUSER[facing=north]" >/dev/null
+    ctl wait 4 >/dev/null
+    [ "$(block_name "$x" "$y" "$z")" = "$INFUSER" ] || fail "the infuser vanished from $x,$y,$z"
+}
+
+# An infuser with `FE` in its own store: the machine's item carries `block_entity_data`, which the
+# block entity reads back on placement (the buffer clamps it to 50,000).
+energised_infuser() { # energised_infuser X Y Z FE
+    ctl command "give @s $INFUSER[minecraft:block_entity_data={id:\"rftoolspower:blazing_infuser_block_entity\",energy:$4}]" >/dev/null
+    ctl wait 6 >/dev/null
+    place_infuser_kept "$1" "$2" "$3"
+}
+
+# A right click with whatever hotbar slot 1 holds: a rod into the input slot, a catalyst into its
+# own slot. Survival, because a creative hand keeps the clicked stack (the cell slice's trap).
+click_infuser() { # click_infuser X Y Z
+    ctl command "execute in minecraft:the_end run tp @s $(($1 - 2)).5 101 $3.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+    ctl look-at "$1.5" "$2.5" "$3.5" >/dev/null || fail "cannot aim at the infuser at $1,$2,$3"
+    ctl interact "$1" "$2" "$3" >/dev/null
+    ctl wait 10 >/dev/null
+}
+
+# `/rftoolspower infuser X Y Z <nonce>`: the line, then the parsed fields (IN_*).
+infuser() { # infuser X Y Z
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower infuser $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower infuser reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_infuser.py" "$line")"
+    [ "${ok:-0}" = 1 ] || fail "the infuser line did not parse: $line"
+    echo "  $line" >&2
+}
+
+expect_in_steps() { [ "$IN_STEPS" = "$1" ] || fail "the input rod has $IN_STEPS steps, expected $1"; }
+expect_in_catalyst() { [ "$IN_CATALYST" = "$1" ] || fail "the catalyst slot holds '$IN_CATALYST', expected '$1'"; }
+expect_in_quality() { [ "$IN_QUALITY" = "$1" ] || fail "the input rod's quality is $IN_QUALITY, expected $1"; }
+expect_in_duration() { [ "$IN_DURATION" = "$1" ] || fail "the input rod's duration is $IN_DURATION, expected $1"; }
+
+# The counter solved over the window two replies name: PERIOD_RUNS is how many times it wrapped,
+# PERIOD_REMAINDER must be 0 for an 11-tick period, PERIOD_FIELD is what 11 ticks predicts for this
+# phase and PERIOD_TEN what the brief's old 10 ticks would.
+inf_period() { # inf_period COUNTER0 COUNTER1 T0 T1
+    eval "$(python3 "$PORT/tools/parse_infuser.py" --period "$1" "$2" "$3" "$4")"
 }
 
 echo "== launch (The End arena, the package's own content and code) =="
@@ -3039,4 +3141,200 @@ ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  the machine frame and the absent #c:rods/blaze tag are the recipe's limit here"
 
-echo "PASS: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+echo "== BO: a rod with no catalyst does not move (the differential) =="
+# BN left the player in creative for its crafting table; the clicks here are survival clicks (a
+# creative hand keeps the clicked stack — the cell slice's trap).
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 6 >/dev/null
+energised_infuser "$SX" 101 172 5000
+infuser "$SX" 101 172
+[ "$IN_ENERGY" = 5000 ] || fail "the seeded infuser reads $IN_ENERGY FE, expected exactly 5000 (it has no way to spend it)"
+[ "$IN_STEPS" = "-" ] || fail "a fresh infuser's input slot reports steps '$IN_STEPS', expected '-'"
+expect_in_catalyst empty
+hold_rod 20
+click_infuser "$SX" 101 172
+infuser "$SX" 101 172
+expect_in_steps 64
+[ "$IN_INPUT" = "$ROD_ITEM" ] || fail "the rod did not land in the input slot ('$IN_INPUT')"
+echo "  the rod is in the input slot (steps=$IN_STEPS), the catalyst slot '$IN_CATALYST'"
+I_T0=$IN_T; I_C0=$IN_COUNTER
+ctl wait 25 >/dev/null
+infuser "$SX" 101 172
+inf_period "$I_C0" "$IN_COUNTER" "$I_T0" "$IN_T"
+expect_in_steps 64
+expect_in_quality 60000.000000
+expect_in_duration 20.000000
+expect_in_catalyst empty
+[ "$IN_ENERGY" = 5000 ] || fail "the store moved to $IN_ENERGY FE with no catalyst"
+[ "$PERIOD_REMAINDER" = 0 ] || fail "the counter does not close an 11-tick period (remainder $PERIOD_REMAINDER over $PERIOD_TICKS ticks)"
+[ "$PERIOD_RUNS" -ge 1 ] || fail "the counter did not wrap in $PERIOD_TICKS ticks"
+echo "  over $PERIOD_TICKS ticks the counter wrapped $PERIOD_RUNS time(s) and nothing was infused or spent"
+
+echo "== BP: one nether star infuses once: a run on the 11th tick, +1,125 quality =="
+energised_infuser "$SX" 101 174 5000
+hold_rod 20
+click_infuser "$SX" 101 174
+infuser "$SX" 101 174
+expect_in_steps 64
+I_T0=$IN_T; I_C0=$IN_COUNTER; I_E0=$IN_ENERGY
+hold minecraft:nether_star 1
+click_infuser "$SX" 101 174
+infuser "$SX" 101 174
+expect_in_catalyst empty
+expect_in_steps 63
+# 60,000 + 60,000 × 120 / (100 × 64) = 61,125 — the brief's +112.5 is a factor 10 out.
+expect_in_quality 61125.000000
+expect_in_duration 20.375000
+[ "$IN_ENERGY" = $((I_E0 - 10)) ] || fail "the store is $IN_ENERGY FE, expected $((I_E0 - 10)) (a run spends 10)"
+inf_period "$I_C0" "$IN_COUNTER" "$I_T0" "$IN_T"
+[ "$PERIOD_REMAINDER" = 0 ] || fail "the counter does not close an 11-tick period (remainder $PERIOD_REMAINDER over $PERIOD_TICKS ticks)"
+[ "$PERIOD_RUNS" -ge 1 ] || fail "no counter tick happened in $PERIOD_TICKS ticks"
+echo "  one star, one run: steps 64 -> $IN_STEPS, quality 60,000 -> $IN_QUALITY, duration 20 -> $IN_DURATION, store -10"
+
+echo "== BQ: redstone is quality-only (+40 %) — the per-catalyst differential =="
+energised_infuser "$SX" 101 176 5000
+hold_rod 20
+click_infuser "$SX" 101 176
+infuser "$SX" 101 176
+expect_in_steps 64
+hold minecraft:redstone 1
+click_infuser "$SX" 101 176
+infuser "$SX" 101 176
+expect_in_catalyst empty
+expect_in_steps 63
+expect_in_quality 60375.000000
+expect_in_duration 20.000000
+echo "  redstone: quality 60,000 -> $IN_QUALITY (+375), duration unchanged at $IN_DURATION (the star moved both)"
+
+echo "== BR: a hopper feeds catalysts, and the counter's period is 11, not 10 =="
+ctl command "execute in minecraft:the_end run setblock $SX 102 172 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+energised_infuser "$SX" 101 172 20000
+hold_rod 20
+click_infuser "$SX" 101 172
+infuser "$SX" 101 172
+expect_in_steps 64
+[ "$IN_INPUT" = "$ROD_ITEM" ] || fail "the rod did not land in the input slot ('$IN_INPUT')"
+# A hopper above the machine: one star at a time is pushed into the catalyst slot, so every run has
+# one to eat (the input slot is occupied, and the output slot takes no insert).
+ctl command "execute in minecraft:the_end run setblock $SX 102 172 minecraft:hopper[facing=down]" >/dev/null
+ctl wait 4 >/dev/null
+ctl command "item replace block $SX 102 172 container.0 with minecraft:nether_star 16" >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$SX" 102 172)" = "minecraft:hopper" ] || fail "the hopper did not place above the infuser"
+hopper_stars() { # hopper_stars X Y Z -> the first stack's count
+    ctl command "data get block $1 $2 $3 Items[0].count" >/dev/null
+    ctl wait 4 >/dev/null
+    local line
+    line=$(await_line 'has the following block data')
+    printf '%s' "$line" | sed -n 's/.*has the following block data: *\([0-9-]*\).*/\1/p'
+}
+infuser "$SX" 101 172
+I_T0=$IN_T; I_C0=$IN_COUNTER; I_E0=$IN_ENERGY; I_STEPS0=$IN_STEPS
+I_Q0=$IN_QUALITY; I_D0=$IN_DURATION
+# Wait until the 11- and 10-tick predictions for this phase differ, so the selftest's inversion is
+# a real difference and not a coincidence of the window.
+for attempt in $(seq 1 8); do
+    ctl wait 11 >/dev/null
+    infuser "$SX" 101 172
+    inf_period "$I_C0" "$IN_COUNTER" "$I_T0" "$IN_T"
+    [ "$PERIOD_FIELD" != "$PERIOD_TEN" ] && [ "$PERIOD_RUNS" -ge 3 ] && break
+done
+RUNS=$((I_STEPS0 - IN_STEPS))
+STARS=$(hopper_stars "$SX" 102 172)
+[ -n "$STARS" ] || fail "the hopper did not answer its own stack count"
+# One catalyst a run, conserved exactly: 16 seeded = runs so far + what the hopper still holds + the
+# one in the catalyst slot (a run consumes the slot's star before the hopper refills it). `steps`
+# names the runs exactly, so this needs no timing assumption between the two reads.
+CAT_N=${IN_CATALYST_COUNT:-0}
+TOTAL=$(( (64 - IN_STEPS) + STARS + CAT_N ))
+echo "  over $PERIOD_TICKS ticks: $RUNS run(s) (counter wrapped $PERIOD_RUNS), '$STARS' stars left in the hopper ($CAT_N in the slot), store $I_E0 -> $IN_ENERGY" >&2
+# One catalyst a run, conserved: 16 seeded = runs + what the hopper holds + what the catalyst slot
+# holds. The hopper and the infuser are two reads a few ticks apart (the campaign's trap 3), so a
+# star that moved from the hopper into the slot between them is counted on neither side: 16 or 15.
+[ "$TOTAL" -ge 15 ] && [ "$TOTAL" -le 16 ] \
+    || fail "the 16 seeded nether stars are not one a run: $((64 - IN_STEPS)) runs + '$STARS' in the hopper + $CAT_N in the slot = $TOTAL"
+[ "$PERIOD_REMAINDER" = 0 ] || fail "the counter does not close an 11-tick period (remainder $PERIOD_REMAINDER over $PERIOD_TICKS ticks)"
+[ "$PERIOD_RUNS" -ge 3 ] || fail "only $PERIOD_RUNS counter tick(s) in $PERIOD_TICKS ticks; the window is too small to assert the period"
+[ "$PERIOD_RUNS" = "$PERIOD_FIELD" ] || fail "the counter wrapped $PERIOD_RUNS times, not floor((Δt + 10 - counter0)/11) = $PERIOD_FIELD over $PERIOD_TICKS ticks (counter0 $I_C0): the period is 11"
+[ "$RUNS" -le "$PERIOD_RUNS" ] || fail "$RUNS runs in $PERIOD_RUNS counter ticks: a run tick cannot be outrun"
+[ "$RUNS" -ge 1 ] || fail "the machine never ran"
+[ $((I_E0 - IN_ENERGY)) = $((10 * RUNS)) ] || fail "the store fell $((I_E0 - IN_ENERGY)) FE over $RUNS runs, expected $((10 * RUNS))"
+python3 - "$RUNS" "$I_Q0" "$IN_QUALITY" "$I_D0" "$IN_DURATION" <<'INFOLD' \
+    || fail "the rod is not the catalyst's per-run percentage fold (quality $I_Q0 -> $IN_QUALITY, duration $I_D0 -> $IN_DURATION over $RUNS runs)"
+import struct
+import sys
+runs, q0, q1, d0, d1 = int(sys.argv[1]), *map(float, sys.argv[2:6])
+f32 = lambda x: struct.unpack("<f", struct.pack("<f", x))[0]
+quality, duration = f32(q0), f32(d0)
+for _ in range(runs):
+    quality = f32(quality + f32(f32(quality * f32(120.0)) / f32(100.0 * 64.0)))
+    duration = f32(duration + f32(f32(duration * f32(120.0)) / f32(100.0 * 64.0)))
+sys.exit(0 if abs(quality - q1) < 0.5 and abs(duration - d1) < 0.01 else 1)
+INFOLD
+if [ "$SELFTEST_INFUSER" = 1 ]; then
+    echo "(selftest: asserting the brief's 10-tick period: $PERIOD_TEN counter ticks, not the artefact's 11)"
+    [ "$PERIOD_RUNS" = "$PERIOD_TEN" ] || fail "selftest: the counter wrapped $PERIOD_RUNS times in $PERIOD_TICKS ticks — one run every 11 (floor((Δt + 10 − counter0)/11) = $PERIOD_FIELD), not the brief's 10-tick period ($PERIOD_TEN) — the assertion is alive"
+fi
+echo "  one catalyst a run, 10 FE a run, and $RUNS runs in $PERIOD_TICKS ticks (the artefact's 11, not the field's 10)"
+
+echo "== BS: the infuser's refusals parse, a stone is refused, and its recipe needs the parent =="
+ctl command "execute in minecraft:the_end run setblock $SX 101 168 minecraft:stone" >/dev/null
+ctl wait 4 >/dev/null
+say "rftoolspower infuser $SX 101 168"
+LINE=$(await_line "blazing infuser there")
+[ -n "$LINE" ] || fail "no refusal for a position with no infuser: $(ctl messages 8 | jq -c '.chat')"
+echo "  $LINE" >&2
+# A stone is neither a rod nor a catalyst: the server keeps it and no slot takes it.
+energised_infuser "$SX" 101 174 5000
+ctl command "item replace entity @s hotbar.0 with $STONE 1" >/dev/null
+ctl wait 4 >/dev/null
+ctl select 1 >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $(($SX - 2)).5 101 174.5" >/dev/null
+ctl wait 6 >/dev/null
+ctl look-at "$SX.5" 101.5 174.5 >/dev/null || fail "cannot aim at the infuser at $SX,101,174"
+ctl interact "$SX" 101 174 >/dev/null
+ctl wait 10 >/dev/null
+infuser "$SX" 101 174
+[ "$IN_INPUT" = empty ] || fail "the input slot took a stone ('$IN_INPUT')"
+[ "$IN_CATALYST" = empty ] || fail "the catalyst slot took a stone ('$IN_CATALYST')"
+SERVER_INV=$(server_inventory)
+case "$SERVER_INV" in
+    *'"minecraft:stone"'*) ;;
+    *) fail "the server lost the stone: a refused click must change nothing ($SERVER_INV)" ;;
+esac
+for cell in "$((SX - 1)) 101 174" "$SX 102 174" "$SX 101 175"; do
+    [ "$(block_name $cell)" = "minecraft:air" ] \
+        || fail "the refused stone was placed against the infuser at $cell ($(block_name $cell))"
+done
+echo "  a stone is refused, kept on the server and nothing is placed against the machine"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+TX9=$((SX + 4)); TY9=101; TZ9=176
+open_crafting_table "$TX9" "$TY9" "$TZ9"
+for item in minecraft:blaze_rod minecraft:iron_ingot "$STONE"; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 10 >/dev/null
+# "iXi" / "sFs" / "iXi": iron ingots at `i`, blaze rods where `#c:rods/blaze` belongs, and stones
+# where the parent's `rftoolsbase:dimensionalshard` (`s`) and `rftoolsbase:machine_frame` (`F`) go.
+place_one minecraft:iron_ingot 100
+place_one minecraft:blaze_rod 101
+place_one minecraft:iron_ingot 102
+place_one "$STONE" 103
+place_one "$STONE" 104
+place_one "$STONE" 105
+place_one minecraft:iron_ingot 106
+place_one minecraft:blaze_rod 107
+place_one minecraft:iron_ingot 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  the infuser's recipe with stones where the parent's items belong: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the infuser's recipe crafted $RESULT without the parent"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+echo "  the parent's dimensional shard and machine frame are the recipe's limit here"
+
+echo "PASS: a blazing infuser spends one catalyst and 10 FE a run on the 11th tick after its counter resets (the field is 10, the period 11 — two replies' counters close it exactly), raising the rod's quality by the catalyst's percentage of a whole 64-step stack (a nether star +1,125 on a 60,000-quality rod, redstone +375 quality and no duration), moving it to the output slot on its last step, costing exactly one catalyst and 10 of its 50,000 FE a run (a hopper-fed window proved one run every 11 ticks over several runs), infusing nothing without a catalyst, and refusing a stone; its recipe needs the parent's dimensional shard and machine frame. Earlier: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

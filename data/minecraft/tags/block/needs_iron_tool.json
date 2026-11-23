@@ -9,6 +9,7 @@
     "rftoolspower:ender_monitor",
     "rftoolspower:pearl_injector",
     "rftoolspower:blazing_generator",
-    "rftoolspower:blazing_agitator"
+    "rftoolspower:blazing_agitator",
+    "rftoolspower:blazing_infuser"
   ]
 }

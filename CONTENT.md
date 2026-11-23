@@ -191,6 +191,34 @@ in this tier. Its `rftoolspower:agitator_data` component is upstream's **block**
 locks); here the locks are the saved `lock0..lock8` bytes of the block entity's compound, which is
 what `minecraft:block_entity_data` carries on a broken agitator's item.
 
+## Slice 9 — the blazing infuser
+
+| File | What |
+|---|---|
+| `assets/rftoolspower/blockstates/blazing_infuser.json` | the jar's own six `facing` variants, byte for byte |
+| `assets/rftoolspower/models/block/blazing_infuser.json` | the jar's front model, with `rftoolsbase:block/base/…` re-pointed at this package's copies |
+| `assets/rftoolspower/models/item/blazing_infuser.json`, `assets/rftoolspower/items/blazing_infuser.json` | the item model (parent: the block) and its item definition |
+| `assets/rftoolspower/textures/block/blazing/blazing_infuser.png` | the jar's own front texture, byte for byte |
+| `data/rftoolspower/horizon/block/blazing_infuser.json` | an iron machine cube with a six-way `facing` (the jar's `orientedBlock`/`frontBasedModel`), hardness 2.0 / blast 2.0, pickaxe, iron sound |
+| `data/rftoolspower/loot_table/blocks/blazing_infuser.json` | `copy_name` only; the store travels through `minecraft:block_entity_data` |
+| `data/rftoolspower/recipe/blazing_infuser.json` | `"iXi"/"sFs"/"iXi"` — `#c:rods/blaze`, `#c:ingots/iron`, `rftoolsbase:dimensionalshard` and `rftoolsbase:machine_frame` |
+| `data/rftoolspower/advancement/recipes/misc/blazing_infuser.json` | the recipe unlock, in the 26.3 predicate shape |
+| `assets/rftoolspower/lang/en_us.json` | + `block.rftoolspower.blazing_infuser` |
+| `data/minecraft/tags/block/…`, `data/rftoolspower/horizon/creative_tab/rftoolspower.json` | the block in the pickaxe and needs-iron-tool tags, in the tab |
+
+The infuser's GUI texture (`assets/rftoolspower/textures/gui/blazing_infuser.png`) and its `.gui`
+file are **not** carried: no menu at this tier. The catalyst's item filter is upstream's
+`slotDefinition` predicate, which this pin has no per-slot form of; the click refuses a non-catalyst
+and the tick ignores one.
+
+## Patched, because 1.21.1 → 26.3 differs (slice 9)
+
+| File | Patch |
+|---|---|
+| the infuser's model | `rftoolsbase:block/base/…` → `rftoolspower:block/base/…` (the base textures travel in this package) |
+| the loot table | `copy_components` removed as above; the store rides on `minecraft:block_entity_data` |
+| the recipe | `{"item": X}` → bare ids, `{"tag": T}` → `#T`; `#c:rods/blaze` and `#c:ingots/iron` are **not** 26.3 tags and `rftoolsbase:dimensionalshard`/`machine_frame` are the parent's, so it loads with unresolved-tag errors and can never match here (`phase BS` proves the pattern crafts nothing) |
+
 ## Patched, because 1.21.1 → 26.3 differs (slice 7)
 
 | File | Patch |
@@ -229,6 +257,9 @@ what `minecraft:block_entity_data` carries on a broken agitator's item.
 - **The blazing agitator's recipe needs `rftoolsbase:machine_frame`** and the absent
   `#c:rods/blaze`/`#c:glass_blocks`/`#c:ingots/iron` tags: with only this package the pattern crafts
   nothing (`phase BN`).
+- **The blazing infuser's recipe needs the parent twice** — `rftoolsbase:machine_frame` and
+  `rftoolsbase:dimensionalshard` — and its rods name the `#c:rods/blaze` tag: with only this package
+  the pattern crafts nothing (`phase BS`).
 - **The blazing generator's recipe needs the parent twice** — `rftoolsbase:machine_frame` and
   `rftoolsbase:infused_diamond` — and its rods name the `#c:rods/blaze` tag, which 26.3 does not
   ship: with only this package the pattern crafts nothing (`phase BE`). Its loot keeps the store

@@ -1,6 +1,6 @@
 id = "rftoolspower"
 name = "RFTools Power"
-version = "0.1.7"
+version = "0.1.8"
 description = """A port of RFTools Power for Horizon: the Coal Generator, which burns coal, charcoal or a
 coal block for 600 ticks each (nine times that for a block) at 60 FE a tick into a 500,000 FE
 buffer, lights its own front while it burns, takes fuel from a hopper or a right click, gives its
@@ -24,7 +24,10 @@ steps) kept in the mod's own `rftoolspower:blazing_rod_data` item component; and
 Agitator, a 3x3 box of rods whose quality and duration climb by the square of a factor built from
 the neighbouring rods, whose agitation clock runs down, and whose finished rods move to one of nine
 output slots unless their slot is locked, over a 50,000 FE buffer that takes 100 FE a tick and
-spends 10."""
+spends 10; and the Blazing Infuser, which spends one catalyst and 10 FE a run on every 11th tick
+to raise the input rod's quality and duration by the catalyst's percentage of a whole 64-step
+stack (a nether star +120 %, redstone +40 % quality only), moves the rod to its output slot when
+its last infusion step is used, and stores 50,000 FE."""
 authors = ["McJty", "Horizon native mod contributors"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside the carried data/ and assets/. The id is the resource namespace and the only identity:

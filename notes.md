@@ -1,8 +1,9 @@
 # RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
 # powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor;
-# slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator)
+# slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator;
+# slice 9: the blazing infuser)
 
-> **Current state (2026-11-23): slice 8, package 0.1.7 at pin
+> **Current state (2026-11-23): slice 9, package 0.1.8 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
 > generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
 > (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
@@ -23,13 +24,16 @@
 > box of rods whose quality and duration climb by the square of a factor built from the
 > **neighbouring** rods, whose agitation clock runs down, and whose finished rods move to one of
 > nine output slots unless their slot is **locked** — over a 50,000 FE buffer that takes 100 FE a
-> tick and spends 10. Where
+> tick and spends 10; and slice 9 adds the **blazing infuser**: three slots (rod in, rod out, one
+> catalyst), a run on the **11th tick and then every 11**, 10 FE and one catalyst a run, and the
+> catalyst's percentage of a whole 64-step stack onto the rod's quality and duration. Where
 > upstream's smart wrench is needed (the link, the cell's face modes), the harness uses commands —
 > `/rftoolspower enderlink`, `/rftoolspower side` — and never a fake item; the monitor's GUI picker
 > is `/rftoolspower endermonitor <pos> <mode|status> [nonce]`, and the power level's readout is
 > `/rftoolspower powerlevel <pos> [nonce]`; the agitator's readout is
 > `/rftoolspower agitator <pos> [nonce]` and its lock checkbox is
-> `/rftoolspower agitatelock <pos> <slot> on|off [nonce]`.
+> `/rftoolspower agitatelock <pos> <slot> on|off [nonce]`; the infuser's readout is
+> `/rftoolspower infuser <pos> [nonce]`.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -53,8 +57,9 @@ to the campaign's maintainer approval (ARCHITECTURE.md §8).
 
 Status: **ported-partial** — the coal generator (A–M), the power monitor plus the generator's
 energy push (N–T), the powercell (U–AD), the endergenic pair (AE–AM), the ender monitor (AN–AS),
-the power level display (AT–AW), the blazing generator with its blazing rod (AX–BE) and the blazing
-agitator (BF–BN) are implemented and verified in game at the current pin. The gap list below is the rest of the mod.
+the power level display (AT–AW), the blazing generator with its blazing rod (AX–BE), the blazing
+agitator (BF–BN) and the blazing infuser (BO–BS) are implemented and verified in game at the
+current pin. The gap list below is the rest of the mod.
 
 ## What the powercell binds to (the 2026-11-21 parent-surface ruling)
 
@@ -1342,6 +1347,183 @@ own. Three *documented deviations*:
 | the blazing infuser (3 slots, the six catalysts, the 11-tick counter) | not ported (next slice; the catalyst table is recorded above) |
 | the infusable factor in the three writes | not ported (gap 3: no upgrade slot) |
 
+## Slice 9 — the blazing infuser (package 0.1.8)
+
+Gap line it comes from (`## Gaps` below): **gap 11** — *"Still open in this family: … the **blazing
+infuser** (3 slots, the six catalysts, the 10-tick counter, 50,000 FE / 100 in / 10 used a tick)"*.
+Tier: still **machines** — one block entity with a server tick, a three-slot container, an energy
+buffer and a saved counter; it reuses 0.1.7's rod component, the one-item slot insertion, the
+`clamp_placed_energy` carrier and the `right_click_block` click owner. No GUI, no renderer.
+
+### The counter, read from the source (not the brief)
+
+`BlazingInfuserTileEntity` (`1.21_neo` @ `e44463c`), verbatim:
+
+```java
+private int counter = 10;
+
+@Override
+protected void tickServer() {
+    counter--;
+    if (counter < 0) {
+        counter = 10;
+        …
+    }
+```
+
+The field is **10**, the **period is 11**: the tick decrements first and compares with zero, so the
+first operation lands on the **11th** tick and then every 11. The brief's "10-tick counter" is the
+field. The leg proves the period from the readout's own `counter` (see BR below), and
+`SELFTEST_INFUSER=1` asserts the 10-tick reading and fails naming the observed wraps.
+
+### What it does (upstream `BlazingInfuserTileEntity`, `BlazingConfiguration`, 1.21-7.0.6)
+
+- **The block.** `rftoolspower:blazing_infuser`: `Properties.of().strength(2.0f).sound(METAL)`,
+  McJtyLib's STANDARD_IRON, and `orientedBlock` + `frontBasedModel` → a six-way `facing` the placer
+  sets (the pearl injector's shape; the placement hook carries the yaw only, so the front is
+  horizontal — the recorded limit).
+- **The slots.** Input 0 (a blazing rod), output 1 (a finished rod), catalyst 2 (one of six items);
+  one item a slot in upstream's `GenericItemHandler`. A click puts a rod in the input slot or a
+  catalyst in its own slot; anything else is refused with a line, and an empty hand reads the
+  machine out (upstream opens its GUI).
+- **The run** (`tickServer` at a counter tick): a rod with `steps <= 0` moves to the output slot and
+  nothing is spent; otherwise, with a catalyst in slot 2 and **10 FE**, the store pays 10, `steps`
+  falls by 1, **one catalyst item is consumed**, and
+  `quality += quality × f/(100 × 64)`, `duration += duration × f/(100 × 64)`. The last step
+  (`steps` reaching 0) moves the rod to the output slot after the infusion; a busy output keeps it
+  in the input until there is room.
+- **The catalysts** (`getCatalystImprovement`), as percentages of a whole 64-step stack:
+  redstone `(40, 0)`, glowstone dust `(10, 30)`, quartz `(0, 40)`,
+  `rftoolsbase:dimensionalshard` `(60, 60)`, nether star `(120, 120)`, ghast tear `(80, 80)`. On a
+  60,000-quality, 20-duration rod a nether star is **+1,125 quality, +0.375 duration** (the brief's
+  "+112.5" is a factor 10 out); redstone is **+375 quality and no duration**.
+- **The buffer.** **50,000 FE**, **100 FE a tick** in through the energy capability on every face,
+  nothing out; `INFUSER_USE_PER_TICK` = 10 is spent **per run**, not per tick (the field's name is
+  misleading).
+- **The item.** A broken infuser carries its **store** (`block_entity_data` naming
+  `rftoolspower:blazing_infuser_block_entity`), clamped to the buffer when placed; the counter and
+  the slot items do not travel (upstream's counter is live, and the engine keeps container items
+  apart from the payload).
+- **The readout.** `/rftoolspower infuser <pos> [nonce]` prints
+  `energy/capacity`, the `counter`, the input rod's `steps`/`quality`/`duration`, and each slot as
+  `id xcount` (or `empty`).
+
+### Numbers and where they came from
+
+| Number | Value | Source |
+|---|---|---|
+| capacity | 50,000 FE | `INFUSER_MAXENERGY` (`blazingInfuserMaxPower`) |
+| input a face a tick | 100 FE | `INFUSER_ENERGY_INPUT_PERTICK` (`blazingInfuserRFPerTick`) |
+| a run costs | 10 FE | `INFUSER_USE_PER_TICK` (`blazingInfuserUsePerTick`) — per run |
+| the counter's field / period | 10 / **11** ticks | `counter = 10`, `counter--` then `if (counter < 0)` |
+| a catalyst's share | `f/(100 × 64)` | `improveQuality`/`improveDuration`, `MAX_INFUSION_STEPS` = 64 |
+| the six catalysts | 40/0, 10/30, 0/40, 60/60, 120/120, 80/80 | `getCatalystImprovement` |
+| slots | 3, one item each | `CONTAINER_FACTORY`, `slotLimit(1)` |
+| block hardness | 2.0 / 2.0, pickaxe, iron sound | `createBlock` (`STANDARD_IRON`) |
+| recipe | `"iXi"/"sFs"/"iXi"` — `#c:rods/blaze`, `rftoolsbase:machine_frame`, `rftoolsbase:dimensionalshard`, `#c:ingots/iron` | `BlazingModule.initDatagen` |
+
+### Red → green
+
+The infuser's rules were stubbed `todo!()` behind their tests; the failing run is
+`ports/_shared/evidence/rftoolspower/red-infuser.log`:
+
+```
+test result: FAILED. 132 passed; 12 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+not yet implemented: Infuser::tick is not written yet
+not yet implemented: Catalyst::quality is not written yet
+```
+
+Green: **150 passed; 0 failed** (`sdk-test.log`, which prints the package sha). The twelve runtime
+tests pin: the first run on the **11th** tick and then 11, 22, 33, 44; the counter wrapping four
+times in four periods (11, not 10) with no catalyst at all; a nether star's `+1,125`/`+0.375` and
+the one step it spends; the whole six-catalyst table (ids and both percentages) folded onto a
+default rod; redstone quality-only and quartz duration-only; no catalyst = no run while the counter
+still wraps; 9 FE cannot pay a run; two runs need two catalysts; the last step moving the rod after
+its infusion; a busy output keeping it; an already-finished rod leaving with no catalyst and no
+energy; a disabled machine not counting; and the 50,000 clamp. Six in `support`: the three-slot
+container (rod in, catalyst in, only the output back), the buffer's 50,000/100/nothing-out, the
+store and counter round trip with the clamp, the exact readout line, the slot naming (`id xcount`)
+and the command's registration.
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `native-build` reported `Compiling rftoolspower (1 of 1)` and
+the two-mod e2e build is `native-0a875da-8f913c1a928e` (`rfpowerharness` 0.1.0, `rftoolspower`
+**0.1.8**).
+
+| log | verdict |
+|---|---|
+| `e2e-infuser.log` | **PASS**, `EXIT:0` — phases A–BS (the whole port), `PACKAGE … sha256=49885b17… bytes=188685` |
+| `e2e-infuser-selftest.log` | `FAIL: selftest: the counter wrapped 3 times in 39 ticks — one run every 11 (floor((Δt + 10 − counter0)/11) = 3), not the brief's 10-tick period (4) — the assertion is alive`, `EXIT:1` |
+| `e2e-infuser-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` (the unmodded Nightly) |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=26 ok=26 missing-exit=0 bad-exit=0`.
+
+The parsed assertions, each from a `ctl` reply:
+
+| phase | what it asserts (observed) |
+|---|---|
+| BO | a rod in a 5,000 FE infuser with **no catalyst**: over 26 ticks the counter wrapped **twice** and `steps` stayed 64, quality `60000.000000`, duration `20.000000`, the catalyst slot `empty`, the store still exactly 5,000 — the differential for BP |
+| BP | one **nether star** clicked in: exactly one run — `steps 64 → 63`, `quality 60000.000000 → 61125.000000`, `duration 20.000000 → 20.375000`, the store `5000 → 4990`, the catalyst slot empty (one star, one run) — and the two replies' counters close an 11-tick period (`remainder 0`) |
+| BQ | **redstone**: `quality 60000.000000 → 60375.000000` (+375), `duration 20.000000` unchanged, `steps 64 → 63` — the per-catalyst differential |
+| BR | a hopper of 16 nether stars over the catalyst slot: **6 runs in 69 ticks** (the counter wrapped 6 times, `floor((Δt + 10 − counter0)/11) = 6`), the store fell 60 = `10 × 6`, `steps 64 → 58`, the hopper's 16 stars are `6 runs + 5 in the hopper + 3 in the slot` (±1 in flight), and the quality/duration fold matches the single-precision `×(1 + 120/6400)` per run (`65839.929688`/`21.946644` observed against the fold) |
+| BS | `No RFTools Power blazing infuser there.` parses; a stone is refused as neither rod nor catalyst, the **server's** inventory keeps it and no block is placed against the machine; the carried recipe with stones where the parent's `dimensionalshard` and `machine_frame` belong crafts nothing |
+
+Counterfactual: `SELFTEST_INFUSER=1` asserts the brief's 10-tick period and the leg fails naming
+the observed wraps, so BR's period can fail; BO is BP's differential (no catalyst, nothing moves)
+and BQ is BP's per-catalyst differential (redstone raises quality only). The control leg proves BO
+is not vacuous.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **The catalyst slot can hold a stack at this pin.** Upstream's `slotLimit(1)` is not expressible
+   (no per-slot predicate or limit), so a hopper feeding the slot leaves *several* stars there; the
+   first conservation check assumed one and read "16 = 4 runs + 9 hopper + 2 slot". The readout now
+   prints each slot as `id xcount`, and the check counts the slot's stack (15 or 16 — a star in
+   flight between the hopper read and the infuser read is on neither side: the campaign's trap 3).
+2. **A hopper's 8-tick cadence can miss a run tick.** The machine's tick can run before the hopper's
+   in the same tick, so one run tick in BR had no catalyst (steps stayed); the **period** is
+   therefore asserted on the counter (which decrements regardless), not on the infusion count, and
+   the leg asserts `runs ≤ wraps` rather than equality.
+3. **A count-less readout hid a stale export.** The first BR run printed `input=rftoolspower:blazing_rod`
+   without ` x1`, which the parser turned into an empty id — the game was loading an older build
+   exported while the launcher's instance was busy (`build-e2e-game.sh` had reported a transient
+   `native-build … failed 10` on its first attempt). Re-running the two-mod build fixed it; the
+   readout's `xcount` is now the check that the delivered code is the running code.
+4. **`gates.sh` did not fail on a failed copy.** The SDK build ran on the *remote* box once (where
+   `cargo horizon-mod` does not exist), its `cp` failed and the script still exited 0 with the
+   previous package's `PACKAGE` line. `gates.sh` now uses `set -euo pipefail`; the SDK `build`,
+   `check` and `fits` steps run with `BUILD_LOCAL=1` (the tool is installed on this box only), while
+   `test`/`clippy` may run on either.
+
+### Upstream defects fixed (slice 9)
+
+None adopted: the counter, the table, the per-run arithmetic, the order (energy, then the step,
+then the catalyst, then the writes, then the move) are upstream's own. Two *documented deviations*:
+
+- **No GUI.** A click puts a rod or a catalyst in its slot and an empty hand prints the readout;
+  `/rftoolspower infuser <pos> [nonce]` is the harness's readout.
+- **No per-slot item filter or stack limit** (the injector's recorded limit): automation can put a
+  non-rod in the input slot (the tick ignores it) and can leave more than one catalyst in its slot
+  (one is eaten a run, so nothing is gained or lost).
+
+### Coverage of the blazing infuser family (slice 9)
+
+| family | state |
+|---|---|
+| `blazing_infuser`: block, item, the jar's six-variant blockstate, its front model with the base textures re-pointed, its texture, tags, creative tab, lang | tested (BO: placed from its item, front pinned, read back; BS: a stone is refused against it) |
+| the three slots (rod in, rod out, catalyst) and the click | tested (BO/BP/BQ the rod and the catalysts by click; BR a hopper feeds the catalyst slot; BS a stone is refused; unit tests pin the container) |
+| the counter: the first run on the 11th tick, then every 11 | tested (BO the counter wraps with nothing to do; BP one run in the window; BR six runs in 69 ticks = the 11-tick period; `SELFTEST_INFUSER=1` inverts it and names the observed wraps) |
+| 10 FE and one catalyst a run | tested (BP: 5000 → 4990 and the slot emptied by one star; BR: the store falls `10 × runs` and the 16 stars are conserved) |
+| the six catalysts' percentages | tested (BP nether star +1,125/+0.375; BQ redstone +375/0; the unit test pins all six; the fold over BR's six runs to < 0.01) |
+| `steps` falls one a run and the last step moves the rod | tested (BP/BR `steps` 64 → 58 over the runs; the unit tests pin the move, a busy output and an already-finished rod) |
+| the 50,000 buffer, 100 in a tick, nothing out | tested (unit test the declaration; BO/BP/BQ/BR the seeded store; the insert cap is the unit test, as the harness hopper moves 1 at a time) |
+| the store on the broken item, clamped | not in game (the unit test's clamp; the payload names `rftoolspower:blazing_infuser_block_entity`) |
+| persistence of the store and the counter | tested (the counter is saved every tick and read back; the relaunch is the agitator's BM on the same build) |
+| the `infuser` command and its refusal | tested (BO–BR every line parsed by `tools/parse_infuser.py`; BS the stone-position refusal) |
+| the recipe | `blocked(rftoolsbase:machine_frame-absent, rftoolsbase:dimensionalshard-absent, #c:rods/blaze-absent, #c:ingots/iron-absent)` (BS proves the pattern crafts nothing) |
+| the GUI, the renderer, TOP/Jade | not ported (no GUI or renderer at this tier; the command is the readout) |
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
@@ -1386,12 +1568,15 @@ own. Three *documented deviations*:
     **ported in slice 7** (four rod slots, the 150th-of-the-gap climb with its +0.01 bias, the
     burn's duration write-back, the 1,000,000 FE buffer, the 20,000 FE a tick push, `working`, the
     rod's `rftoolspower:blazing_rod_data` component and the `/rftoolspower blazing` readout; the
-    click is owned by the global `right_click_block`, see the slice's trap 1). Still open in this
-    family: the **blazing agitator** (3×3 rod box, the adjacency algorithm, 9 output slots, the
-    `AgitatorData` locks, 50,000 FE / 100 in / 10 used a tick) and the **blazing infuser** (3 slots,
-    the six catalysts, the 10-tick counter, 50,000 FE / 100 in / 10 used a tick) — both **mutate**
-    a rod (`quality`, `duration`, `time`, `steps`) rather than consume it, and both are the next
-    slice; their GUIs too. **The rest of the mod:** the dimensional cell (with its card-linked
+    click is owned by the global `right_click_block`, see the slice's trap 1). ~~The **blazing
+    agitator** (3×3 rod box, the adjacency algorithm, 9 output slots, the `AgitatorData` locks,
+    50,000 FE / 100 in / 10 used a tick)~~ — **ported in slice 8** — and ~~the **blazing infuser**
+    (3 slots, the six catalysts, the 10-tick counter, 50,000 FE / 100 in / 10 used a tick)~~ —
+    **ported in slice 9** (the three slots, the six catalysts' `f/(100 × 64)` per run, the counter
+    that runs every **11** ticks and not 10, the move on the last step, the 50,000 buffer and the
+    `/rftoolspower infuser` readout; its GUI is not carried). Still open in this family: the
+    **GUIs** of the three blazing machines, the **rod's tooltip**, and the **infusable factor**
+    (gap 3). **The rest of the mod:** the dimensional cell (with its card-linked
     networks), the power level's **renderer** (`PowerLevelRenderer`: the ten `powerlevel_N`
     textures) and the blazing generator's GUI and TOP/Jade drivers. The power monitor is ported in
     slice 2 and the endergenic pair in slice 4.
@@ -1508,37 +1693,38 @@ own. Three *documented deviations*:
 | the smart wrench, the GUI, the powercell card, `cell3` | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–8; slice 8 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`const fn`/`expect`-with-reason habits)
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–9; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
 
-## Verification (slice 8 run)
+## Verification (slice 9 run)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **131 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **150 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 177,048 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.7 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `177048 bytes, SHA-256 15cc6d27…` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 188,685 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.8 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `188685 bytes, SHA-256 49885b17…` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
-| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 131 entries |
-| `tools/assemble_content.py --check` | `ok: 154 entries re-derive exactly` |
-| the leg | `PASS` + `EXIT:0`; `SELFTEST_AGITATOR=1` `EXIT:1`; control `EXIT:1`; `--strict` 23/23 |
+| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 140 entries |
+| `tools/assemble_content.py --check` | `ok: 163 entries re-derive exactly` |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST_INFUSER=1` `EXIT:1`; control `EXIT:1`; `--strict` 26/26 |
 
-The red proof for slice 8's rules is `ports/_shared/evidence/rftoolspower/red-agitator.log`:
-`test result: FAILED. 113 passed; 12 failed`, every failure `not yet implemented`. The green
-`sdk-test.log` was regenerated **after** the 0.1.7 build, so its `PACKAGE` line names `15cc6d27…` /
-177,048 B. The `Tag::Double` defect (trap 1) is red in the leg instead: BI's readouts in the pre-fix
-run (`e2e-double-bits-red.log`) printed `time=4587366470488424448.000000`.
+The red proof for slice 9's rules is `ports/_shared/evidence/rftoolspower/red-infuser.log`:
+`test result: FAILED. 132 passed; 12 failed`, every failure `not yet implemented`. The green
+`sdk-test.log` was regenerated **after** the 0.1.8 build, so its `PACKAGE` line names `49885b17…` /
+188,685 B. The launcher's own build printed `Compiling rftoolspower (1 of 1)` and exported
+`native-0a875da-8f913c1a928e` (`native-mods.json` names version 0.1.8).
 
-## Artifact (0.1.7)
+## Artifact (0.1.8)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 177,048 B | `15cc6d27279638fb67003d7a9492eb8dd21f87b1273025a433c4712121212bbd` | 131 |
+| `rftoolspower.hmod` (port root) | 188,685 B | `49885b17eefb49dc54ae8cb400a05a85f6125201d09f0bef564fdc1a26bb559d` | 140 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1 (including `package matches the
-tree`), and the three legs ran on these bytes (their `PACKAGE` lines name them). The 0.1.6
+tree`), and the three legs ran on these bytes (their `PACKAGE` lines name them). The 0.1.7
+artifact (177,048 B, `15cc6d27…`, 131 entries) is the slice-8 record; the 0.1.6
 artifact (162,363 B, `7fe0e237…`, 122 entries) is the slice-7 record; the 0.1.5
 artifact (141,168 B, `26485b9a…`, 105 entries) is the slice-6 record; the 0.1.4 (134,377 B,
 `e1c60156…`, 96 entries), 0.1.3 (122,516 B, `ab452bd8…`, 87 entries), 0.1.2 (100,317 B,

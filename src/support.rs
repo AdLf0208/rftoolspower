@@ -22,13 +22,14 @@ use mod_api::{
 use crate::runtime::{
     AGITATOR_CAPACITY, AGITATOR_INSERT_PER_TICK, AGITATOR_OUTPUTS, AGITATOR_SLOTS,
     AGITATOR_USE_PER_TICK, Agitator, BLAZING_CAPACITY, BLAZING_SLOTS, Blazing, BlazingSlot,
-    CAPACITY, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic,
-    FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE, INJECTOR_SLOTS, Loss, MAX_DISTANCE,
-    MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse,
-    ROD_START_STEPS, Rod, RodSlot, SideMode, Sides, Tier, as_capability,
-    capacity as network_capacity, clamp_agitator, clamp_blazing, clamp_endergenic, clamped_energy,
-    network_valid, pearl_lost, receive as network_receive, restored, rf_per_tick, rising_edge,
-    send_amount, stored as network_stored, take as network_take,
+    CAPACITY, Catalyst, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic,
+    FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE, INFUSER_CAPACITY, INFUSER_CATALYST,
+    INFUSER_COUNTER_START, INFUSER_INPUT, INFUSER_INSERT_PER_TICK, INFUSER_OUTPUT, INFUSER_SLOTS,
+    INJECTOR_SLOTS, Infuser, Loss, MAX_DISTANCE, MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX,
+    OBSERVE_TICKS, PEARL, PowerLevel, Pulse, ROD_START_STEPS, Rod, RodSlot, SideMode, Sides, Tier,
+    as_capability, capacity as network_capacity, clamp_agitator, clamp_blazing, clamp_endergenic,
+    clamp_infuser, clamped_energy, network_valid, pearl_lost, receive as network_receive, restored,
+    rf_per_tick, rising_edge, send_amount, stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -247,6 +248,23 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     if let Err(error) = r.block_entity_part(&kind, AgitatorPart) {
         context.refuse(&format!(
             "rftoolspower: the blazing agitator part was refused: {error}"
+        ));
+    }
+
+    // The blazing infuser: a type, its three slots (rod in, rod out, catalyst), its 50,000 FE
+    // buffer and its Part. Its item carries the store through `block_entity_data`.
+    let kind = r
+        .block_entity_type(INFUSER_TYPE)
+        .blocks(&["blazing_infuser"])
+        .build();
+    let block = r.block_key(INFUSER);
+    r.block_container(&block, infuser_container());
+    r.block_energy(&block, infuser_battery());
+    let item = r.item_key(INFUSER);
+    r.item_part(item, InfuserItemPart);
+    if let Err(error) = r.block_entity_part(&kind, InfuserPart) {
+        context.refuse(&format!(
+            "rftoolspower: the blazing infuser part was refused: {error}"
         ));
     }
 }
@@ -1745,6 +1763,17 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
             return Flow::Continue;
         }
         entity_data_patch(&saved, AGITATOR_TYPE_ID)
+    } else if block == INFUSER {
+        // Upstream's loot copies `mcjtylib:item_energy` and `mcjtylib:item_inventory`: only the
+        // store travels here (the counter is a live field upstream and the slots' items are the
+        // engine's container, not this payload).
+        let energy = int(&Tag::Compound(saved.clone()), KEY_ENERGY);
+        if energy == 0 {
+            return Flow::Continue;
+        }
+        let mut payload = Compound::new();
+        payload.insert(KEY_ENERGY.into(), Tag::Int(energy));
+        entity_data_patch(&payload, INFUSER_TYPE_ID)
     } else if block == ENDER_MONITOR {
         // Upstream's mode rides on the block's item (`EnderMonitorData` on the dropped stack):
         // the configured mode travels, the default one has nothing worth carrying, and the
@@ -2361,6 +2390,7 @@ pub(crate) fn on_right_click_block(
     let handled = match block.as_deref() {
         Some(BLAZING) => blazing_click(host, click, click.stack),
         Some(AGITATOR) => agitator_click(host, click, click.stack),
+        Some(INFUSER) => infuser_click(host, click, click.stack),
         _ => return Flow::Continue,
     };
     if handled.is_none() {
@@ -2872,6 +2902,290 @@ pub(crate) fn agitator_click(
 }
 
 // ---------------------------------------------------------------------------
+// The blazing infuser (`BlazingInfuserTileEntity`)
+// ---------------------------------------------------------------------------
+
+/// `rftoolspower:blazing_infuser` (`BlazingModule.BLAZING_INFUSER`).
+pub(crate) const INFUSER: &str = "rftoolspower:blazing_infuser";
+/// Its block entity type, named apart from its block for the reason [`GENERATOR_TYPE`] is.
+const INFUSER_TYPE: &str = "blazing_infuser_block_entity";
+/// That type's registry id, which a broken infuser's payload names.
+const INFUSER_TYPE_ID: &str = "rftoolspower:blazing_infuser_block_entity";
+/// What a read where no infuser stands answers.
+const NO_INFUSER: &str = "No RFTools Power blazing infuser there.";
+
+/// The infuser's container: an input rod slot, an output rod slot and a catalyst slot (upstream's
+/// `specific(BLAZING_ROD).in()`, `.out()` and `getCatalystImprovement != null` — the pin has no
+/// per-slot item predicate, so the tick is what refuses a foreign item).
+pub(crate) fn infuser_container() -> ModContainer {
+    let all: Vec<usize> = (0..INFUSER_SLOTS).collect();
+    ModContainer {
+        slots: INFUSER_SLOTS,
+        faces: std::array::from_fn(|_| all.clone()),
+        // Rod in and catalyst in; only the output slot gives an item back to automation.
+        inputs: vec![INFUSER_INPUT, INFUSER_CATALYST],
+        outputs: vec![INFUSER_OUTPUT],
+        menu: None,
+    }
+}
+
+/// The infuser's buffer: upstream's `GenericEnergyStorage(this, true, 50000, 100)` — it takes
+/// [`INFUSER_INSERT_PER_TICK`] an insert on any face and gives nothing out.
+pub(crate) fn infuser_battery() -> ModEnergyBuffer {
+    ModEnergyBuffer {
+        capacity: INFUSER_CAPACITY,
+        max_insert: INFUSER_INSERT_PER_TICK,
+        max_extract: 0,
+        insert_faces: [true; 6],
+        extract_faces: [false; 6],
+    }
+}
+
+/// The infuser's saved state: its store and its counter (`saveAdditional`; the counter is a live
+/// field upstream, saved here because the tick reply discards payload edits it is not told about).
+pub(crate) fn read_infuser(saved: &Tag) -> Infuser {
+    Infuser {
+        energy: clamp_infuser(int(saved, KEY_ENERGY)),
+        counter: int_or(saved, KEY_COUNTER, INFUSER_COUNTER_START).clamp(0, INFUSER_COUNTER_START),
+    }
+}
+
+/// Write the infuser back into a saved compound.
+pub(crate) fn write_infuser(saved: &mut Tag, state: &Infuser) {
+    set_int(saved, KEY_ENERGY, state.energy);
+    set_int(saved, KEY_COUNTER, state.counter);
+}
+
+/// One infuser tick (`tickServer`): the counter, then the run, the catalyst and the move.
+///
+/// True when this Part's edits must be applied: upstream marks the block dirty every tick, and the
+/// counter moves every tick, so the payload is written every tick.
+pub(crate) fn tick_infuser(
+    host: &mut dyn ServerHost,
+    saved: &mut Tag,
+    items: &mut Vec<Option<ItemStack>>,
+) -> bool {
+    let before = read_infuser(saved);
+    let mut state = before;
+    if items.len() != INFUSER_SLOTS {
+        items.resize(INFUSER_SLOTS, None);
+    }
+    let input = items[INFUSER_INPUT]
+        .as_ref()
+        .filter(|held| item_id(&*host, held) == BLAZING_ROD)
+        .map(rod_of);
+    let catalyst = items[INFUSER_CATALYST]
+        .as_ref()
+        .and_then(|held| Catalyst::of(&item_id(&*host, held)));
+    let output_free = items[INFUSER_OUTPUT].is_none();
+    let infusion = state.tick(true, input, catalyst, output_free);
+    if infusion.moved {
+        // The rod leaves the input slot for the output slot with the data this tick wrote (an
+        // already-finished rod keeps the stack it came in with, components and all).
+        let stack = match infusion.rod {
+            Some(rod) if infusion.ran => rod_stack(&*host, rod),
+            _ => items[INFUSER_INPUT].clone(),
+        };
+        if output_free && let Some(stack) = stack {
+            items[INFUSER_OUTPUT] = Some(stack);
+            items[INFUSER_INPUT] = None;
+        }
+    } else if infusion.ran
+        && let Some(rod) = infusion.rod
+        && let Some(stack) = rod_stack(&*host, rod)
+    {
+        items[INFUSER_INPUT] = Some(stack);
+    }
+    if infusion.catalyst_used
+        && let Some(held) = items[INFUSER_CATALYST].as_mut()
+    {
+        // `extractItem(SLOT_CATALYST, 1, false)`: one item a run, the stack is `slotLimit(1)`.
+        let count = held.count();
+        if count <= 1 {
+            items[INFUSER_CATALYST] = None;
+        } else {
+            let _ = held.set_count(count - 1);
+        }
+    }
+    write_infuser(saved, &state);
+    infusion.changed || state != before
+}
+
+/// What an infuser's three slots hold, for [`infuser_line`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct InfuserStacks<'a> {
+    /// The input slot's rod, when it is a blazing rod.
+    pub rod: Option<Rod>,
+    /// The input slot's item id.
+    pub input: Option<&'a str>,
+    /// The catalyst slot's item id.
+    pub catalyst: Option<&'a str>,
+    /// The output slot's item id.
+    pub output: Option<&'a str>,
+}
+
+/// The infuser's line, as `/rftoolspower infuser` and a click print it.
+pub(crate) fn infuser_line(
+    pos: [i32; 3],
+    state: &Infuser,
+    stacks: &InfuserStacks<'_>,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let rod = stacks.rod;
+    let value = |pick: fn(&Rod) -> f32| -> String {
+        rod.map_or("-".to_owned(), |rod| format!("{:.6}", pick(&rod)))
+    };
+    let name = |slot: Option<&str>| slot.unwrap_or("empty").to_owned();
+    let steps = rod.map_or("-".to_owned(), |rod| rod.steps.to_string());
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Blazing Infuser at {},{},{}: {}/{} FE (counter {}, steps={steps}, quality={}, \
+         duration={}, input={}, catalyst={}, output={}, t={t}{suffix})",
+        pos[0],
+        pos[1],
+        pos[2],
+        state.energy,
+        INFUSER_CAPACITY,
+        state.counter,
+        value(|rod| rod.quality),
+        value(|rod| rod.duration),
+        name(stacks.input),
+        name(stacks.catalyst),
+        name(stacks.output),
+    )
+}
+
+/// The three slots an infuser block entity holds, as [`infuser_line`] prints them (`"<id> x<count>"`):
+/// the catalyst's count is what proves one catalyst a run, because this pin has no per-slot stack
+/// limit and a hopper may leave more than one there.
+type InfuserIds = (Option<String>, Option<String>, Option<String>);
+
+/// Read the input rod and the three stacks off a block entity.
+fn infuser_slots(
+    host: &mut dyn ServerHost,
+    entity: mod_api::BlockEntityRef,
+) -> (Option<Rod>, InfuserIds) {
+    let stack = |host: &mut dyn ServerHost, slot: usize| -> Option<ItemStack> {
+        entity.item_slot(&*host, slot as u32).ok().flatten()
+    };
+    let input = stack(host, INFUSER_INPUT);
+    let catalyst = stack(host, INFUSER_CATALYST);
+    let output = stack(host, INFUSER_OUTPUT);
+    let rod = input
+        .as_ref()
+        .filter(|held| item_id(&*host, held) == BLAZING_ROD)
+        .map(rod_of);
+    let describe = |held: Option<&ItemStack>| -> Option<String> {
+        held.map(|stack| slot_description(&item_id(&*host, stack), stack.count()))
+    };
+    (
+        rod,
+        (
+            describe(input.as_ref()),
+            describe(catalyst.as_ref()),
+            describe(output.as_ref()),
+        ),
+    )
+}
+
+/// How the infuser's readout names one slot: `"<id> x<count>"`.
+fn slot_description(id: &str, count: u32) -> String {
+    format!("{id} x{count}")
+}
+
+/// The line `/rftoolspower infuser <pos>` prints for the block at `pos`.
+pub(crate) fn infuser_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    if block_id(&*host, level, pos).as_deref() != Some(INFUSER) {
+        return NO_INFUSER.to_owned();
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_INFUSER.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_INFUSER.to_owned();
+    };
+    let (rod, (input, catalyst, output)) = infuser_slots(host, entity);
+    let t = level.game_time(&*host).unwrap_or(0);
+    infuser_line(
+        pos,
+        &read_infuser(&Tag::Compound(saved)),
+        &InfuserStacks {
+            rod,
+            input: input.as_deref(),
+            catalyst: catalyst.as_deref(),
+            output: output.as_deref(),
+        },
+        t,
+        nonce,
+    )
+}
+
+/// `PlayerInteractEvent.RightClickBlock`: an infuser takes every click as its own — a blazing rod
+/// goes into the input slot, a catalyst into the catalyst slot, anything else is refused with a
+/// line, an empty hand reads the machine out — and nothing else acts (upstream opens its GUI).
+///
+/// Owned by the global hook for the reason the blazing generator's click is: on an
+/// `iron_block`-template block this pin does not run `BlockPart::use_item_on` for a click carrying
+/// a block item, so a stone would be placed on the machine's face.
+pub(crate) fn infuser_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+    held: Option<&ItemStack>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    if block_id(&*host, level, click.pos).as_deref() != Some(INFUSER) {
+        return None;
+    }
+    let Some(held) = held.filter(|stack| stack.count() > 0) else {
+        let line = infuser_status_line(host, level, click.pos, None);
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal(line));
+        }
+        return Some(InteractionResult::Success);
+    };
+    let id = item_id(&*host, held);
+    let (slot, what) = if id == BLAZING_ROD {
+        (INFUSER_INPUT, "a blazing rod is already in the input slot")
+    } else if Catalyst::of(&id).is_some() {
+        (INFUSER_CATALYST, "a catalyst is already in its slot")
+    } else {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(
+                host,
+                Text::literal(format!("{id} is not a blazing rod or a catalyst")),
+            );
+        }
+        return Some(InteractionResult::Success);
+    };
+    let busy = host
+        .block_entity(level, click.pos)
+        .and_then(|entity| entity.item_slot(&*host, slot as u32).ok().flatten())
+        .is_some();
+    if busy {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal(what));
+        }
+        return Some(InteractionResult::Success);
+    }
+    let hand = ItemPlace::PlayerHand {
+        player: click.player,
+        hand: click.hand,
+    };
+    if insert_rod_from_hand(host, level, click.pos, held, &hand, slot) == 0
+        && let Some(player) = host.player(click.player)
+    {
+        let _ = player.action_bar(host, Text::literal("the item did not go in"));
+    }
+    Some(InteractionResult::Success)
+}
+
+// ---------------------------------------------------------------------------
 // The command
 // ---------------------------------------------------------------------------
 
@@ -2895,6 +3209,7 @@ pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
         "rftoolspower blazing <pos:block_pos> [nonce:word]",
         "rftoolspower agitator <pos:block_pos> [nonce:word]",
         "rftoolspower agitatelock <pos:block_pos> <slot:integer> <lock:word> [nonce:word]",
+        "rftoolspower infuser <pos:block_pos> [nonce:word]",
     ] {
         commands.push(Command::op(usage, OPERATOR_LEVEL));
     }
@@ -2991,6 +3306,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             | "blazing"
             | "agitator"
             | "agitatelock"
+            | "infuser"
     ) {
         return Flow::Continue;
     }
@@ -3014,6 +3330,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             "endermonitor" => NO_ENDER_MONITOR,
             "blazing" => NO_BLAZING,
             "agitator" | "agitatelock" => NO_AGITATOR,
+            "infuser" => NO_INFUSER,
             _ => NO_GENERATOR,
         }));
         return Flow::Cancel;
@@ -3037,6 +3354,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         "injector" => injector_status_line(host, level, *pos, nonce_of(event)),
         "blazing" => blazing_status_line(host, level, *pos, nonce_of(event)),
         "agitator" => agitator_status_line(host, level, *pos, nonce_of(event)),
+        "infuser" => infuser_status_line(host, level, *pos, nonce_of(event)),
         "agitatelock" => set_agitator_lock(
             host,
             level,
@@ -4441,6 +4759,17 @@ impl ItemPart for AgitatorItemPart {
     }
 }
 
+/// A blazing infuser's own item: it carries its store (upstream's loot copies
+/// `mcjtylib:item_energy`), clamped back to the buffer when it is placed again.
+pub(crate) struct InfuserItemPart;
+
+#[mod_api::horizon_part]
+impl ItemPart for InfuserItemPart {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        clamp_placed_energy(host, event, INFUSER, clamp_infuser);
+    }
+}
+
 /// Clamp a placed machine's `block_entity_data` store to its own buffer (`applyImplicitComponents`
 /// then `GenericEnergyStorage.applyImplicitComponents`).
 fn clamp_placed_energy(
@@ -4546,6 +4875,62 @@ impl BlockEntityPart for AgitatorPart {
         let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
         let items = &mut event.entity.items;
         let changed = tick_agitator(host, &mut saved, items);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
+/// The blazing infuser: it ticks, and a click puts a rod or a catalyst in its own slot. Upstream's
+/// `orientedBlock` blockstate gives it a six-way `facing` the placer sets.
+pub(crate) struct InfuserPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for InfuserPart {
+    /// `BaseBlock.getStateForPlacement` with `RotationType.ROTATION`: the front faces the placer.
+    ///
+    /// The click is not handled here: `on_right_click_block` takes it, so it cannot be handled
+    /// twice (and a block item in the hand is never placed against the machine).
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        if level.state_block(event.state) != Some(INFUSER) {
+            return None;
+        }
+        let front = facing_from_yaw(event.context.yaw).opposite();
+        Some(level.state_with_property(event.state, KEY_FACING, dir_name(front)))
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for InfuserPart {
+    /// `EntityBlock.newBlockEntity`: an empty saved compound; the tick fills it.
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    /// `EntityBlock.getTicker`: it ticks.
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: the counter, the run, the catalyst and the move to the output slot.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        if event.entity.items.len() != INFUSER_SLOTS {
+            event.entity.items.resize(INFUSER_SLOTS, None);
+        }
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let items = &mut event.entity.items;
+        let changed = tick_infuser(host, &mut saved, items);
         if let Tag::Compound(nbt) = saved {
             event.entity.nbt = nbt;
         }
@@ -4870,10 +5255,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_thirteen_the_harness_types() {
+    fn the_commands_are_the_fourteen_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 13);
+        assert_eq!(commands.len(), 14);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -4928,6 +5313,10 @@ mod tests {
             commands[12].usage,
             "rftoolspower agitatelock <pos:block_pos> <slot:integer> <lock:word> [nonce:word]",
             "the GUI's lock checkbox, as a command"
+        );
+        assert_eq!(
+            commands[13].usage, "rftoolspower infuser <pos:block_pos> [nonce:word]",
+            "the infuser's readout"
         );
         for command in &commands {
             assert_eq!(command.level, OPERATOR_LEVEL);
@@ -5669,6 +6058,142 @@ mod tests {
                 "rftoolspower agitator <pos:block_pos> [nonce:word]",
                 "rftoolspower agitatelock <pos:block_pos> <slot:integer> <lock:word> [nonce:word]",
             ]
+        );
+    }
+
+    #[test]
+    fn the_infuser_has_three_slots_and_only_the_output_gives_one_back() {
+        let container = infuser_container();
+        assert_eq!(container.slots, INFUSER_SLOTS, "rod in, rod out, catalyst");
+        assert_eq!(
+            container.inputs,
+            vec![INFUSER_INPUT, INFUSER_CATALYST],
+            "automation may insert a rod and a catalyst, never into the output"
+        );
+        assert_eq!(
+            container.outputs,
+            vec![INFUSER_OUTPUT],
+            "only the finished rod comes back out"
+        );
+        assert_eq!(
+            container.faces,
+            std::array::from_fn(|_| (0..INFUSER_SLOTS).collect::<Vec<usize>>()),
+            "every face reaches all three slots, as upstream's ITEMS_AUTOMATION does"
+        );
+        assert_eq!(container.menu, None, "no GUI in this slice");
+    }
+
+    #[test]
+    fn the_infuser_buffer_is_fifty_thousand_and_takes_a_hundred_a_tick() {
+        let battery = infuser_battery();
+        assert_eq!(battery.capacity, INFUSER_CAPACITY, "blazingInfuserMaxPower");
+        assert_eq!(
+            battery.max_insert, INFUSER_INSERT_PER_TICK,
+            "blazingInfuserRFPerTick is what one insert moves"
+        );
+        assert_eq!(battery.max_extract, 0, "the infuser gives nothing out");
+        assert_eq!(battery.insert_faces, [true; 6], "every face takes FE in");
+        assert_eq!(battery.extract_faces, [false; 6]);
+    }
+
+    #[test]
+    fn the_infusers_store_and_counter_read_back_from_the_compound_it_wrote() {
+        let mut saved = compound();
+        let state = Infuser {
+            energy: 4_321,
+            counter: 7,
+        };
+        write_infuser(&mut saved, &state);
+        assert_eq!(read_infuser(&saved), state);
+        assert_eq!(saved.get("energy"), Some(&Tag::Int(4_321)));
+        assert_eq!(saved.get("counter"), Some(&Tag::Int(7)));
+        let mut doctored = compound();
+        set_int(&mut doctored, "energy", 999_999);
+        assert_eq!(
+            read_infuser(&doctored).energy,
+            INFUSER_CAPACITY,
+            "a doctored store is clamped"
+        );
+        let mut negative = compound();
+        set_int(&mut negative, "energy", -5);
+        assert_eq!(read_infuser(&negative).energy, 0);
+        assert_eq!(
+            read_infuser(&negative).counter,
+            INFUSER_COUNTER_START,
+            "a save without a counter starts at the field's initialiser"
+        );
+        let mut wild = compound();
+        set_int(&mut wild, "counter", 999);
+        assert_eq!(
+            read_infuser(&wild).counter,
+            INFUSER_COUNTER_START,
+            "a doctored counter cannot delay a run forever"
+        );
+    }
+
+    #[test]
+    fn the_infuser_line_is_the_line_the_e2e_asserts() {
+        let state = Infuser {
+            energy: 4_990,
+            counter: 7,
+        };
+        let line = infuser_line(
+            [302, 101, 158],
+            &state,
+            &InfuserStacks {
+                rod: Some(Rod::default()),
+                input: Some("rftoolspower:blazing_rod x1"),
+                catalyst: Some("minecraft:nether_star x1"),
+                output: None,
+            },
+            9_002,
+            Some("n3"),
+        );
+        assert_eq!(
+            line,
+            "Blazing Infuser at 302,101,158: 4990/50000 FE (counter 7, steps=64, \
+             quality=60000.000000, duration=20.000000, input=rftoolspower:blazing_rod x1, \
+             catalyst=minecraft:nether_star x1, output=empty, t=9002 nonce=n3)"
+        );
+        let empty = infuser_line(
+            [302, 101, 158],
+            &Infuser::default(),
+            &InfuserStacks::default(),
+            9_003,
+            None,
+        );
+        assert_eq!(
+            empty,
+            "Blazing Infuser at 302,101,158: 0/50000 FE (counter 10, steps=-, quality=-, \
+             duration=-, input=empty, catalyst=empty, output=empty, t=9003)"
+        );
+    }
+
+    #[test]
+    fn an_infuser_slot_is_named_with_its_count() {
+        assert_eq!(
+            slot_description("minecraft:nether_star", 3),
+            "minecraft:nether_star x3",
+            "the catalyst's count is what proves one consumed a run (no slot limit at this pin)"
+        );
+        assert_eq!(
+            slot_description(BLAZING_ROD, 1),
+            "rftoolspower:blazing_rod x1"
+        );
+    }
+
+    #[test]
+    fn the_infuser_command_is_declared_at_the_operator_level() {
+        let mut commands = Vec::new();
+        declare_commands(&mut commands);
+        let infuser: Vec<&str> = commands
+            .iter()
+            .map(|command| command.usage.as_str())
+            .filter(|usage| usage.contains("infuser"))
+            .collect();
+        assert_eq!(
+            infuser,
+            vec!["rftoolspower infuser <pos:block_pos> [nonce:word]"]
         );
     }
 }

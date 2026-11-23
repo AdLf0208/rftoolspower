@@ -222,6 +222,7 @@ LANG = {
     "block.rftoolspower.pearl_injector": "Pearl Injector",
     "block.rftoolspower.blazing_generator": "Blazing Generator",
     "block.rftoolspower.blazing_agitator": "Blazing Agitator",
+    "block.rftoolspower.blazing_infuser": "Blazing Infuser",
     "item.rftoolspower.power_core1": "Power Core (Low)",
     "item.rftoolspower.blazing_rod": "Blazing Rod",
     "itemGroup.rftoolspower": "RFTools Power",
@@ -241,6 +242,7 @@ CREATIVE_TAB = {
         "rftoolspower:pearl_injector",
         "rftoolspower:blazing_generator",
         "rftoolspower:blazing_agitator",
+        "rftoolspower:blazing_infuser",
         "rftoolspower:blazing_rod",
         "rftoolspower:power_core1",
     ],
@@ -259,6 +261,7 @@ TAGS = {
         "rftoolspower:pearl_injector",
         "rftoolspower:blazing_generator",
         "rftoolspower:blazing_agitator",
+        "rftoolspower:blazing_infuser",
     ],
     "data/minecraft/tags/block/needs_iron_tool.json": [
         "rftoolspower:coalgenerator",
@@ -271,6 +274,7 @@ TAGS = {
         "rftoolspower:pearl_injector",
         "rftoolspower:blazing_generator",
         "rftoolspower:blazing_agitator",
+        "rftoolspower:blazing_infuser",
     ],
 }
 
@@ -459,6 +463,28 @@ AGITATOR_DECL = {
     },
     "shapes": {"default": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]},
     "collision_shapes": {"default": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]},
+    "item": True,
+}
+
+# --- the blazing infuser (`BlazingInfuserTileEntity`): BlockBuilder's STANDARD_IRON with
+# `orientedBlock` + `frontBasedModel` — a full cube with a six-way `facing` the placer sets (the
+# same `RotationType.ROTATION` the pearl injector takes), and no other state.
+INFUSER = "blazing_infuser"
+INFUSER_DECL = {
+    "template": "minecraft:iron_block",
+    "properties": {
+        "hardness": 2.0,
+        "explosion_resistance": 2.0,
+        "sounds": "minecraft:iron_block",
+        "requires_tool": True,
+    },
+    "state_properties": {
+        "facing": {
+            "type": "enum",
+            "values": ["north", "south", "east", "west", "up", "down"],
+        },
+    },
+    "default_state": {"facing": "north"},
     "item": True,
 }
 
@@ -857,6 +883,38 @@ def build(out: Path) -> None:
     write(
         out / f"data/rftoolspower/advancement/recipes/misc/{AGITATOR}.json",
         json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{AGITATOR}.json")),
+    )
+
+    # --- the blazing infuser: the jar's six-variant blockstate (facing), its front model with the
+    # base textures re-pointed into this namespace, and its own item.
+    write(
+        out / f"assets/rftoolspower/blockstates/{INFUSER}.json",
+        json.loads(read_jar(POWER, f"assets/rftoolspower/blockstates/{INFUSER}.json")),
+    )
+    model = json.loads(read_jar(POWER, f"assets/rftoolspower/models/block/{INFUSER}.json"))
+    model["textures"] = {
+        key: value.replace("rftoolsbase:block/base/", "rftoolspower:block/base/")
+        for key, value in model["textures"].items()
+    }
+    write(out / f"assets/rftoolspower/models/block/{INFUSER}.json", model)
+    write(
+        out / f"assets/rftoolspower/models/item/{INFUSER}.json",
+        {"parent": f"rftoolspower:block/{INFUSER}"},
+    )
+    write(
+        out / f"assets/rftoolspower/items/{INFUSER}.json",
+        {"model": {"model": f"rftoolspower:item/{INFUSER}", "type": "minecraft:model"}},
+    )
+    binary(
+        out / f"assets/rftoolspower/textures/block/blazing/{INFUSER}.png",
+        read_jar(POWER, f"assets/rftoolspower/textures/block/blazing/{INFUSER}.png"),
+    )
+    write(out / f"data/rftoolspower/horizon/block/{INFUSER}.json", INFUSER_DECL)
+    write(out / f"data/rftoolspower/loot_table/blocks/{INFUSER}.json", plain_loot(INFUSER))
+    write(out / f"data/rftoolspower/recipe/{INFUSER}.json", patched_recipe(INFUSER))
+    write(
+        out / f"data/rftoolspower/advancement/recipes/misc/{INFUSER}.json",
+        json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{INFUSER}.json")),
     )
 
 

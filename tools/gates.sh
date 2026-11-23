@@ -7,7 +7,7 @@
 # Written for a build-slot lease: `build-slot.sh run --job W1-rftoolspower --port ports/rftoolspower
 # --step <step> -- bash ports/rftoolspower/tools/gates.sh <step>` (or with `env BUILD_LOCAL=1`, since
 # `cargo horizon-mod` is installed on this box only).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PACKAGE=rftoolspower.hmod

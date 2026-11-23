@@ -1692,6 +1692,207 @@ pub fn clamp_agitator(energy: i32) -> i32 {
     energy.clamp(0, AGITATOR_CAPACITY)
 }
 
+// ---------------------------------------------------------------------------
+// The blazing infuser (`BlazingInfuserTileEntity`)
+// ---------------------------------------------------------------------------
+
+/// The infuser's slots: input 0, output 1, catalyst 2 (`SLOT_INPUT`/`SLOT_OUTPUT`/`SLOT_CATALYST`).
+pub const INFUSER_SLOTS: usize = 3;
+/// The slot the rod being infused sits in.
+pub const INFUSER_INPUT: usize = 0;
+/// The slot a finished rod is moved to.
+pub const INFUSER_OUTPUT: usize = 1;
+/// The slot one catalyst item sits in.
+pub const INFUSER_CATALYST: usize = 2;
+/// The infuser's buffer (`BlazingConfiguration.INFUSER_MAXENERGY`, `blazingInfuserMaxPower`).
+pub const INFUSER_CAPACITY: i32 = 50_000;
+/// FE one face takes in a tick (`INFUSER_ENERGY_INPUT_PERTICK`, `blazingInfuserRFPerTick`).
+pub const INFUSER_INSERT_PER_TICK: i32 = 100;
+/// FE one **run** costs (`INFUSER_USE_PER_TICK`, `blazingInfuserUsePerTick`) — a run, not a tick.
+pub const INFUSER_USE_PER_RUN: i32 = 10;
+/// The counter's reset value (`private int counter = 10`).
+pub const INFUSER_COUNTER_START: i32 = 10;
+/// The field is 10, the **period** is 11: `counter--` first, then `if (counter < 0) { counter = 10; … }`,
+/// so the first operation lands on the 11th tick and then every 11 (not every 10).
+pub const INFUSER_PERIOD: i32 = INFUSER_COUNTER_START + 1;
+/// The percentage base of the catalyst factors (`100 * MAX_INFUSION_STEPS`).
+pub const INFUSER_PERCENT: f32 = 100.0;
+/// A catalyst's factor is a percentage of a **whole stack** of rods (`MAX_INFUSION_STEPS` = 64).
+pub const INFUSER_STACK_STEPS: f32 = ROD_START_STEPS as f32;
+
+/// One of the six catalysts `getCatalystImprovement` knows, with its `(quality, duration)` factors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Catalyst {
+    /// `Items.REDSTONE`: `(40, 0)`.
+    Redstone,
+    /// `Items.GLOWSTONE_DUST`: `(10, 30)`.
+    GlowstoneDust,
+    /// `Items.QUARTZ`: `(0, 40)`.
+    Quartz,
+    /// `VariousModule.DIMENSIONALSHARD`: `(60, 60)`.
+    DimensionalShard,
+    /// `Items.NETHER_STAR`: `(120, 120)`.
+    NetherStar,
+    /// `Items.GHAST_TEAR`: `(80, 80)`.
+    GhastTear,
+}
+
+impl Catalyst {
+    /// `getCatalystImprovement(stack)`: the catalyst an item id names, `None` for anything else.
+    #[must_use]
+    pub fn of(item: &str) -> Option<Self> {
+        match item {
+            "minecraft:redstone" => Some(Self::Redstone),
+            "minecraft:glowstone_dust" => Some(Self::GlowstoneDust),
+            "minecraft:quartz" => Some(Self::Quartz),
+            "rftoolsbase:dimensionalshard" => Some(Self::DimensionalShard),
+            "minecraft:nether_star" => Some(Self::NetherStar),
+            "minecraft:ghast_tear" => Some(Self::GhastTear),
+            _ => None,
+        }
+    }
+
+    /// The catalyst's quality percentage (`Pair.getLeft`).
+    #[must_use]
+    pub fn quality(self) -> f32 {
+        match self {
+            Self::Redstone => 40.0,
+            Self::GlowstoneDust => 10.0,
+            Self::Quartz => 0.0,
+            Self::DimensionalShard => 60.0,
+            Self::NetherStar => 120.0,
+            Self::GhastTear => 80.0,
+        }
+    }
+
+    /// The catalyst's duration percentage (`Pair.getRight`).
+    #[must_use]
+    pub fn duration(self) -> f32 {
+        match self {
+            Self::Redstone => 0.0,
+            Self::GlowstoneDust => 30.0,
+            Self::Quartz => 40.0,
+            Self::DimensionalShard => 60.0,
+            Self::NetherStar => 120.0,
+            Self::GhastTear => 80.0,
+        }
+    }
+}
+
+/// An infuser's saved state: its store and the countdown that decides when a run happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Infuser {
+    /// The store, an int in the saved compound (`energyStorage`).
+    pub energy: i32,
+    /// The countdown (`private int counter = 10`), tenths of a tick from a run's reset.
+    pub counter: i32,
+}
+
+impl Default for Infuser {
+    fn default() -> Self {
+        Self {
+            energy: 0,
+            counter: INFUSER_COUNTER_START,
+        }
+    }
+}
+
+impl Infuser {
+    /// One server tick (`tickServer`): count down, and at a counter tick infuse the input rod with
+    /// one catalyst item — or move a finished rod to the output slot.
+    ///
+    /// The counter is decremented first and compared with **0**: from its reset value of 10 the
+    /// first run is on the 11th tick, then every 11. A run needs a blazing rod with steps left, a
+    /// catalyst in its slot and [`INFUSER_USE_PER_RUN`] FE; a rod already at zero steps leaves at a
+    /// counter tick without either.
+    pub fn tick(
+        &mut self,
+        enabled: bool,
+        input: Option<Rod>,
+        catalyst: Option<Catalyst>,
+        output_free: bool,
+    ) -> Infusion {
+        if !enabled {
+            return Infusion::default();
+        }
+        self.counter -= 1;
+        if self.counter >= 0 {
+            // The counter counts down even with nothing to do; only its wrap is a run's moment.
+            return Infusion {
+                changed: true,
+                rod: input,
+                ..Infusion::default()
+            };
+        }
+        self.counter = INFUSER_COUNTER_START;
+        let Some(rod) = input else {
+            return Infusion {
+                changed: true,
+                ..Infusion::default()
+            };
+        };
+        if rod.steps <= 0 {
+            // A rod that is already finished (its last run could not move it) leaves the input slot
+            // at a counter tick with no catalyst and no energy.
+            return Infusion {
+                changed: true,
+                rod: Some(rod),
+                moved: output_free,
+                ..Infusion::default()
+            };
+        }
+        let Some(catalyst) = catalyst else {
+            return Infusion {
+                changed: true,
+                rod: Some(rod),
+                ..Infusion::default()
+            };
+        };
+        if self.energy < INFUSER_USE_PER_RUN {
+            return Infusion {
+                changed: true,
+                rod: Some(rod),
+                ..Infusion::default()
+            };
+        }
+        // `energyStorage.consumeEnergy(INFUSER_USE_PER_TICK)`, then `steps--` and the two writes.
+        self.energy -= INFUSER_USE_PER_RUN;
+        let mut rod = rod;
+        rod.steps -= 1;
+        rod.quality += rod.quality * catalyst.quality() / (INFUSER_PERCENT * INFUSER_STACK_STEPS);
+        rod.duration +=
+            rod.duration * catalyst.duration() / (INFUSER_PERCENT * INFUSER_STACK_STEPS);
+        Infusion {
+            ran: true,
+            rod: Some(rod),
+            moved: rod.steps <= 0 && output_free,
+            catalyst_used: true,
+            changed: true,
+        }
+    }
+}
+
+/// What one infuser tick did.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Infusion {
+    /// `true` when a catalyst was consumed and the rod infused this tick.
+    pub ran: bool,
+    /// The rod as it stands after the tick (`None` when the input slot holds no rod).
+    pub rod: Option<Rod>,
+    /// `true` when the rod left the input slot for the output slot.
+    pub moved: bool,
+    /// `true` when one catalyst item was consumed.
+    pub catalyst_used: bool,
+    /// `true` when anything changed (the counter alone is enough).
+    pub changed: bool,
+}
+
+/// A store read back from a saved compound, clamped to the infuser's buffer.
+#[must_use]
+pub fn clamp_infuser(energy: i32) -> i32 {
+    energy.clamp(0, INFUSER_CAPACITY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3381,5 +3582,262 @@ mod tests {
         assert_eq!(clamp_agitator(999_999), AGITATOR_CAPACITY);
         assert_eq!(clamp_agitator(-5), 0);
         assert_eq!(clamp_agitator(12_345), 12_345);
+    }
+
+    /// An infuser that can pay for a run.
+    fn fed(energy: i32) -> Infuser {
+        Infuser {
+            energy,
+            ..Infuser::default()
+        }
+    }
+
+    /// The first tick that infused anything, out of the next counter period.
+    fn run_once(infuser: &mut Infuser, rod: Rod, catalyst: Catalyst) -> Infusion {
+        for _ in 0..INFUSER_PERIOD {
+            let tick = infuser.tick(true, Some(rod), Some(catalyst), true);
+            if tick.ran {
+                return tick;
+            }
+        }
+        panic!("no infusion in a whole counter period");
+    }
+
+    #[test]
+    fn the_first_infusion_is_on_the_eleventh_tick_and_then_every_eleventh() {
+        let mut infuser = fed(INFUSER_CAPACITY);
+        let mut infused_at = Vec::new();
+        for tick_number in 1..=45 {
+            let tick = infuser.tick(true, Some(Rod::default()), Some(Catalyst::NetherStar), true);
+            if tick.ran {
+                infused_at.push(tick_number);
+            }
+        }
+        assert_eq!(
+            infused_at,
+            vec![11, 22, 33, 44],
+            "the counter field is 10, the period is 11 (counter-- then compare with 0)"
+        );
+        assert_eq!(
+            infuser.counter, 9,
+            "45 ticks from 10 is four wraps (44) and one"
+        );
+    }
+
+    #[test]
+    fn the_counter_period_is_eleven_not_ten() {
+        // The period is what the field does, not what it is called: a fresh infuser with no rod
+        // still counts down and wraps, so the period is observable without a catalyst.
+        let mut infuser = Infuser::default();
+        let mut wraps = 0;
+        for _ in 0..INFUSER_PERIOD * 4 {
+            let before = infuser.counter;
+            infuser.tick(true, None, None, true);
+            if infuser.counter > before {
+                wraps += 1;
+            }
+        }
+        assert_eq!(wraps, 4, "four wraps in four periods of 11 ticks");
+        assert_eq!(infuser.counter, INFUSER_COUNTER_START);
+    }
+
+    #[test]
+    fn a_nether_star_adds_120_percent_of_a_whole_stack() {
+        let mut infuser = fed(5_000);
+        let tick = run_once(&mut infuser, Rod::default(), Catalyst::NetherStar);
+        let rod = tick.rod.expect("the rod stays in the input slot");
+        assert_eq!(rod.steps, 63, "one step a run");
+        // 60,000 + 60,000 × 120 / (100 × 64) = 60,000 + 1,125 (the brief's +112.5 is a factor 10).
+        assert_eq!(rod.quality, 61_125.0, "quality is 120 % of a 64-step stack");
+        assert_eq!(
+            rod.duration, 20.375,
+            "duration is the same 120 %: 20 + 20 × 120 / 6,400"
+        );
+        assert_eq!(infuser.energy, 4_990, "a run spends 10 FE, not 10 a tick");
+        assert!(tick.catalyst_used, "one catalyst a run");
+        assert!(tick.ran && tick.changed);
+        assert!(!tick.moved, "the rod has 63 steps left");
+    }
+
+    #[test]
+    fn every_catalyst_is_the_jars_percentage_of_a_whole_stack() {
+        let table = [
+            ("minecraft:redstone", Catalyst::Redstone, 40.0, 0.0),
+            (
+                "minecraft:glowstone_dust",
+                Catalyst::GlowstoneDust,
+                10.0,
+                30.0,
+            ),
+            ("minecraft:quartz", Catalyst::Quartz, 0.0, 40.0),
+            (
+                "rftoolsbase:dimensionalshard",
+                Catalyst::DimensionalShard,
+                60.0,
+                60.0,
+            ),
+            ("minecraft:nether_star", Catalyst::NetherStar, 120.0, 120.0),
+            ("minecraft:ghast_tear", Catalyst::GhastTear, 80.0, 80.0),
+        ];
+        for (id, catalyst, quality, duration) in table {
+            assert_eq!(Catalyst::of(id), Some(catalyst), "{id}");
+            assert_eq!(catalyst.quality(), quality, "{id} quality");
+            assert_eq!(catalyst.duration(), duration, "{id} duration");
+            let mut infuser = fed(5_000);
+            let tick = run_once(&mut infuser, Rod::default(), catalyst);
+            let rod = tick.rod.expect("the rod stays");
+            assert_eq!(rod.quality, 60_000.0 + 60_000.0 * quality / 6_400.0, "{id}");
+            assert_eq!(rod.duration, 20.0 + 20.0 * duration / 6_400.0, "{id}");
+        }
+        for other in [
+            "minecraft:stone",
+            "minecraft:glowstone",
+            "rftoolspower:blazing_rod",
+        ] {
+            assert_eq!(Catalyst::of(other), None, "{other} is no catalyst");
+        }
+    }
+
+    #[test]
+    fn redstone_raises_quality_only_and_quartz_duration_only() {
+        let mut infuser = fed(5_000);
+        let tick = run_once(&mut infuser, Rod::default(), Catalyst::Redstone);
+        let rod = tick.rod.expect("the rod stays");
+        assert_eq!(rod.quality, 60_375.0, "60,000 × 40 / 6,400 = 375");
+        assert_eq!(rod.duration, 20.0, "redstone's duration factor is 0");
+
+        let mut infuser = fed(5_000);
+        let tick = run_once(&mut infuser, Rod::default(), Catalyst::Quartz);
+        let rod = tick.rod.expect("the rod stays");
+        assert_eq!(rod.quality, 60_000.0, "quartz's quality factor is 0");
+        assert_eq!(rod.duration, 20.125, "20 × 40 / 6,400 = 0.125");
+    }
+
+    #[test]
+    fn without_a_catalyst_nothing_is_infused_but_the_counter_still_runs() {
+        let mut infuser = fed(5_000);
+        let rod = Rod::default();
+        let mut ran = false;
+        for _ in 0..INFUSER_PERIOD {
+            let tick = infuser.tick(true, Some(rod), None, true);
+            assert_eq!(tick.rod, Some(rod), "the rod is untouched");
+            ran |= tick.ran;
+        }
+        assert!(!ran, "no catalyst, no infusion");
+        assert_eq!(infuser.energy, 5_000);
+        assert_eq!(
+            infuser.counter, INFUSER_COUNTER_START,
+            "the counter wraps anyway"
+        );
+    }
+
+    #[test]
+    fn a_run_needs_the_ten_fe() {
+        let mut infuser = fed(INFUSER_USE_PER_RUN - 1);
+        for _ in 0..INFUSER_PERIOD {
+            let tick = infuser.tick(true, Some(Rod::default()), Some(Catalyst::NetherStar), true);
+            assert!(!tick.ran, "9 FE cannot pay a run");
+            assert!(!tick.catalyst_used);
+        }
+        assert_eq!(infuser.energy, INFUSER_USE_PER_RUN - 1);
+        let tick = infuser.tick(true, Some(Rod::default()), Some(Catalyst::NetherStar), true);
+        assert!(!tick.ran);
+    }
+
+    #[test]
+    fn two_runs_need_two_catalysts() {
+        let mut infuser = fed(5_000);
+        let first = run_once(&mut infuser, Rod::default(), Catalyst::GhastTear);
+        let rod = first.rod.expect("the rod stays");
+        assert_eq!(rod.steps, 63);
+        // Eleven more ticks with the catalyst gone: the counter wraps, nothing is infused.
+        for _ in 0..INFUSER_PERIOD {
+            let tick = infuser.tick(true, Some(rod), None, true);
+            assert!(!tick.ran, "the catalyst was consumed");
+        }
+        let second = run_once(&mut infuser, rod, Catalyst::GhastTear);
+        assert_eq!(second.rod.expect("the rod stays").steps, 62);
+        assert_eq!(
+            infuser.energy,
+            5_000 - 2 * INFUSER_USE_PER_RUN,
+            "ten FE a run, twice"
+        );
+    }
+
+    #[test]
+    fn the_last_step_moves_the_rod_to_the_output() {
+        let mut infuser = fed(5_000);
+        let almost = Rod {
+            steps: 1,
+            ..Rod::default()
+        };
+        let tick = run_once(&mut infuser, almost, Catalyst::NetherStar);
+        assert!(tick.ran && tick.moved, "the last run moves the rod");
+        let rod = tick.rod.expect("the finished rod is still described");
+        assert_eq!(rod.steps, 0);
+        assert_eq!(
+            rod.quality, 61_125.0,
+            "the last run still infuses before the move"
+        );
+    }
+
+    #[test]
+    fn a_busy_output_keeps_the_finished_rod() {
+        let mut infuser = fed(5_000);
+        let almost = Rod {
+            steps: 1,
+            ..Rod::default()
+        };
+        for _ in 0..INFUSER_PERIOD {
+            let tick = infuser.tick(true, Some(almost), Some(Catalyst::NetherStar), false);
+            if tick.ran {
+                assert!(!tick.moved, "the output slot is taken");
+                assert_eq!(tick.rod.expect("kept").steps, 0);
+                return;
+            }
+        }
+        panic!("no infusion in a whole counter period");
+    }
+
+    #[test]
+    fn a_finished_rod_leaves_without_a_catalyst_or_energy() {
+        let mut infuser = Infuser::default();
+        let spent = Rod {
+            steps: 0,
+            ..Rod::default()
+        };
+        for _ in 0..INFUSER_PERIOD {
+            let tick = infuser.tick(true, Some(spent), None, true);
+            if tick.moved {
+                assert!(!tick.ran, "nothing was infused");
+                assert!(!tick.catalyst_used);
+                assert_eq!(infuser.energy, 0);
+                return;
+            }
+        }
+        panic!("a spent rod never left its slot");
+    }
+
+    #[test]
+    fn a_disabled_infuser_does_not_count() {
+        let mut infuser = fed(5_000);
+        for _ in 0..INFUSER_PERIOD * 2 {
+            let tick = infuser.tick(
+                false,
+                Some(Rod::default()),
+                Some(Catalyst::NetherStar),
+                true,
+            );
+            assert!(!tick.ran && !tick.changed);
+        }
+        assert_eq!(infuser.counter, INFUSER_COUNTER_START);
+        assert_eq!(infuser.energy, 5_000);
+    }
+
+    #[test]
+    fn the_infusers_store_clamps_at_fifty_thousand() {
+        assert_eq!(clamp_infuser(999_999), INFUSER_CAPACITY);
+        assert_eq!(clamp_infuser(-5), 0);
+        assert_eq!(clamp_infuser(12_345), 12_345);
     }
 }

@@ -1,11 +1,11 @@
-# Package receipt — rftoolspower 0.1.7
+# Package receipt — rftoolspower 0.1.8
 
 | field | value |
 |---|---|
-| version | `0.1.7` |
+| version | `0.1.8` |
 | file | `rftoolspower.hmod` |
-| bytes | 177,048 |
-| sha256 | `15cc6d27279638fb67003d7a9492eb8dd21f87b1273025a433c4712121212bbd` |
+| bytes | 188,685 |
+| sha256 | `49885b17eefb49dc54ae8cb400a05a85f6125201d09f0bef564fdc1a26bb559d` |
 | source | this tag — the tree here is the source that produced the archive |
 | game | 26.3 |
 | horizon | `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` |
