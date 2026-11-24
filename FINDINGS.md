@@ -159,3 +159,28 @@ carried (it could never craft here); the plain core recipe is, with the leg prov
 nothing without the parent. The tier-3 runtime itself needed no new logic — `Tier::Three` and the
 generic capacity/per-side/network functions were already written in slice 3; what was missing was
 the carried block/item, the third `declare_cell` registration and the per-tier drop type id.
+
+## Slice 12: the infusable upgrade factor (read at the same commits)
+
+Files read in the upstream `1.21_neo` checkout @ `e44463ca` and McJtyLib @ `ef393e6`:
+
+| File | What it gave |
+|---|---|
+| `modules/generator/blocks/CoalGeneratorTileEntity.java` (`handlePowerGeneration`, `getRfPerTick`, `applyImplicitComponents`) | the two rules: `burning += (int)(burning * factor / 2.0f)` on the fuel-load branch (after the coal-block `×9`), and `long rf = 60; rf += (long)(rf * factor); return rf;`; the `DefaultInfusable` capability and its component save/load under the NBT key `"infusable"` |
+| McJtyLib `api/infusable/IInfusable.java` | `getInfusedFactor() = (float) infused / GeneralConfig.maxInfuse`, `infused` an int 0…256 by the interface's own javadoc |
+| McJtyLib `api/infusable/DefaultInfusable.java` | `infused` is an int field, saved under the given block-NBT tag and applied to the machine from an `ItemInfusable` component |
+| McJtyLib `base/GeneralConfig.java` | `maxInfuse` defaults to **256** (`defineInRange("maxInfuse", 256, 1, Integer.MAX_VALUE)`) |
+
+**The load-bearing finding:** the factor is a **float 0…1**, not a whole-number multiplier, and both
+rules cast a single-precision product to an integer. At `infused = 128` the factor is 0.5, the rate
+is 90 and a coal's burn is 750; at `infused = 1` the factor is 1/256, so `60 × factor = 0.234375`
+truncates to 0 extra FE while `600 × factor / 2 = 1.17` truncates to 1 extra tick. The directive's
+`60 × (1 + factor) × Δburn` is the same rule for the doctored 0.5, and the port implements the
+artefact's float arithmetic (including the truncations) rather than a rounded whole-number factor.
+
+**The API gap:** the pinned SDK has **no** infusable component or capability (`grep -ri infus` over
+`ports/_shared/sdk/0a875da/` is empty), and the `ITEM_INFUSABLE` upgrade-item family is not carried.
+Per the directive the port registers its own int component `rftoolspower:infusable_data` with the
+component's field named `infused` (McJtyLib's `ItemInfusable`) and an existing carried item as the
+carrier in a third generator slot. Upstream applies the component when the machine is placed; here
+it is read from the slot every tick, so a broken machine loses its infusion — a documented deviation.

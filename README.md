@@ -3,9 +3,9 @@
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.10**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.11**.
 
-Nine families so far (the coal generator gained its charge-item slot in slice 11):
+Nine families so far (the coal generator gained the infusion factor in slice 12):
 
 **The Coal Generator** (slice 1)
 
@@ -16,6 +16,9 @@ Nine families so far (the coal generator gained its charge-item slot in slice 11
 - charges an **energy item in its second slot at 1,000 FE a tick** out of its own store (upstream's
   `handleChargingItem`); a powercell item is such an energy item, carrying its FE in the same
   `minecraft:block_entity_data` store the block reads;
+- takes an **infusion carrier in its third slot**: an int 0–256 component (`rftoolspower:infusable_data`,
+  this port's stand-in for McJtyLib's `ITEM_INFUSABLE`) raises the rate to `60 + (long)(60 × factor)`
+  FE a tick and the burn to `600 + (int)(600 × factor / 2)` ticks, exactly upstream's float rules;
 - gives up to **2,000 FE an extract** through the energy capability on every face, and **pushes
   2,000 FE a tick into each adjacent energy block** (upstream's `handleSendingEnergy`);
 - keeps its store on its own item when broken, and clamps a doctored item back to the capacity;

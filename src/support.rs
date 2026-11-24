@@ -26,12 +26,13 @@ use crate::runtime::{
     CAPACITY, Catalyst, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic,
     FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE, INFUSER_CAPACITY, INFUSER_CATALYST,
     INFUSER_COUNTER_START, INFUSER_INPUT, INFUSER_INSERT_PER_TICK, INFUSER_OUTPUT, INFUSER_SLOTS,
-    INJECTOR_SLOTS, Infuser, Loss, MAX_DISTANCE, MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX,
-    OBSERVE_TICKS, PEARL, PowerLevel, Pulse, ROD_START_STEPS, Rod, RodSlot, SideMode, Sides, Tier,
-    as_capability, capacity as network_capacity, charge_step, clamp_agitator, clamp_blazing,
-    clamp_endergenic, clamp_energy, clamp_infuser, clamped_energy, network_valid, pearl_lost,
-    receive as network_receive, restored, rf_per_tick, rising_edge, send_amount,
-    stored as network_stored, take as network_take,
+    INJECTOR_SLOTS, Infuser, Loss, MAX_DISTANCE, MAX_INFUSE, MONITOR_SIGNAL, Monitor, MonitorMode,
+    NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse, ROD_START_STEPS, Rod, RodSlot, SideMode,
+    Sides, Tier, as_capability, capacity as network_capacity, charge_step, clamp_agitator,
+    clamp_blazing, clamp_endergenic, clamp_energy, clamp_infuser, clamped_energy,
+    generator_rf_per_tick, infused_factor, network_valid, pearl_lost, receive as network_receive,
+    restored, rf_per_tick, rising_edge, send_amount, stored as network_stored,
+    take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -48,8 +49,12 @@ const FUEL_SLOT: usize = 0;
 /// The charge slot (`CoalGeneratorTileEntity.SLOT_CHARGEITEM`): an energy item is charged here,
 /// 1,000 FE a tick, out of the generator's store (upstream's `handleChargingItem`).
 const CHARGE_SLOT: usize = 1;
-/// Two slots: fuel and the charge item (upstream's `ContainerFactory(2)`).
-const SLOTS: usize = 2;
+/// The infusion carrier slot (gap 3). Upstream's infusion level is McJtyLib's `ITEM_INFUSABLE`
+/// component on the machine item, not a container slot; this port carries the same int on an
+/// existing carried item in a third slot so the factor is reachable without the upgrade family.
+const UPGRADE_SLOT: usize = 2;
+/// Three slots: fuel, the charge item and the infusion carrier.
+const SLOTS: usize = 3;
 /// The block's `lit` property, which the `minecraft:furnace` template already declares.
 const KEY_LIT: &str = "lit";
 /// The saved store, under the key the energy capability reads (`ModEnergyBuffer`'s amount).
@@ -58,6 +63,13 @@ const KEY_ENERGY: &str = "energy";
 const KEY_BURN: &str = "burn";
 /// The burn bar's denominator; not upstream's saved state, but the readout needs it.
 const KEY_BURN_MAX: &str = "burn_max";
+/// The component's int field, McJtyLib's `ItemInfusable.infused()`.
+const KEY_INFUSED: &str = "infused";
+/// The block-NBT key, McJtyLib's `DefaultInfusable.save(tag, "infusable")`.
+const KEY_INFUSABLE_SAVED: &str = "infusable";
+/// This port's own int component, the analogue of McJtyLib's `ITEM_INFUSABLE`: the int 0…256 whose
+/// quotient by `maxInfuse` is the factor both generator rules use.
+const INFUSABLE_DATA: &str = "rftoolspower:infusable_data";
 /// The vanilla component that carries a block entity's saved data on its item
 /// (`BlockEntity.applyComponentsFromItemStack`).
 const BLOCK_ENTITY_DATA: &str = "minecraft:block_entity_data";
@@ -342,14 +354,16 @@ fn declare_cell(
     }
 }
 
-/// The generator's container: a fuel slot and the charge slot, both reachable from every face.
-/// The fuel slot is insert-only (upstream `.in()`); the charge slot can be taken back
-/// (upstream `.in().out()`).
+/// The generator's container: the fuel slot, the charge slot and the infusion carrier, all
+/// reachable from every face. The fuel and infusion slots are insert-only (upstream `.in()`);
+/// only the charge slot can be taken back (upstream `.in().out()`). The infusion level lives on
+/// the carrier's own component, so removing it would remove the upgrade — upstream's implicit
+/// component is likewise a property of the machine, not a loose item.
 pub(crate) fn generator_container() -> ModContainer {
     ModContainer {
         slots: SLOTS,
-        faces: std::array::from_fn(|_| vec![FUEL_SLOT, CHARGE_SLOT]),
-        inputs: vec![FUEL_SLOT, CHARGE_SLOT],
+        faces: std::array::from_fn(|_| vec![FUEL_SLOT, CHARGE_SLOT, UPGRADE_SLOT]),
+        inputs: vec![FUEL_SLOT, CHARGE_SLOT, UPGRADE_SLOT],
         outputs: vec![CHARGE_SLOT],
         menu: None,
     }
@@ -477,6 +491,8 @@ pub(crate) fn generator_line(
     state: &Generator,
     fuel: Option<(&str, u32)>,
     charge: Option<(&str, u32, u32, bool)>,
+    // The carrier's item id and the infusion level its component carries.
+    carrier: Option<(&str, i32)>,
     t: i64,
     nonce: Option<&str>,
 ) -> String {
@@ -491,10 +507,11 @@ pub(crate) fn generator_line(
         ),
         None => "empty".to_owned(),
     };
+    let (carrier, infused) = carrier.unwrap_or(("empty", 0));
     let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
     format!(
         "Coal Generator at {},{},{}: {}/{} FE (burning {}/{} ticks, lit {}, fuel {fuel}, \
-         charge {charge}, t={t}{suffix})",
+         charge {charge}, carrier {carrier}, infused {infused} factor {:.3} rf {}, t={t}{suffix})",
         pos[0],
         pos[1],
         pos[2],
@@ -503,6 +520,8 @@ pub(crate) fn generator_line(
         state.burn,
         state.burn_max,
         state.lit(),
+        infused_factor(infused),
+        generator_rf_per_tick(infused),
     )
 }
 
@@ -553,21 +572,29 @@ pub(crate) fn tick_generator(
     let before = read_generator(saved);
     let mut state = before.clone();
     let mut changed = false;
+    // The infusion level is read from the carrier's own component every tick, as upstream reads
+    // `DefaultInfusable` from its `ITEM_INFUSABLE` component, and saved under McJtyLib's own key.
+    let infused = items
+        .get(UPGRADE_SLOT)
+        .and_then(Option::as_ref)
+        .map_or(0, infused_of);
+    let infused_before = int_or(saved, KEY_INFUSABLE_SAVED, 0);
     // The charge slot is filled at the level tick's end, not here: a block entity is out of the
     // world during its own tick, so `ItemPlace::capability` answers nothing for its items.
     push_energy(host, level, pos, &mut state);
     if state.wants_fuel()
         && let Some(stack) = items.get(FUEL_SLOT).and_then(Option::clone)
         && let Some(fuel) = Fuel::of(&item_id(&*host, &stack))
-        && state.load(fuel)
+        && state.load_infused(fuel, infused)
     {
         // One item is spent; `shrink` answers `None` when that empties the stack.
         items[FUEL_SLOT] = stack.shrink(1);
         changed = true;
     }
-    state.tick();
-    changed |= state != before;
+    state.tick_infused(infused);
+    changed |= state != before || infused_before != infused;
     write_generator(saved, &state);
+    set_int(saved, KEY_INFUSABLE_SAVED, infused);
     if level.is_some() {
         mirror_lit(host, pos, state.lit());
     }
@@ -1811,10 +1838,13 @@ pub(crate) fn generator_click(
         hand: click.hand,
     };
     // Upstream's container accepts only a valid fuel in slot 0 and only an energy item in slot 1
-    // (`EnergyTools.isEnergyItem`); this port asks the item's own capability. A stone answers
-    // neither, so the click changes nothing and the stone stays in the hand.
+    // (`EnergyTools.isEnergyItem`); this port asks the item's own capability, plus its own infusion
+    // component for slot 2 (the gap-3 carrier). A stone answers none of the three, so the click
+    // changes nothing and the stone stays in the hand.
     let slot = if Fuel::of(&held_id).is_some() {
         FUEL_SLOT
+    } else if held.get(&Infusable).is_some() {
+        UPGRADE_SLOT
     } else if hand.capability(host, &mod_api::ITEM_ENERGY).is_some() {
         CHARGE_SLOT
     } else {
@@ -2253,6 +2283,38 @@ const NO_BLAZING: &str = "No RFTools Power blazing generator there.";
 /// The rod slot the readout and the click name first.
 const ROD_SLOT_FIRST: usize = 0;
 
+/// `rftoolspower:infusable_data`: this port's own int component, the analogue of McJtyLib's
+/// `ITEM_INFUSABLE` record. A bare int and a compound `{infused: N}` are both accepted so a
+/// `/give` can carry either spelling; an out-of-range value is clamped to the javadoc's 0…256.
+struct Infusable;
+
+impl Component for Infusable {
+    type Value = i32;
+
+    fn id(&self) -> &str {
+        INFUSABLE_DATA
+    }
+
+    fn decode(&self, value: &Tag) -> Option<i32> {
+        let raw = match value {
+            Tag::Int(n) => *n,
+            Tag::Long(n) => i32::try_from(*n).unwrap_or(0),
+            Tag::Compound(_) => int_or(value, KEY_INFUSED, 0),
+            _ => return None,
+        };
+        Some(raw.clamp(0, MAX_INFUSE))
+    }
+
+    fn encode(&self, value: i32) -> Tag {
+        Tag::compound([(KEY_INFUSED, Tag::Int(value.clamp(0, MAX_INFUSE)))])
+    }
+}
+
+/// The infusion level a carrier stack holds; 0 when it carries no component.
+fn infused_of(stack: &ItemStack) -> i32 {
+    stack.get(&Infusable).unwrap_or(0)
+}
+
 /// `rftoolspower:blazing_rod_data`: the rod's `{steps, time, quality, duration}`, the component
 /// `BlazingRodData`'s own codec writes.
 struct RodData;
@@ -2324,6 +2386,9 @@ fn set_rod(stack: &mut ItemStack, rod: Rod) -> bool {
 pub(crate) fn declare_component(types: &mut Vec<String>) {
     if !types.iter().any(|known| known == ROD_DATA) {
         types.push(ROD_DATA.to_owned());
+    }
+    if !types.iter().any(|known| known == INFUSABLE_DATA) {
+        types.push(INFUSABLE_DATA.to_owned());
     }
 }
 
@@ -3469,6 +3534,12 @@ pub(crate) fn status_line(
             let fe = handler.map_or(0, |handler| handler.amount(&mut *host));
             (item, count, fe, cap)
         });
+    // The infusion lives on the carrier stack's own component, so read it there rather than from
+    // the saved copy the tick writes (which can be a tick behind a just-clicked carrier).
+    let carrier = entity.item_slot(&*host, UPGRADE_SLOT as u32).ok().flatten();
+    let carrier_report = carrier
+        .as_ref()
+        .map(|stack| (stack.item().id(&*host).to_owned(), infused_of(stack)));
     let t = level.game_time(&*host).unwrap_or(0);
     generator_line(
         pos,
@@ -3477,6 +3548,9 @@ pub(crate) fn status_line(
         charge
             .as_ref()
             .map(|(item, count, fe, cap)| (item.as_str(), *count, *fe, *cap)),
+        carrier_report
+            .as_ref()
+            .map(|(id, infused)| (id.as_str(), *infused)),
         t,
         nonce,
     )
@@ -5188,19 +5262,27 @@ impl BlockEntityPart for InfuserPart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{COAL_BLOCK_TICKS, MAX_LEVEL, PERCENT, TICKS_PER_COAL};
+    use crate::runtime::{MAX_BURN, MAX_LEVEL, PERCENT, TICKS_PER_COAL};
     fn compound() -> Tag {
         Tag::Compound(Compound::new())
     }
 
     #[test]
-    fn the_generator_has_a_fuel_slot_and_a_charge_slot() {
+    fn the_generator_has_a_fuel_slot_a_charge_slot_and_an_infusion_slot() {
         let container = generator_container();
-        assert_eq!(container.slots, SLOTS, "upstream's ContainerFactory(2)");
+        assert_eq!(
+            container.slots, SLOTS,
+            "fuel, charge item and infusion carrier"
+        );
+        assert_eq!(SLOTS, 3);
+        assert_eq!(
+            UPGRADE_SLOT, 2,
+            "the carrier is a third slot; fuel stays 0 and charge 1"
+        );
         assert_eq!(
             container.inputs,
-            vec![FUEL_SLOT, CHARGE_SLOT],
-            "fuel and the charge item may be inserted"
+            vec![FUEL_SLOT, CHARGE_SLOT, UPGRADE_SLOT],
+            "fuel, the charge item and the carrier may be inserted"
         );
         assert_eq!(
             container.outputs,
@@ -5209,10 +5291,26 @@ mod tests {
         );
         assert_eq!(
             container.faces,
-            std::array::from_fn(|_| vec![FUEL_SLOT, CHARGE_SLOT]),
-            "automation reaches both slots from every face: there is no side configuration"
+            std::array::from_fn(|_| vec![FUEL_SLOT, CHARGE_SLOT, UPGRADE_SLOT]),
+            "automation reaches every slot from every face: there is no side configuration"
         );
         assert_eq!(container.menu, None, "no GUI in this slice");
+    }
+
+    #[test]
+    fn the_infusion_component_round_trips_and_accepts_a_bare_int() {
+        assert_eq!(Infusable.id(), INFUSABLE_DATA);
+        assert_eq!(Infusable.decode(&Tag::Int(128)), Some(128));
+        assert_eq!(Infusable.decode(&Tag::Int(9999)), Some(MAX_INFUSE));
+        assert_eq!(Infusable.decode(&Tag::Int(-4)), Some(0));
+        assert_eq!(Infusable.decode(&Tag::Float(0)), None);
+        let encoded = Infusable.encode(128);
+        assert_eq!(encoded, Tag::compound([(KEY_INFUSED, Tag::Int(128))]));
+        assert_eq!(Infusable.decode(&encoded), Some(128));
+        assert_eq!(
+            Infusable.decode(&Tag::compound([("other", Tag::Int(9))])),
+            Some(0)
+        );
     }
 
     #[test]
@@ -5262,7 +5360,7 @@ mod tests {
             "a negative burn is empty, not huge"
         );
         set_int(&mut saved, KEY_BURN, 99_999);
-        assert_eq!(read_generator(&saved).burn, COAL_BLOCK_TICKS);
+        assert_eq!(read_generator(&saved).burn, MAX_BURN);
     }
 
     #[test]
@@ -5278,16 +5376,31 @@ mod tests {
                 &state,
                 Some(("minecraft:coal", 4)),
                 Some(("rftoolspower:cell1", 1, 98_000, true)),
+                None,
                 324,
                 Some("1")
             ),
             "Coal Generator at 0,100,0: 1940/500000 FE (burning 503/600 ticks, lit true, fuel \
-             minecraft:coal x4, charge rftoolspower:cell1 x1 (98000 FE, cap=yes), t=324 nonce=1)"
+             minecraft:coal x4, charge rftoolspower:cell1 x1 (98000 FE, cap=yes), carrier empty, \
+             infused 0 factor 0.000 rf 60, t=324 nonce=1)"
         );
         assert_eq!(
-            generator_line([200, 101, 0], &Generator::new(), None, None, 7, None),
+            generator_line([200, 101, 0], &Generator::new(), None, None, None, 7, None),
             "Coal Generator at 200,101,0: 0/500000 FE (burning 0/0 ticks, lit false, fuel empty, \
-             charge empty, t=7)"
+             charge empty, carrier empty, infused 0 factor 0.000 rf 60, t=7)"
+        );
+        assert_eq!(
+            generator_line(
+                [201, 101, 0],
+                &Generator::new(),
+                None,
+                None,
+                Some(("rftoolspower:power_core1", 128)),
+                9,
+                None
+            ),
+            "Coal Generator at 201,101,0: 0/500000 FE (burning 0/0 ticks, lit false, fuel empty, \
+             charge empty, carrier rftoolspower:power_core1, infused 128 factor 0.500 rf 90, t=9)"
         );
     }
 
@@ -6166,7 +6279,11 @@ mod tests {
         let mut types = Vec::new();
         declare_component(&mut types);
         declare_component(&mut types);
-        assert_eq!(types, vec![ROD_DATA.to_owned()], "registered once");
+        assert_eq!(
+            types,
+            vec![ROD_DATA.to_owned(), INFUSABLE_DATA.to_owned()],
+            "both components registered once"
+        );
     }
 
     #[test]

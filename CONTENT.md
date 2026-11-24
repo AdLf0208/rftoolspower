@@ -294,3 +294,10 @@ the parent's `rftoolsbase:dimensional_shard`. Per the cell2 precedent a recipe t
 craft is not carried; the plain `power_core3` recipe is carried for the same reason the other plain
 recipes are, and the leg proves it crafts nothing here (phase BX). The tier numbers themselves
 (20,000,000 FE, 4,000 a side) come from `PowerCellConfig.class`, not from this content directory.
+
+## Slice 12 — no content change
+
+The infusable factor adds no block, item, texture or data file: the carrier is the existing
+`rftoolspower:power_core1` item in a third container slot, and its `rftoolspower:infusable_data`
+component is installed by `Hooks::component_types` (code, not content). `assemble_content.py --check`
+still re-derives the same 177 entries; the packed `assets/` and `data/` are byte-identical to 0.1.10.

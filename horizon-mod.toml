@@ -1,11 +1,14 @@
 id = "rftoolspower"
 name = "RFTools Power"
-version = "0.1.10"
+version = "0.1.11"
 description = """A port of RFTools Power for Horizon: the Coal Generator, which burns coal, charcoal or a
 coal block for 600 ticks each (nine times that for a block) at 60 FE a tick into a 500,000 FE
 buffer, lights its own front while it burns, takes fuel from a hopper or a right click, gives its
 store out through the energy capability and pushes 2,000 FE a tick into an adjacent energy block,
-and charges an energy item in its second slot at 1,000 FE a tick out of its own store; powercells'
+charges an energy item in its second slot at 1,000 FE a tick out of its own store, and takes an
+infusion carrier in a third slot whose int 0-256 component raises the rate to 60 + (long)(60*factor)
+FE a tick and the burn to 600 + (int)(600*factor/2) ticks (upstream's infusable factor);
+powercells'
 own items answer the energy-item capability with the store they carry;
 the Power Monitor, which reads the block it faces every 20 ticks, shows its charge as a level
 0-5, and gives a redstone alarm on its display side inside a configureable percentage band; the

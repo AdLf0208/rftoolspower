@@ -22,6 +22,59 @@ pub const EXTRACT_PER_TICK: i32 = 2_000;
 /// The most FE a tick the generator gives an energy item in its charge slot
 /// (`CoalGeneratorConfig.CHARGEITEMPERTICK`, `chargeItemPerTick`).
 pub const CHARGE_PER_TICK: i32 = 1_000;
+/// McJtyLib `GeneralConfig.maxInfuse` (default 256): `infused` is an int 0…256 and
+/// `IInfusable.getInfusedFactor()` is `infused / 256.0f`.
+pub const MAX_INFUSE: i32 = 256;
+/// The longest burn a coal block gets at full infusion: `5400 + (int)(5400 * 1 / 2)`.
+pub const MAX_BURN: u32 = COAL_BLOCK_TICKS + COAL_BLOCK_TICKS / 2;
+
+/// The factor upstream's `IInfusable.getInfusedFactor()` answers for a stored `infused` int:
+/// `(float) infused / GeneralConfig.maxInfuse`, clamped to the documented 0…256 range.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "McJtyLib's factor is a float division of an int 0..256"
+)]
+#[must_use]
+pub fn infused_factor(infused: i32) -> f32 {
+    infused.clamp(0, MAX_INFUSE) as f32 / MAX_INFUSE as f32
+}
+
+/// The generator's `getRfPerTick`: `long rf = 60; rf += (long)(rf * factor);`. The product is
+/// taken in single precision and truncated to a long before it is added to the base — the same
+/// float arithmetic upstream's `float factor` forces.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the base rate is 60 FE, exactly representable as a float"
+)]
+#[must_use]
+pub fn generator_rf_per_tick(infused: i32) -> i32 {
+    let bonus = FE_PER_TICK as f32 * infused_factor(infused);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "upstream casts (long)(rf * factor) with factor in 0..1"
+    )]
+    let bonus = bonus as i64;
+    FE_PER_TICK.saturating_add(i32::try_from(bonus).unwrap_or(i32::MAX))
+}
+
+/// The burn `handlePowerGeneration` starts: `burning += (int)(burning * factor / 2.0f)`, after the
+/// coal block's `×9`. Single precision and a truncating cast, as upstream's `float factor` forces.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a burn is at most 5,400 ticks, exactly representable as a float"
+)]
+#[must_use]
+pub fn infused_burn_ticks(fuel: Fuel, infused: i32) -> u32 {
+    let base = fuel.burn_ticks();
+    let bonus = (base as f32) * infused_factor(infused) / 2.0f32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "factor is in 0..1, so the bonus is at most 2,700 ticks"
+    )]
+    let bonus = bonus as u32;
+    base.saturating_add(bonus)
+}
 
 /// What the generator offers the charge-slot item this tick (upstream
 /// `handleChargingItem`: `min(CHARGEITEMPERTICK, storedPower)`, then the item's
@@ -126,25 +179,36 @@ impl Generator {
         !self.burning()
     }
 
-    /// Light one item of fuel. False when it is already burning (one item at a time).
+    /// Light one item of fuel with no infusion. False when it is already burning (one item at a time).
     pub fn load(&mut self, fuel: Fuel) -> bool {
+        self.load_infused(fuel, 0)
+    }
+
+    /// Light one item of fuel at a given infusion level (upstream's `burning +=
+    /// (int)(burning * factor / 2.0f)` on the `else if` branch that loads fuel).
+    pub fn load_infused(&mut self, fuel: Fuel, infused: i32) -> bool {
         if self.burning() {
             return false;
         }
-        self.burn = fuel.burn_ticks();
+        self.burn = infused_burn_ticks(fuel, infused);
         self.burn_max = self.burn;
         true
     }
 
-    /// One server tick: spend a tick of burn and store [`FE_PER_TICK`], never past the capacity.
-    /// Returns the FE actually stored (0 when nothing burned or the buffer was full).
+    /// One server tick with no infusion: spend a tick of burn and store [`FE_PER_TICK`], never past
+    /// the capacity. Returns the FE actually stored (0 when nothing burned or the buffer was full).
     pub fn tick(&mut self) -> i32 {
+        self.tick_infused(0)
+    }
+
+    /// One server tick at a given infusion level, storing `getRfPerTick()` FE.
+    pub fn tick_infused(&mut self, infused: i32) -> i32 {
         if self.burn == 0 {
             return 0;
         }
         self.burn -= 1;
         let before = self.energy;
-        self.energy = clamp_energy(self.energy.saturating_add(FE_PER_TICK));
+        self.energy = clamp_energy(self.energy.saturating_add(generator_rf_per_tick(infused)));
         self.energy - before
     }
 }
@@ -159,13 +223,11 @@ pub fn clamp_energy(energy: i32) -> i32 {
 /// `GenericEnergyStorage.load` and the burn counter's own range do.
 #[must_use]
 pub fn restored(energy: i32, burn: i32, burn_max: i32) -> Generator {
-    let burn = u32::try_from(burn).unwrap_or(0).min(COAL_BLOCK_TICKS);
+    let burn = u32::try_from(burn).unwrap_or(0).min(MAX_BURN);
     let burn_max = if burn == 0 {
         0
     } else {
-        u32::try_from(burn_max)
-            .unwrap_or(0)
-            .clamp(burn, COAL_BLOCK_TICKS)
+        u32::try_from(burn_max).unwrap_or(0).clamp(burn, MAX_BURN)
     };
     Generator {
         energy: clamp_energy(energy),
@@ -2035,12 +2097,12 @@ mod tests {
         assert_eq!(restored(-5, 0, 0).energy, 0, "a negative amount is empty");
         let huge = restored(0, 999_999, 999_999);
         assert_eq!(
-            huge.burn, COAL_BLOCK_TICKS,
-            "no burn longer than a coal block's"
+            huge.burn, MAX_BURN,
+            "no burn longer than a fully infused coal block's"
         );
         let short = restored(0, 300, 999_999);
         assert_eq!(
-            short.burn_max, COAL_BLOCK_TICKS,
+            short.burn_max, MAX_BURN,
             "a doctored denominator is clamped too"
         );
         let odd = restored(0, 0, 600);
@@ -2073,6 +2135,64 @@ mod tests {
             Fuel::CoalBlock.burn_ticks() * u32::try_from(FE_PER_TICK).unwrap(),
             324_000
         );
+    }
+
+    #[test]
+    fn the_infusion_factor_is_mcjtylibs_int_over_256() {
+        assert_eq!(infused_factor(0), 0.0);
+        assert_eq!(infused_factor(128), 0.5);
+        assert_eq!(infused_factor(MAX_INFUSE), 1.0);
+        assert_eq!(
+            infused_factor(9999),
+            1.0,
+            "a doctored value is clamped to the javadoc's 0..256"
+        );
+        assert_eq!(infused_factor(-5), 0.0);
+    }
+
+    #[test]
+    fn the_rate_and_burn_follow_upstreams_float_truncation() {
+        // getRfPerTick: `long rf = 60; rf += (long)(rf * factor);`
+        assert_eq!(generator_rf_per_tick(0), 60);
+        assert_eq!(generator_rf_per_tick(128), 90, "factor 0.5: 60 + 30");
+        assert_eq!(generator_rf_per_tick(MAX_INFUSE), 120, "factor 1: 60 + 60");
+        assert_eq!(
+            generator_rf_per_tick(1),
+            60,
+            "60 * (1/256) = 0.234375 truncates to 0"
+        );
+        // handlePowerGeneration: `burning += (int)(burning * factor / 2.0f);`
+        assert_eq!(infused_burn_ticks(Fuel::Coal, 0), 600);
+        assert_eq!(infused_burn_ticks(Fuel::Coal, 128), 750, "600 + 150");
+        assert_eq!(infused_burn_ticks(Fuel::Coal, MAX_INFUSE), 900, "600 + 300");
+        assert_eq!(
+            infused_burn_ticks(Fuel::Coal, 1),
+            601,
+            "600 * (1/256) / 2 = 1.17 truncates to 1"
+        );
+        assert_eq!(
+            infused_burn_ticks(Fuel::CoalBlock, 128),
+            6750,
+            "the x9 comes first, then + 1350"
+        );
+        assert_eq!(infused_burn_ticks(Fuel::CoalBlock, MAX_INFUSE), MAX_BURN);
+    }
+
+    #[test]
+    fn an_infused_burn_makes_the_infused_rate_every_tick() {
+        let mut generator = Generator::new();
+        assert!(generator.load_infused(Fuel::Coal, 128));
+        assert_eq!(
+            generator.burn_max, 750,
+            "the burn bar starts at the infused burn"
+        );
+        let mut made = 0;
+        for _ in 0..100 {
+            made += generator.tick_infused(128);
+        }
+        assert_eq!(made, 9_000, "100 ticks x 90 FE");
+        assert_eq!(generator.burn, 650);
+        assert_eq!(generator.energy, 9_000);
     }
 
     // --- the power monitor -------------------------------------------------

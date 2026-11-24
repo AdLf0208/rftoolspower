@@ -1,9 +1,10 @@
 # RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
 # powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor;
 # slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator;
-# slice 9: the blazing infuser; slice 10: `cell3`; slice 11: the charge-item slot)
+# slice 9: the blazing infuser; slice 10: `cell3`; slice 11: the charge-item slot; slice 12: the
+# infusable upgrade factor)
 
-> **Current state (2026-11-24): slice 11, package 0.1.10 at pin
+> **Current state (2026-11-24): slice 12, package 0.1.11 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 11 adds the coal
 > generator's **charge-item slot**: an energy item in slot 1 is charged at 1,000 FE a tick out of
 > the generator's own store, through the pin's `horizon:item_energy` capability, and a powercell item
@@ -37,7 +38,8 @@
 > `/rftoolspower powerlevel <pos> [nonce]`; the agitator's readout is
 > `/rftoolspower agitator <pos> [nonce]` and its lock checkbox is
 > `/rftoolspower agitatelock <pos> <slot> on|off [nonce]`; the infuser's readout is
-> `/rftoolspower infuser <pos> [nonce]`.
+> `/rftoolspower infuser <pos> [nonce]`; the generator now reads its **infusion carrier** (slot 2) in
+> the same `/rftoolspower info` line as `carrier/infused/factor/rf`.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -1718,6 +1720,135 @@ None adopted. The charge direction is upstream's, not the directive's (documente
 level-tick post and the second harness receiver are this port's mechanisms for pin limits, not
 behaviour changes from the jar.
 
+## Slice 12 — the infusable upgrade factor (package 0.1.11)
+
+Gap line it comes from (`## Gaps` below): **gap 3** — *"The infusable upgrade factor
+(`getRfPerTick`'s `factor`, and the burn's `+burning*factor/2`). Upstream's upgrade slot is
+McJtyLib's `DefaultInfusable`; the upgrade item family is not ported."* Tier: still **machines** —
+one more insert-only slot on the existing block entity and two integer rules in its tick, with no
+new block, renderer, GUI or hook. FUEL_SLOT 0 and CHARGE_SLOT 1 are unchanged, so BY/BZ (and every
+other family) still run.
+
+### The component gate (first command of the slice, before any code)
+
+`grep -ri infus ports/_shared/sdk/0a875da/` → **no matches**: the pin has no infusable component or
+capability. Per the directive the factor is carried as this port's **own int component**
+`rftoolspower:infusable_data`, the way the blazing rod's `rftoolspower:blazing_rod_data` is carried;
+no upstream item is invented and no chat command sets the factor. The carrier stack is an existing
+carried item (`rftoolspower:power_core1`) doctored with `{infused: N}`.
+
+### The formula, read from the artefact (`1.21_neo` @ `e44463ca`, McJtyLib `ef393e6`)
+
+`CoalGeneratorTileEntity.handlePowerGeneration` and `getRfPerTick`, verbatim:
+
+```java
+burning = CoalGeneratorConfig.TICKSPERCOAL.get();     // 600, x9 for a coal block first
+float factor = infusable.getInfusedFactor();
+burning += (int) (burning * factor / 2.0f);
+...
+long rf = CoalGeneratorConfig.RFPERTICK.get();        // 60
+float factor = infusable.getInfusedFactor();
+rf += (long) (rf * factor);
+return rf;
+```
+
+McJtyLib's `IInfusable.getInfusedFactor()` is `(float) infused / GeneralConfig.maxInfuse`, with
+`maxInfuse = 256` (default) and `infused` an int 0…256 (`ItemInfusable`). So the factor is a float
+**0…1**, the rate is `60 + (long)(60 × factor)` and the starting burn is
+`600 + (int)(600 × factor / 2.0f)` (5,400 ×… for a coal block). Both products are taken in single
+precision and **truncated** — `infused=1` gives 0 extra FE and +1 tick, which the unit tests pin.
+The directive's `60 × (1 + factor) × Δburn` is exactly this for the doctored factor 0.5 (90 FE a
+tick); the artefact's float cast is what the port implements.
+
+### What changed
+
+- `runtime.rs`: `infused_factor` (the int/256 with a 0…256 clamp), `generator_rf_per_tick` and
+  `infused_burn_ticks` (the two float rules), `Generator::{load_infused,tick_infused}`; `load`/`tick`
+  now delegate with factor 0. `restored` clamps a burn to `MAX_BURN = 8,100` (a full-infusion coal
+  block) instead of 5,400.
+- `support.rs`: `UPGRADE_SLOT = 2` (fuel 0, charge 1 unchanged), the `Infusable` component whose
+  field is `infused` (upstream's `ItemInfusable`) while the block-NBT key stays `"infusable"`
+  (upstream's `DefaultInfusable.save`); the component is registered in `component_types`; the click
+  checks the component before the energy capability; every tick reads the carrier's int, passes it
+  to both rules and saves it; the `info` line gains `carrier/infused/factor/rf`.
+- No content change: the carrier is an existing item and the component is installed by the code, so
+  `assemble_content.py` still re-derives the same 177 entries.
+
+### Red → green (unit, verbatim)
+
+`ports/_shared/evidence/rftoolspower/red-factor.log`: `test result: FAILED. 156 passed; 3 failed`,
+verbatim `not yet implemented: infused_burn_ticks is not written yet`,
+`not yet implemented: infused_factor is not written yet`,
+`not yet implemented: generator_rf_per_tick is not written yet`. Green: **160 passed; 0 failed**
+(`sdk-test.log`, regenerated after the final build and naming its sha).
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `Compiling rftoolspower (1 of 1)`; single-mod
+`native-0a875da-3d288b05a395`, two-mod e2e build `native-0a875da-44fd54c31c1d`
+(`native-mods.json` names **0.1.11**).
+
+| log | verdict |
+|---|---|
+| `e2e-factor.log` | **PASS**, `EXIT:0` — phases A–BX + BY/BZ + CA/CB |
+| `e2e-factor-selftest.log` | `FAIL: selftest: the infused generator made 3330 FE over 37 ticks (90 a tick), so asserting the un-infused 60 a tick fails — the assertion is alive`, `EXIT:1` |
+| `e2e-factor-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=35 ok=35 missing-exit=0 bad-exit=0` (all prior
+legs stay green; the two component-field probes are kept in `debug/`, outside the evidence tree).
+
+| phase | what it asserts (observed) |
+|---|---|
+| CA | a carrier with `infused=128` in slot 2 reads `carrier rftoolspower:power_core1, infused 128 factor 0.500 rf 90`; one coal starts `burning 744/750` (the reply's `burn_max=750 = 600 + 600×0.5/2`), and over two replies naming `t=242 → 279` the store rises `540 → 3,870` — **+3,330 = 90 × 37** |
+| CB | a generator with no carrier starts `600` ticks and over its own window makes exactly **60 × Δburn**; a stone clicked on slot 2 is refused, stays in the server's `Inventory`, and nothing is placed against the machine |
+
+Counterfactual: `SELFTEST=factor` asserts the un-infused 60 FE a tick on the infused machine and
+fails with `EXIT:1` naming the observed 90 — so CA's rate assertion can fail. CB is CA's differential
+(no carrier, no boost), and the control leg proves a fresh generator cannot even be placed without
+this package.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **The component field name, not the component id, was wrong first.** The `/give` carried
+   `{infused: 128}` (McJtyLib's `ItemInfusable` field), but the port decoded the compound under the
+   key `infusable` (the *block-NBT* key), so slot 2 held the carrier and read `infused 0`. Two
+   probes (`debug/probe-component-field.log`, `debug/probe-saved-nbt.log`) showed the stack's NBT and
+   the block NBT before the fix; the component field is now `infused` and the saved key `infusable`.
+2. **A shell variable named `CARRIER` is clobbered by `info`.** `info` `eval`s `parse_info.py`, which
+   now prints `CARRIER=<the slot-2 item>`; the e2e's local `CARRIER` (the item to give) became
+   `empty` and the click answered `Unknown item 'minecraft:empty'`. The local is `UPGRADE_ITEM`, and
+   the readout's `CARRIER` is now an assertion instead.
+3. **A shared launcher build lock** (`A native build or cache cleanup is running`) delayed one
+   rebuild while another port's build was in flight; the build was retried in-turn, not polled.
+4. The carrier is consumed into slot 2, so it is **not** in the player's inventory afterwards — the
+   "stays server-side" assertion belongs only to the refused stone (the slice-7/8 trap inverted here).
+
+### Upstream defects fixed
+
+None adopted: both float rules are upstream's own, including the truncating casts and the missing
+clamp on `getInfusedFactor`. Two *documented deviations*:
+
+- **No upgrade-item family.** Upstream's infusion is `ITEM_INFUSABLE` on the machine item, applied
+  when the machine is placed; this port carries the same int on an existing item in a third slot,
+  read every tick. A broken machine therefore loses its infusion (the engine keeps container items
+  apart from the `block_entity_data` payload — gap 8's shape) instead of carrying it on its item.
+- **The carrier is insert-only.** Upstream's implicit component cannot be pulled out of a slot; this
+  port's container marks slot 2 input-only while only the charge slot is an output.
+- **The `carrier/infused/factor/rf` fields in `info`** are harness additions (upstream has a GUI
+  readout), like the other readouts in this port.
+
+### Coverage of the infusable factor (slice 12)
+
+| family | state |
+|---|---|
+| the int component `rftoolspower:infusable_data`, its 0…256 clamp and round trip | tested (CA: given with `{infused:128}` and read back from slot 2; unit test pins the bare-int, compound, out-of-range and non-compound cases) |
+| the third slot and the click's component-first routing | tested (CA: the carrier lands in slot 2 and the readout names it; CB: a stone is refused, stays server-side and is not placed) |
+| `60 + (long)(60 × factor)` FE a tick | tested (CA: ΔE == 90 × Δburn over two replies' own `t=`; `SELFTEST=factor` inverts it and exits 1; unit test pins factor 0, 0.5, 1 and the 1/256 truncation) |
+| `600 + (int)(600 × factor / 2)` ticks (×9 for a coal block) | tested (CA: `burn_max=750`; unit test pins 600/750/900/601 and the coal block's 6,750/8,100) |
+| the un-infused differential | tested (CB: `burn_max=600` and ΔE == 60 × Δburn) |
+| persistence of the saved `infusable` int | not in game (the unit test pins the round trip; the carrier lives in the container, which does not ride on a broken item — documented deviation) |
+| the upgrade-item family and the machine-infuser GUI | not ported (gap 3's carrier is this port's own component on an existing item; no GUI at this tier) |
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
@@ -1727,8 +1858,11 @@ behaviour changes from the jar.
    in slice 11**: the pin's `horizon:item_energy` capability answers for a powercell item's
    `minecraft:block_entity_data` store, and `handleChargingItem` runs at the level tick's end (a
    block entity's item capability answers nothing during its own tick).
-3. **The infusable upgrade factor** (`getRfPerTick`'s `factor`, and the burn's `+burning*factor/2`).
-   Upstream's upgrade slot is McJtyLib's `DefaultInfusable`; the upgrade item family is not ported.
+3. ~~**The infusable upgrade factor** (`getRfPerTick`'s `factor`, and the burn's
+   `+burning*factor/2`)~~ — **ported in slice 12**: the pin has no infusable component, so the factor
+   is carried as this port's own int item component `rftoolspower:infusable_data={infused:N}`
+   (McJtyLib's 0…256 scale) in a third slot of the existing generator; the two float rules are
+   proved in game (CA/CB) with no new block, hook or upstream item.
 4. **The GUI and its redstone mode** (`GuiCoalGenerator`, `RedstoneMode` Ignored/Off/On). The port
    keeps upstream's default `IGNORED` (the machine always runs) and has no toggle.
 5. **The `lit=true` glow layer and the animated `coalgenerator_glow.png`** (see the deviations).
@@ -1849,7 +1983,7 @@ behaviour changes from the jar.
 | unknown id refused | tested (L) |
 | comparator output, TOP/Jade | not ported (gaps 4, 6) |
 | the GUI, the redstone toggle, the glow layer | not ported (gaps 4, 5) |
-| the charge-item slot, the infusable factor | the slot tested (BY/BZ, gap 2); the factor not ported (gap 3) |
+| the charge-item slot, the infusable factor | both tested: BY/BZ (gap 2) and CA/CB (gap 3 — carrier component, 750-tick burn and 90 FE a tick, the 60-a-tick differential, the stone refusal) |
 | the FE push into an adjacent energy handler, 2,000 a tick a neighbour | tested (R, against the harness receiver) |
 | the charge item: 1,000 FE a tick into an energy item, paid out of the store | tested (BY: the item's component rose 39,000 over 39 replies' ticks, 1,000 × Δt, and the store fell by exactly the same; BZ: a stone is refused and stays server-side; `SELFTEST=charge` inverts the rate) |
 | the recipe's craft | `blocked(rftoolsbase:machine_frame-absent)` (gap 7) |
@@ -1893,43 +2027,43 @@ behaviour changes from the jar.
 | the smart wrench, the GUI, the powercell card | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review (slices 1–11; slice 11 kept the charge rule in `runtime.rs` as a pure `charge_step` tested red-first, used `#[must_use]` constants with the jar value as the source, and re-read every gate's `PACKAGE` sha; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review (slices 1–12; slice 12 kept both infusion rules in `runtime.rs` as pure functions tested red-first, used `#[must_use]` with the artefact's float arithmetic as the source and narrow `#[expect(…, reason = …)]` for the two truncating casts, folded the carrier and its level into one semantic argument when clippy counted eight, and re-read every gate's `PACKAGE` sha; slice 11 kept the charge rule in `runtime.rs` as a pure `charge_step` tested red-first; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
 
-## Verification (slice 11 run — every compile gate forwarded to `AdLf-PC`)
+## Verification (slice 12 run — every compile gate forwarded to `AdLf-PC`)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **156 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the final package sha) |
+| `cargo test --offline` | **160 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the final package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 202,754 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.10 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `202754 bytes, SHA-256 acf020a0…` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 205,875 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.11 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `205875 bytes, SHA-256 12edfec1…` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits.log`) |
 | `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, R9 clean, no local `Block`/`Item` type |
-| the leg | `PASS` + `EXIT:0`; `SELFTEST=charge` `EXIT:1`; control `EXIT:1`; `--strict` 32/32 |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST=factor` `EXIT:1`; control `EXIT:1`; `--strict` 35/35 |
 
 Every SDK gate was run as `build-slot.sh run --job W1-rftoolspower --port ports/rftoolspower
 --step …` and the runner printed `build-slot: forwarding … to the remote runner`; the far hostname
 is `AdLf-PC`. The launcher game build and all three e2e legs stayed local (the exported instance,
 the offscreen renderer and the control game are here). No `BUILD_LOCAL=1` was used.
 
-The red proof is `ports/_shared/evidence/rftoolspower/red-chargeitem.log`: `test result: FAILED.
-152 passed; 4 failed`, every failure `not yet implemented: charge_step is not written yet`. The green
-`sdk-test.log` was regenerated **after** the final 0.1.10 build, so its `PACKAGE` line names
-`acf020a0…` / 202,754 B. The launcher's own build printed `Compiling rftoolspower (1 of 1)` and
-exported `native-0a875da-c77791f98fa0`; the two-mod e2e export is `native-0a875da-4936ffe0d492`
-(`native-mods.json` names version 0.1.10).
+The red proof is `ports/_shared/evidence/rftoolspower/red-factor.log`: `test result: FAILED.
+156 passed; 3 failed`, every failure `not yet implemented: … is not written yet`. The green
+`sdk-test.log` was regenerated **after** the final 0.1.11 build, so its `PACKAGE` line names
+`12edfec1…` / 205,875 B. The launcher's own build printed `Compiling rftoolspower (1 of 1)` and
+exported `native-0a875da-3d288b05a395`; the two-mod e2e export is `native-0a875da-44fd54c31c1d`
+(`native-mods.json` names version 0.1.11).
 
-## Artifact (0.1.10)
+## Artifact (0.1.11)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 202,754 B | `acf020a0636fdebc6f799d721a034dcebc75a1b20e4a2c134f191377ad18f2fb` | 154 |
+| `rftoolspower.hmod` (port root) | 205,875 B | `12edfec12d1537c8d72e4ff3dafbb789addbf684dce4d1667173cbcf3a2a65a9` | 154 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1 (`package matches the tree`, R9
-clean), and the three 0.1.10 legs ran on these bytes (their `PACKAGE` lines name them). The earlier
-0.1.9 artifact was 199,035 B / `1e6beecf…` / 154 entries.
+clean), and the three 0.1.11 legs ran on these bytes (their `PACKAGE` lines name them). The earlier
+0.1.10 artifact was 202,754 B / `acf020a0…` / 154 entries; 0.1.9 was 199,035 B / `1e6beecf…`.
 
 ## Artifact (0.1.8, historical)
 
@@ -1948,20 +2082,23 @@ artifact (141,168 B, `26485b9a…`, 105 entries) is the slice-6 record; the 0.1.
 
 ## Next slice
 
-- **Family:** the generator's **infusable upgrade factor** (`getRfPerTick`'s `factor` and the burn's
-  `+burning*factor/2`) — gap 3, the highest-value remaining generator rule now that gap 2 is
-  ported. It fits `machines`: the generator already has an item slot and a saved compound, and the
-  change is one more slot plus two integer rules in its tick, with no GUI, renderer or new hook.
-- **Gap line it comes from:** gap 3 — *"The infusable upgrade factor (`getRfPerTick`'s `factor`, and
-  the burn's `+burning*factor/2`). Upstream's upgrade slot is McJtyLib's `DefaultInfusable`; the
-  upgrade item family is not ported."*
-- **Gate before code:** grep the pinned SDK for an infusable component/capability (the pin has none
-  for McJtyLib's `DefaultInfusable`); if absent, carry the factor as this port's own int component on
-  a carried item, exactly as the blazing rod's data was carried, and stop with
-  `blocked(infusable-capability)` only if even that is impossible.
-- **In-game assertion that would prove it:** with a doctored upgrade item carrying a known factor
-  in slot 0 (the fuel slot moves to 1), seed a generator with a coal and read `/rftoolspower info
-  <pos> <nonce>` twice; assert `Δenergy == 60 * (1 + factor) * Δburn` from the two replies' own `t=`
-  and burn values, and the burn's starting value equals `600 + 600*factor/2`. A `SELFTEST=factor`
-  run asserts the un-infused `60 * Δburn` and exits 1; a stone in the upgrade slot is refused and
-  stays in the server's inventory.
+- **Family:** the **endergenic generator's infusable factors** — gap 10's remaining line, *"the
+  infusable factors in the hold and the gain (no upgrade slot in this port)"*. Now that slice 12 has
+  the component and the slot pattern, this is one more slot on an existing block entity and two
+  float rules in its existing tick, with no new block, hook or renderer. It fits `machines`.
+- **Gap line it comes from:** gap 10 — *"Still open in this family: … the infusable factors in the
+  hold and the gain (no upgrade slot in this port), and the 5-second statistics window the HUD
+  averages."* (the statistics window is a client HUD feature and stays out of tier).
+- **Artefact to follow (already read at `e44463ca`):** `EndergenicTileEntity.java:353` makes the hold
+  cost `(long)(500 × (3 − factor) / 3)` and `:579` makes the arrival gain
+  `(long)(rfPerHit[mode] × 2 × (factor + 2) / 2)`; both reuse `infused_factor` from `runtime.rs`.
+- **Gate before code:** confirm the same `rftoolspower:infusable_data` component works on the
+  injector's/endergenic's carried items (slice 12 proved it on `power_core1`); no SDK change is
+  expected. If the carrier cannot be clicked into the endergenic's third slot, stop with
+  `blocked(infusable-carrier)` rather than setting the factor by command.
+- **In-game assertion that would prove it:** with a carrier at `infused=256` (factor 1.0), a pearl
+  that lands at mode 1 must pay `gained == 600` (200 × 2 × 3/2) instead of the un-infused 200, read
+  from `/rftoolspower endergenic <pos> <nonce>`; a held pearl must spend `(long)(500 × 2/3) = 333`
+  a tick instead of 500 (`spent % Δt`), both computed from two replies' own values. A
+  `SELFTEST=enderfactor` run asserts the un-infused 200/500 and exits 1; a stone in the slot is
+  refused and stays server-side.
