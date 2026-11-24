@@ -2,7 +2,7 @@
 
 `assets/` and `data/` at the package root are generated from two jars by
 [`tools/assemble_content.py`](tools/assemble_content.py); rerun it to rebuild, or `--check` to
-re-derive into a temporary tree and compare (`ok: 127 entries re-derive exactly`). They ship inside
+re-derive into a temporary tree and compare (`ok: 177 entries re-derive exactly`). They ship inside
 the SDK package `rftoolspower.hmod`, beside `src/` and `horizon-mod.toml`.
 
 The two jars, both MIT, both already in this campaign's licence cache:
@@ -141,7 +141,7 @@ which this `machines` slice does not carry; the block model only names the base 
 | `coalgenerator_on.json` | the jar's parent is `rftoolsbase:block/rftoolsblock_glow`, a custom glow-overlay model with an animated `coalgenerator_glow.png`; the pin cannot run it, so the lit variant is the same cube. The `lit` state is real; the overlay is a recorded gap |
 | the advancement | the predicate rewritten to 26.3's `{"items": […]}` shape under `conditions` (the cell/core files already ship that shape) |
 | the cell recipes | the 1.21.1 `{"item": X}` ingredient objects become bare ids (`{"tag": T}` → `#T`) |
-| `cell2`'s recipe | **not carried**: McJtyLib's `copy_components` wrapper around a shaped recipe needing `power_core2`, whose recipe needs `rftoolsbase:dimensional_shard` — a parent item this build does not carry, so it could never craft |
+| `cell2`'s and `cell3`'s recipes | **not carried**: McJtyLib's `copy_components` wrapper around a shaped recipe needing `power_core2`/`power_core3`, whose ingredients include `rftoolsbase:dimensional_shard` — a parent item this build does not carry, so the wrappers could never craft (the cell2 precedent, see slice 10 for the plain core recipes that are carried) |
 | the lang | only the three keys this slice can show (block name, tab, shift line); upstream's GUI and tooltip strings are not carried because nothing reads them |
 
 ## Slice 7 — the blazing generator and the blazing rod
@@ -265,3 +265,32 @@ and the tick ignores one.
   ship: with only this package the pattern crafts nothing (`phase BE`). Its loot keeps the store
   (upstream copies `mcjtylib:item_energy`) but not the rods in its slots, which the engine keeps
   apart from the payload (gap 8's shape).
+
+## Slice 10 — the third powercell tier (`cell3`)
+
+The assembler's powercell loop now runs over `cell1`, `cell2` and `cell3`. The new files, all derived
+from the installed jar (nothing invented), are:
+
+| File | Why |
+|---|---|
+| `assets/rftoolspower/blockstates/cell3.json` | the jar's own single `""` variant (the same state/model shape as cell1/2) |
+| `assets/rftoolspower/models/block/cell3.json` | `cube_all` with the tier-3 texture `cellboth_t3` (the jar's model, parent qualified for 26.3) |
+| `assets/rftoolspower/models/item/cell3.json`, `assets/rftoolspower/items/cell3.json` | the item model and 26.3 item definition |
+| `assets/rftoolspower/textures/block/powercell/cellboth_t3.png{, .mcmeta}` | the jar's animated tier-3 texture, byte for byte, with its animation metadata |
+| `data/rftoolspower/horizon/block/cell3.json` | the same plain full cube as the other tiers (`minecraft:iron_block` template, hardness/blast 2.0, pickaxe, iron sound) |
+| `data/rftoolspower/loot_table/blocks/cell3.json` | the jar's block drop (`copy_name` kept; `copy_components` dropped — the FE rides on `block_entity_data`) |
+| `data/rftoolspower/recipe/power_core3.json` | the jar's plain `crafting_shaped` `"sds"/"rRr"/"ses"`; its `s` is `rftoolsbase:dimensionalshard`, so this build crafts nothing (phase BX) |
+| `data/rftoolspower/advancement/recipes/misc/power_core3.json` | the core3 recipe unlock, in the jar's own 26.3-shaped predicate form |
+| `assets/rftoolspower/models/item/power_core3.json`, `assets/rftoolspower/items/power_core3.json`, `assets/rftoolspower/textures/item/power_core3.png` | the core3 item model, 26.3 definition and the jar's texture |
+| `data/rftoolspower/horizon/item/power_core3.json` | the pure item needs its own declaration (`minecraft:stick` template), or `give` refuses the id (the slice-3 trap) |
+
+`assets/rftoolspower/lang/en_us.json` gains `block.rftoolspower.cell3` = "Powercell (High)" and
+`item.rftoolspower.power_core3` = "Power Core (High)"; both the mineable-pickaxe and needs-iron-tool
+tags and the creative tab gain `rftoolspower:cell3`, and the tab gains `power_core3`.
+
+**Not carried:** the jar's `data/rftoolspower/recipe/cell3.json` (and `cell2.json`) are
+`mcjtylib:copy_components` wrappers — a recipe type this build cannot run, whose inner recipes need
+the parent's `rftoolsbase:dimensional_shard`. Per the cell2 precedent a recipe that could never
+craft is not carried; the plain `power_core3` recipe is carried for the same reason the other plain
+recipes are, and the leg proves it crafts nothing here (phase BX). The tier numbers themselves
+(20,000,000 FE, 4,000 a side) come from `PowerCellConfig.class`, not from this content directory.

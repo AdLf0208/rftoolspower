@@ -107,6 +107,10 @@ const CELL1_TYPE_ID: &str = "rftoolspower:cell1_block_entity";
 pub(crate) const CELL2: &str = "rftoolspower:cell2";
 const CELL2_TYPE: &str = "cell2_block_entity";
 const CELL2_TYPE_ID: &str = "rftoolspower:cell2_block_entity";
+/// `rftoolspower:cell3`, the tier-3 cell (20,000,000 FE, 4,000 a side a tick).
+pub(crate) const CELL3: &str = "rftoolspower:cell3";
+const CELL3_TYPE: &str = "cell3_block_entity";
+const CELL3_TYPE_ID: &str = "rftoolspower:cell3_block_entity";
 /// The six face modes, saved as upstream's own six-digit string (`saveClientDataToNBT`).
 const KEY_MODE: &str = "mode";
 /// What a read where no cell stands answers.
@@ -173,6 +177,7 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     // plain buffer, so the handler is this port's.
     declare_cell(r, context, CELL1_TYPE, "cell1", CELL1, Tier::One);
     declare_cell(r, context, CELL2_TYPE, "cell2", CELL2, Tier::Two);
+    declare_cell(r, context, CELL3_TYPE, "cell3", CELL3, Tier::Three);
 
     // The endergenic generator: a type, the buffer the monitor reads (5,000,000 FE, nothing in or
     // out through the capability — it pushes on its own tick), its Part and its item's Part.
@@ -1694,6 +1699,16 @@ pub(crate) fn entity_data_patch(saved: &Compound, type_id: &str) -> Compound {
     patch
 }
 
+/// The saved block-entity type a broken cell's item names, by tier (`PowerCellModule`'s per-tier
+/// block entity registration, which the vanilla `block_entity_data` carrier must match).
+fn cell_type_id(tier: Tier) -> &'static str {
+    match tier {
+        Tier::One => CELL1_TYPE_ID,
+        Tier::Two => CELL2_TYPE_ID,
+        Tier::Three => CELL3_TYPE_ID,
+    }
+}
+
 /// `Hooks::block_drops`: a broken generator keeps its store on its own item, so a player who breaks
 /// a burning or charged generator and places it again does not lose the FE or the burn; a monitor
 /// keeps its configured alarm band the same way (upstream's `ITEM_POWER_MONITOR_DATA`), and a
@@ -1716,12 +1731,7 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
         }
         let mut payload = Compound::new();
         payload.insert(KEY_ENERGY.into(), Tag::Int(cell.energy));
-        let type_id = if tier == Tier::One {
-            CELL1_TYPE_ID
-        } else {
-            CELL2_TYPE_ID
-        };
-        entity_data_patch(&payload, type_id)
+        entity_data_patch(&payload, cell_type_id(tier))
     } else if block == GENERATOR {
         if !crate::runtime::carried(&read_generator(&Tag::Compound(saved.clone()))) {
             return Flow::Continue;
@@ -5533,6 +5543,17 @@ mod tests {
             data.get(KEY_MODE),
             None,
             "the face modes are client data and do not travel on the item"
+        );
+    }
+
+    #[test]
+    fn a_cell3_store_rides_on_its_own_block_entity_type() {
+        assert_eq!(cell_type_id(Tier::One), CELL1_TYPE_ID);
+        assert_eq!(cell_type_id(Tier::Two), CELL2_TYPE_ID);
+        assert_eq!(
+            cell_type_id(Tier::Three),
+            CELL3_TYPE_ID,
+            "a tier-3 cell's item names its own block entity type, not the tier-2 one"
         );
     }
 

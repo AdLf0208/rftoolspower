@@ -217,6 +217,7 @@ LANG = {
     "block.rftoolspower.power_level": "Power Level",
     "block.rftoolspower.cell1": "Powercell (Low)",
     "block.rftoolspower.cell2": "Powercell (Medium)",
+    "block.rftoolspower.cell3": "Powercell (High)",
     "block.rftoolspower.endergenic": "Endergenic",
     "block.rftoolspower.ender_monitor": "Ender Monitor",
     "block.rftoolspower.pearl_injector": "Pearl Injector",
@@ -224,6 +225,7 @@ LANG = {
     "block.rftoolspower.blazing_agitator": "Blazing Agitator",
     "block.rftoolspower.blazing_infuser": "Blazing Infuser",
     "item.rftoolspower.power_core1": "Power Core (Low)",
+    "item.rftoolspower.power_core3": "Power Core (High)",
     "item.rftoolspower.blazing_rod": "Blazing Rod",
     "itemGroup.rftoolspower": "RFTools Power",
     "message.rftoolspower.shiftmessage": "<Press Shift>",
@@ -237,6 +239,7 @@ CREATIVE_TAB = {
         "rftoolspower:power_level",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
+        "rftoolspower:cell3",
         "rftoolspower:endergenic",
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
@@ -245,6 +248,7 @@ CREATIVE_TAB = {
         "rftoolspower:blazing_infuser",
         "rftoolspower:blazing_rod",
         "rftoolspower:power_core1",
+        "rftoolspower:power_core3",
     ],
     "title": "itemGroup.rftoolspower",
 }
@@ -256,6 +260,7 @@ TAGS = {
         "rftoolspower:power_level",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
+        "rftoolspower:cell3",
         "rftoolspower:endergenic",
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
@@ -269,6 +274,7 @@ TAGS = {
         "rftoolspower:power_level",
         "rftoolspower:cell1",
         "rftoolspower:cell2",
+        "rftoolspower:cell3",
         "rftoolspower:endergenic",
         "rftoolspower:ender_monitor",
         "rftoolspower:pearl_injector",
@@ -613,12 +619,14 @@ def build(out: Path) -> None:
     write(out / f"data/rftoolspower/recipe/{MONITOR}.json", MONITOR_RECIPE)
     write(out / f"data/rftoolspower/advancement/recipes/misc/{MONITOR}.json", MONITOR_ADVANCEMENT)
 
-    # --- the powercells: tier 1 and tier 2, one plain cube each, and the power core that
-    # `cell1`'s recipe is built from. `cell2`'s own recipe is *not* carried: it is McJtyLib's
-    # `copy_components` wrapper around a shaped recipe needing `power_core2`, whose recipe needs
-    # `rftoolsbase:dimensional_shard` — a parent item this build does not carry, so it could never
-    # craft (recorded in notes.md).
-    for tier, name in ((1, "cell1"), (2, "cell2")):
+    # --- the powercells: tier 1, 2 and 3, one plain cube each, and the power cores that `cell1`
+    # and `power_core3` are built from. `cell2`/`cell3`'s own recipes are *not* carried: they are
+    # McJtyLib's `copy_components` wrappers around shaped recipes needing `power_core2`/`core3`,
+    # whose ingredients include `rftoolsbase:dimensional_shard` — a parent item this build does not
+    # carry, so those wrappers could never craft (the cell2 precedent, recorded in notes.md). The
+    # plain `crafting_shaped` recipe for `power_core3` *is* carried, exactly like the other items'
+    # plain recipes: the leg proves it crafts nothing here without that parent item.
+    for tier, name in ((1, "cell1"), (2, "cell2"), (3, "cell3")):
         write(
             out / f"assets/rftoolspower/blockstates/{name}.json",
             {"variants": {"": {"model": f"rftoolspower:block/{name}"}}},
@@ -675,6 +683,34 @@ def build(out: Path) -> None:
     binary(
         out / "assets/rftoolspower/textures/item/power_core1.png",
         read_jar(POWER, "assets/rftoolspower/textures/item/power_core1.png"),
+    )
+
+    # `power_core3` is the third tier's core: a plain shaped recipe from the jar (its
+    # `"sds"/"rRr"/"ses"` needs the parent's dimensional shard, so it crafts nothing in this build
+    # — proven in game like every other carried recipe with an absent parent ingredient). Its
+    # `copy_components` cell recipe is deliberately not carried.
+    write(out / "data/rftoolspower/recipe/power_core3.json", patched_recipe("power_core3"))
+    write(
+        out / "data/rftoolspower/advancement/recipes/misc/power_core3.json",
+        json.loads(
+            read_jar(POWER, "data/rftoolspower/advancement/recipes/misc/power_core3.json")
+        ),
+    )
+    write(
+        out / "assets/rftoolspower/models/item/power_core3.json",
+        {
+            "parent": "minecraft:item/handheld",
+            "textures": {"layer0": "rftoolspower:item/power_core3"},
+        },
+    )
+    write(
+        out / "assets/rftoolspower/items/power_core3.json",
+        {"model": {"model": "rftoolspower:item/power_core3", "type": "minecraft:model"}},
+    )
+    write(out / "data/rftoolspower/horizon/item/power_core3.json", {"template": "minecraft:stick"})
+    binary(
+        out / "assets/rftoolspower/textures/item/power_core3.png",
+        read_jar(POWER, "assets/rftoolspower/textures/item/power_core3.png"),
     )
 
     # --- the endergenic generator and the pearl injector: the two blocks of the endergenic

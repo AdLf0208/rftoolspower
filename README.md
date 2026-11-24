@@ -3,9 +3,9 @@
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.8**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.9**.
 
-Nine families so far:
+Nine families so far (the powercell family gained its third tier in slice 10):
 
 **The Coal Generator** (slice 1)
 
@@ -29,11 +29,12 @@ Nine families so far:
 - reads and sets the band through `/rftoolspower monitor <pos>` and
   `/rftoolspower band <pos> <min> <max>` — the harness's stand-in for upstream's GUI sliders.
 
-**The Powercell** (slice 3, `cell1`/`cell2`)
+**The Powercell** (slice 3 `cell1`/`cell2`, slice 10 `cell3`)
 
-- stores **500,000 FE** (tier 1) / **4,000,000 FE** (tier 2) per cell;
+- stores **500,000 FE** (tier 1) / **4,000,000 FE** (tier 2) / **20,000,000 FE** (tier 3) per cell;
 - has six face modes — `NONE` (a fresh cell, all six), `INPUT`, `OUTPUT` — and moves at most
-  **250 / 1,000 FE a tick a side**, plus 25 % of that per extra cell in its network;
+  **250 / 1,000 / 4,000 FE a tick a side**, plus 25 % of that per extra cell in its network
+  (a pair of tier-3 cells moves 5,000 a side);
 - shares one store and one capacity with **every adjacent powercell, of any tier** (upstream's
   `PowerCellNetwork` has no tier test): the capability answers the network's total, an insert fills
   the cell asked first, and a cell with an `OUTPUT` face pushes the network's FE out;

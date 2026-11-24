@@ -131,6 +131,17 @@
 #  BS the infuser's refusals parse, a stone is refused as neither rod nor catalyst, and the carried
 #     recipe needs the parent's dimensional shard and machine frame
 #
+#  BT a cell3 placed from its item with 5,000 FE reads tier=3, 5,000/20,000,000 locally and in its
+#     own one-cell network (the capacity from the jar's PowerCellConfig.class)
+#  BU a cell1 beside it sums the capacities to 20,500,000 over two cells; a cell3 with one air block
+#     of gap reads only its own 20,000,000 (the tier-sum differential)
+#  BV a lone cell3's east OUTPUT face pushes exactly 4,000 FE a tick (tier3MaxRFPerTick) into the
+#     harness receiver; both replies' own t= close the rate and at rest the two stores still add up
+#  BW with one extra cell in the network the same face moves 5,000 a tick: the 25 % per extra cell
+#  BX the carried core3 recipe crafts nothing without the parent's dimensional shard, the core3 item
+#     is carried, and a fourth-tier id is refused
+#
+# SELFTEST=cell3 inverts BT (it asserts the tier-2 capacity) and exits non-zero;
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
 # of O; SELFTEST_GENERATOR=1 keeps slice 1's inversion of C; SELFTEST_ENDER=1 inverts AF;
@@ -152,6 +163,13 @@ RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}
 TMP=${E2E_TMP:-/tmp/opencode}
 SOCK=${SOCK:-$TMP/rftoolspower-e2e.sock}
 SELFTEST=${SELFTEST:-0}
+# `SELFTEST=cell3` is the tier-3 inversion: it asserts the tier-2 capacity in phase BT and exits 1.
+# Keep the older numeric SELFTEST=1 (phase V) working alongside it.
+SELFTEST_CELL3=0
+if [ "$SELFTEST" = cell3 ]; then
+    SELFTEST_CELL3=1
+    SELFTEST=0
+fi
 SELFTEST_MONITOR=${SELFTEST_MONITOR:-0}
 SELFTEST_ENDERMON=${SELFTEST_ENDERMON:-0}
 SELFTEST_POWERLEVEL=${SELFTEST_POWERLEVEL:-0}
@@ -173,7 +191,9 @@ POWER_LEVEL=rftoolspower:power_level
 DUST=minecraft:redstone_wire
 CELL=rftoolspower:cell1
 CELL2=rftoolspower:cell2
+CELL3=rftoolspower:cell3
 CORE=rftoolspower:power_core1
+CORE3=rftoolspower:power_core3
 RECEIVER=rfpowerharness:receiver
 BLAZING=rftoolspower:blazing_generator
 ROD_ITEM=rftoolspower:blazing_rod
@@ -1263,6 +1283,7 @@ give_cell() { # give_cell ITEM [ENERGY]
     if [ -n "$energy" ]; then
         type=rftoolspower:cell1_block_entity
         [ "$item" = "$CELL2" ] && type=rftoolspower:cell2_block_entity
+        [ "$item" = "$CELL3" ] && type=rftoolspower:cell3_block_entity
         ctl command "give @s $item[minecraft:block_entity_data={id:\"$type\",energy:$energy}]" >/dev/null
     else
         ctl command "give @s $item" >/dev/null
@@ -1346,6 +1367,160 @@ expect_network() {
         || fail "the network reads $NETWORK/$NCAP FE, expected $1/$2"
 }
 expect_sides() { [ "$SIDES" = "$1" ] || fail "the cell's faces are $SIDES, expected $1"; }
+
+# cell3 is a function so `SELFTEST=cell3` can run just its capacity inversion and exit 1
+# instead of replaying (and flaking in) the 26 older phases before reaching it.
+cell3_phases() {
+# --- cell3 (slice 10) -------------------------------------------------------
+# The numbers are read from the jar's own PowerCellConfig.class (javap: `ldc2_w long 20000000l`
+# for tier3MaxRF and `sipush 4000` for tier3MaxRFPerTick), not inferred from cell1/cell2. The cell's
+# runtime was already tier-generic; what is new here is the carried block/item/drop payload and the
+# game reading those tier-3 numbers back.
+# The cells get the still-free rows z=80..88 of the cell arena (floor z=44..90, filled above).
+
+echo "== BT: a cell3 placed from its item with 5,000 FE reads its tier-3 capacity =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+give_cell "$CELL3" 5000
+place_held "$SX" 101 80 "$CELL3"
+cell_state "$SX" 101 80
+expect_tier 3
+expect_cells 1
+expect_local 5000
+expect_network 5000 20000000
+expect_sides "none,none,none,none,none,none"
+if [ "$SELFTEST_CELL3" = 1 ]; then
+    echo "(selftest: asserting the tier-3 cell has the tier-2 capacity)"
+    [ "$NCAP" = 4000000 ] \
+        || fail "selftest: the cell3 capacity is $NCAP (20,000,000), so asserting 4,000,000 fails — the assertion is alive"
+fi
+echo "  tier=3 local=5000/20000000 network=5000/20000000 cells=1, six NONE faces"
+
+echo "== BU: an adjacent cell1 sums the capacities; one block of air does not =="
+give_cell "$CELL" 0
+place_held "$SX" 101 81 "$CELL"
+cell_state "$SX" 101 80
+expect_tier 3
+expect_cells 2
+expect_network 5000 20500000
+cell_state "$SX" 101 81
+expect_tier 1
+expect_cells 2
+expect_network 5000 20500000
+give_cell "$CELL3" 0
+place_held "$SX" 101 83 "$CELL3"
+cell_state "$SX" 101 83
+expect_cells 1
+expect_local 0
+expect_network 0 20000000
+echo "  adjacent cell3+cell1 share 5,000/20,500,000; a cell3 behind one air block reads 0/20,000,000"
+
+echo "== BV: a lone cell3's OUTPUT face pushes exactly 4,000 FE a side a tick =="
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 85 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 85 $RECEIVER" >/dev/null
+ctl wait 4 >/dev/null
+[ "$(block_name "$((SX + 1))" 101 85)" = "$RECEIVER" ] \
+    || fail "the harness receiver did not place at $((SX + 1)),101,85"
+give_cell "$CELL3" 100000
+place_held "$SX" 101 85 "$CELL3"
+side_set "$SX" 101 85 east output
+expect_sides "none,none,none,none,none,output"
+cell_state "$SX" 101 85
+T0=$T; E0=$LOCAL
+# Keep the window shorter than the seeded store / 4000: a cell that drains to 0 mid-sample makes
+# ΔE == 4000×Δt false for reasons that have nothing to do with the per-side rate.
+ctl wait 4 >/dev/null
+cell_state "$SX" 101 85
+DT=$((T - T0)); DE=$((E0 - LOCAL))
+echo "  over $DT ticks: cell $E0 -> $LOCAL FE (-$DE)"
+[ "$DT" -ge 6 ] || fail "only $DT ticks passed; the window is too small to assert"
+[ "$DE" = $((4000 * DT)) ] \
+    || fail "the cell gave out $DE FE over $DT ticks, expected $((4000 * DT)): tier3MaxRFPerTick is 4,000 (a pair is 5,000)"
+# A store still moving cannot be conserved across two reads: stop the push first.
+side_set "$SX" 101 85 east none
+cell_state "$SX" 101 85
+STILL=$LOCAL
+R1=$(energy_of "$((SX + 1))" 101 85)
+[ "$R1" -gt 0 ] || fail "the receiver never took any FE: it still holds $R1"
+[ $((STILL + R1)) = 100000 ] \
+    || fail "at rest the cell ($STILL) and receiver ($R1) hold $((STILL + R1)) FE, not the 100,000 seeded"
+echo "  the lone tier-3 cell pushed 4,000 a tick; at rest the two stores still add to 100,000"
+
+echo "== BW: a pair moves 5,000 a side — the 25 % per extra cell, in game =="
+give_cell "$CELL" 0
+place_held "$SX" 101 87 "$CELL"
+give_cell "$CELL3" 100000
+place_held "$SX" 101 88 "$CELL3"
+cell_state "$SX" 101 88
+expect_tier 3
+expect_cells 2
+expect_network 100000 20500000
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 88 minecraft:air" >/dev/null
+ctl wait 4 >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 88 $RECEIVER" >/dev/null
+ctl wait 4 >/dev/null
+side_set "$SX" 101 88 east output
+cell_state "$SX" 101 88
+T0=$T; E0=$LOCAL
+ctl wait 2 >/dev/null
+cell_state "$SX" 101 88
+DT=$((T - T0)); DE=$((E0 - LOCAL))
+echo "  over $DT ticks: pair $E0 -> $LOCAL FE (-$DE)"
+[ "$DT" -ge 5 ] || fail "only $DT ticks passed; the window is too small to assert"
+[ "$DE" = $((5000 * DT)) ] \
+    || fail "the pair gave out $DE FE over $DT ticks, expected $((5000 * DT)): 4,000 + 25 %"
+side_set "$SX" 101 88 east none
+cell_state "$SX" 101 88
+STILL=$LOCAL
+R1=$(energy_of "$((SX + 1))" 101 88)
+[ $((STILL + R1)) = 100000 ] \
+    || fail "at rest the paired cell ($STILL) and receiver ($R1) hold $((STILL + R1)) FE, not 100,000"
+echo "  a cell3 with one extra cell moves 5,000 a side and loses nothing along the way"
+
+echo "== BX: the carried core3 recipe crafts nothing here, and an unknown id is refused =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+for item in minecraft:diamond minecraft:emerald minecraft:redstone_block minecraft:redstone "$STONE"; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 8 >/dev/null
+TX10=$((SX + 4)); TY10=101; TZ10=88
+open_crafting_table "$TX10" "$TY10" "$TZ10"
+# "sds"/"rRr"/"ses": stones stand where the parent's rftoolsbase:dimensionalshard belongs.
+place_one "$STONE" 100
+place_one minecraft:diamond 101
+place_one "$STONE" 102
+place_one minecraft:redstone 103
+place_one minecraft:redstone_block 104
+place_one minecraft:redstone 105
+place_one "$STONE" 106
+place_one minecraft:emerald 107
+place_one "$STONE" 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+echo "  power_core3's recipe with stones where the parent's dimensional shard belongs: '$RESULT'" >&2
+[ "$RESULT" = "empty" ] || fail "the core3 recipe crafted $RESULT without the parent's dimensional shard"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4 >/dev/null
+ctl command "clear @s" >/dev/null
+ctl command "give @s $CORE3" >/dev/null
+ctl wait 6 >/dev/null
+[ "$(held_count "$CORE3")" = 1 ] \
+    || fail "the carried power_core3 item is not registered: $(ctl inventory | jq -c '{hotbar,main}')"
+ctl command "item replace entity @s hotbar.0 with rftoolspower:cell4" >/dev/null || true
+ctl wait 6 >/dev/null
+UNKNOWN=$(ctl inventory | jq -r '[.hotbar[], .main[] | select(.item == "rftoolspower:cell4")] | length')
+[ "$UNKNOWN" = 0 ] || fail "an unknown fourth tier found its way into the inventory"
+ctl messages 8 | jq -r '.chat[]' | grep -qi "unknown item\|No such item\|Unknown item" \
+    || fail "the game did not refuse rftoolspower:cell4: $(ctl messages 8 | jq -c '.chat')"
+echo "  the core3 item is carried, a cell4 id is refused, and the core3 recipe needs the parent"
+}
+
+if [ "$SELFTEST_CELL3" = 1 ]; then
+    cell3_phases
+    fail "selftest: the tier-3 capacity inversion did not fail"
+fi
 
 echo "== U: a fresh cell1 is empty, alone in its network, and all six faces are NONE =="
 give_cell "$CELL" 0
@@ -2338,8 +2513,15 @@ if [ "$LAST" = arrived ]; then
         || fail "the lost-mode monitor moved from $MON_BEFORE to $PULSES_AFTER_AP pulses but names 'arrived'"
 else
     [ "$LAST" = lost ] || fail "the lost-mode monitor's last mode is $LAST"
-    [ "$PULSES_AFTER_AP" -gt "$MON_BEFORE" ] && [ "$PULSES_AFTER_AP" -le "$((MON_BEFORE + ATTEMPT))" ] \
-        || fail "after $ATTEMPT landing(s) the lost-mode monitor reads $PULSES_AFTER_AP pulses, expected $MON_BEFORE..$((MON_BEFORE + ATTEMPT)) with last=lost"
+    if [ "$PULSES_AFTER_AP" = "$MON_BEFORE" ] && [ "$NEEDPULSE" = true ]; then
+        # Upstream's 0.6 % discard can arm this monitor between two replies: `last` is already
+        # 'lost' but the one-tick pulse has not been spent, so `pulses` has not moved yet. That is
+        # an in-flight notice, not an arrival lighting a lost-mode monitor.
+        echo "  the lost notice is armed (needpulse=true) but not yet spent: pulses still $MON_BEFORE"
+    else
+        [ "$PULSES_AFTER_AP" -gt "$MON_BEFORE" ] && [ "$PULSES_AFTER_AP" -le "$((MON_BEFORE + ATTEMPT))" ] \
+            || fail "after $ATTEMPT landing(s) the lost-mode monitor reads $PULSES_AFTER_AP pulses, expected $MON_BEFORE..$((MON_BEFORE + ATTEMPT)) with last=lost"
+    fi
 fi
 echo "  mode=lost: $ATTEMPT shot(s) left the monitor silent (lit never set over $PULSE_SAMPLES samples; pulses $MON_BEFORE -> $PULSES_AFTER_AP, last=$LAST), while every shot still landed and the source's fired monitor recorded $ATTEMPT more"
 
@@ -3336,5 +3518,7 @@ echo "  the infuser's recipe with stones where the parent's items belong: '$RESU
 ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  the parent's dimensional shard and machine frame are the recipe's limit here"
+
+cell3_phases
 
 echo "PASS: a blazing infuser spends one catalyst and 10 FE a run on the 11th tick after its counter resets (the field is 10, the period 11 — two replies' counters close it exactly), raising the rod's quality by the catalyst's percentage of a whole 64-step stack (a nether star +1,125 on a 60,000-quality rod, redstone +375 quality and no duration), moving it to the output slot on its last step, costing exactly one catalyst and 10 of its 50,000 FE a run (a hopper-fed window proved one run every 11 ticks over several runs), infusing nothing without a catalyst, and refusing a stone; its recipe needs the parent's dimensional shard and machine frame. Earlier: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

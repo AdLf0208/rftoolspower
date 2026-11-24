@@ -4,6 +4,7 @@
   "block.rftoolspower.blazing_infuser": "Blazing Infuser",
   "block.rftoolspower.cell1": "Powercell (Low)",
   "block.rftoolspower.cell2": "Powercell (Medium)",
+  "block.rftoolspower.cell3": "Powercell (High)",
   "block.rftoolspower.coalgenerator": "Coal Generator",
   "block.rftoolspower.ender_monitor": "Ender Monitor",
   "block.rftoolspower.endergenic": "Endergenic",
@@ -12,6 +13,7 @@
   "block.rftoolspower.power_monitor": "Power Monitor",
   "item.rftoolspower.blazing_rod": "Blazing Rod",
   "item.rftoolspower.power_core1": "Power Core (Low)",
+  "item.rftoolspower.power_core3": "Power Core (High)",
   "itemGroup.rftoolspower": "RFTools Power",
   "message.rftoolspower.shiftmessage": "<Press Shift>"
 }

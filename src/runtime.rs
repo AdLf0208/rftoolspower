@@ -2490,6 +2490,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tier_three_cell_moves_four_thousand_a_side_and_five_in_a_pair() {
+        assert_eq!(rf_per_tick(Tier::Three, 1), 4_000, "tier3MaxRFPerTick");
+        assert_eq!(
+            rf_per_tick(Tier::Three, 2),
+            5_000,
+            "4,000 + 25 % of 4,000 for the extra cell"
+        );
+        let mut lone = [cell(Tier::Three, 0)];
+        assert_eq!(receive(&mut lone, 100_000), 4_000);
+        let mut pair = [cell(Tier::Three, 0), cell(Tier::One, 0)];
+        assert_eq!(receive(&mut pair, 100_000), 5_000);
+    }
+
+    #[test]
     fn a_full_cell_passes_the_rest_of_its_budget_to_the_network() {
         let mut network = [cell(Tier::One, 500_000), cell(Tier::One, 499_000)];
         assert_eq!(

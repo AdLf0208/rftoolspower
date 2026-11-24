@@ -138,3 +138,24 @@ Two facts this slice measured against the artefact rather than the brief:
   `(0 − rft)/30` a tick, and `total` keeps adding `(int)rft`, so `working` stays true for ~120
   ticks after the 400th; the store stops rising only then. The leg asserts the empty slot at the
   400th tick and the fall of `working` after the decay, not an instant one.
+
+## Slice 10: the third tier, read from the jar's own config class
+
+No source clone was needed for this slice: the numbers were read directly from the installed jar
+(`rftoolspower-1.21-7.0.6.jar`) with `javap -c -p` on
+`mcjty/rftoolspower/modules/powercell/PowerCellConfig.class`:
+
+- `ldc2_w #51 // long 20000000l` immediately before `putstatic … TIER3_MAXRF` at the comment
+  `Maximum RF a single tier3 cell can hold` → **tier3MaxRF = 20,000,000 FE**;
+- `sipush 4000` immediately before `putstatic … TIER3_RFPERTICK` at the comment
+  `Maximum RF/tick per side for a tier3 cell` → **tier3MaxRFPerTick = 4,000 FE a side a tick**.
+
+The constant-pool longs for the other two capacities (`500000`, `4000000`) are present in the same
+class, so the three tiers are read on one footing. The recipe shapes came from the jar's JSON:
+`data/rftoolspower/recipe/cell3.json` is a `mcjtylib:copy_components` wrapper with an inner
+`"rKr"/"KPK"/"rKr"` pattern (`K` = `power_core3`, `P` = `cell2`), and `power_core3.json` is a plain
+`crafting_shaped` `"sds"/"rRr"/"ses"` where `s` = `rftoolsbase:dimensionalshard`. The wrapper is not
+carried (it could never craft here); the plain core recipe is, with the leg proving it crafts
+nothing without the parent. The tier-3 runtime itself needed no new logic — `Tier::Three` and the
+generic capacity/per-side/network functions were already written in slice 3; what was missing was
+the carried block/item, the third `declare_cell` registration and the per-tier drop type id.

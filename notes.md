@@ -1,15 +1,16 @@
 # RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
 # powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor;
 # slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator;
-# slice 9: the blazing infuser)
+# slice 9: the blazing infuser; slice 10: `cell3`)
 
-> **Current state (2026-11-23): slice 9, package 0.1.8 at pin
+> **Current state (2026-11-24): slice 10, package 0.1.9 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
 > generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
 > (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
 > entity with a 500,000 / 4,000,000 FE buffer, six face modes that default to `NONE`, an adjacency
 > **network** that shares one store and capacity across cells of any tier, and the output push out
-> of an `OUTPUT` face; slice 4 adds the mod's signature mechanic, the **endergenic generator** with
+> of an `OUTPUT` face — slice 10 adds the third tier, `cell3` (20,000,000 FE, 4,000 a side, 5,000 in
+> a pair); slice 4 adds the mod's signature mechanic, the **endergenic generator** with
 > its **pearl injector**: two linked generators, a redstone pulse that starts a 15-mode charge and
 > one that fires the held pearl, and the `rfPerHit` table that pays 200…25,600 FE for a pearl that
 > lands inside the window (and nothing for one that lands outside it); slice 5 adds the **ender
@@ -71,7 +72,7 @@ current pin. The gap list below is the rest of the mod.
   upstream's own default — so the command reproduces the wrench's state machine, not a behaviour
   the mod does not have.
 - `cell2` is carried because the network's tier behaviour needs a second capacity to be observable;
-  `cell3` is not (gap 9).
+  `cell3` was added in slice 10 for the same reason (its own numbers, not a copy of the other tiers').
 
 ## Class + tier and the approach
 
@@ -1524,6 +1525,94 @@ then the catalyst, then the writes, then the move) are upstream's own. Two *docu
 | the recipe | `blocked(rftoolsbase:machine_frame-absent, rftoolsbase:dimensionalshard-absent, #c:rods/blaze-absent, #c:ingots/iron-absent)` (BS proves the pattern crafts nothing) |
 | the GUI, the renderer, TOP/Jade | not ported (no GUI or renderer at this tier; the command is the readout) |
 
+## Slice 10 — the third powercell tier, `cell3` (package 0.1.9)
+
+Gap line it comes from (`## Gaps` below): **gap 9** — *"Still open: **`cell3`** (20,000,000 FE,
+4,000 FE a side — the same code with a third content block and recipe)"*. Tier: still **machines**
+— one content block and item with the already-proven tier-generic block-entity Part, buffer, face
+modes and adjacency network. No new API, no renderer, no GUI.
+
+### The tier numbers, read from the artefact
+
+`javap -c -p` of `mcjty/rftoolspower/modules/powercell/PowerCellConfig.class` in the installed jar
+(`rftoolspower-1.21-7.0.6.jar`): `ldc2_w #51 // long 20000000l` at `tier3MaxRF` → **20,000,000 FE**;
+`sipush 4000` at `tier3MaxRFPerTick` → **4,000 FE a side a tick**. They were not inferred from
+`cell1`/`cell2`. The jar's `data/rftoolspower/recipe/cell3.json` is a `mcjtylib:copy_components`
+wrapper around a shaped recipe needing `power_core3` and `cell2`; `power_core3.json` is a plain
+`crafting_shaped` whose `s` is `rftoolsbase:dimensionalshard`. Per the **cell2 precedent** the
+wrapper recipe is not carried (it could never craft here), but the plain `power_core3` recipe,
+item, model, texture and advancement are — like every other plain recipe with an absent parent
+ingredient, proven uncraftable in game.
+
+### What changed
+
+- `src/support.rs`: `CELL3`/`CELL3_TYPE`/`CELL3_TYPE_ID`, a third `declare_cell(...)` call, and the
+  per-tier `cell_type_id(tier)` used by `block_drops` (the previous `if One else Two` mislabelled a
+  broken cell3's item as a cell2).
+- `src/runtime.rs`: a test pinning `rf_per_tick(Three, 1) == 4,000` and `rf_per_tick(Three, 2) ==
+  5,000` — the jar's 25 % per extra cell; the tier's capacity/per-side/suffix were already covered.
+- `tools/assemble_content.py`: tier-3 block, item, models, animated textures, loot table, tags,
+  creative tab, lang, plus the carried `power_core3`; `--check` re-derives all 177 entries.
+- `tools/e2e.sh`: phases BT–BX. The cell3 phases are a function so `SELFTEST=cell3` runs the
+  capacity inversion directly instead of replaying the 26 older (and occasionally flaky) phases.
+
+### Red → green
+
+The failing rule is the broken cell's saved type id: the red run
+(`ports/_shared/evidence/rftoolspower/red-cell3.log`) is
+`test result: FAILED. 150 passed; 1 failed` with, verbatim:
+
+```
+not yet implemented: cell3's saved block entity type is not written yet
+```
+
+The tier-rates test was added green (the runtime was already tier-generic); the red is the new
+glue. Green after the fix: **152 passed; 0 failed** (`sdk-test.log`, regenerated after the 0.1.9
+build so its `PACKAGE` line names `1e6beecf…`).
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+| log | verdict |
+|---|---|
+| `e2e-cell3.log` | **PASS**, `EXIT:0` — A–BS plus BT–BX, all 26 older legs still green |
+| `e2e-cell3-selftest.log` | `FAIL: selftest: the cell3 capacity is 20000000 (20,000,000), so asserting 4,000,000 fails — the assertion is alive`, `EXIT:1` |
+| `e2e-cell3-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` (the unmodded Nightly) |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=29 ok=29 missing-exit=0 bad-exit=0`.
+
+| phase | what it asserts (observed) |
+|---|---|
+| BT | a cell3 placed from its item with 5,000 reads `tier=3 local=5000/20000000 network=5000/20000000 cells=1 sides=none,×6`; `SELFTEST=cell3` asserts 4,000,000 here and fails |
+| BU | a cell1 beside it: both read `network=5000/20500000 cells=2` (local 5,000 + 0); a cell3 behind one air block reads `0/20000000 cells=1` — the tier-sum differential |
+| BV | east OUTPUT beside the receiver: over **9 ticks** the cell fell `76,000 → 40,000`, exactly `4,000 × 9`; after `east none`, cell `12,000` + receiver `88,000` = the **100,000** seeded |
+| BW | with one extra cell in the network: over **8 ticks** the cell fell `65,000 → 25,000`, exactly `5,000 × 8`; at rest cell 0 + receiver 100,000 = 100,000 |
+| BX | the carried core3 recipe with stones where the parent's dimensional shard belongs crafts nothing; `give @s rftoolspower:power_core3` works (the `horizon/item` declaration); `rftoolspower:cell4` is refused |
+
+Counterfactual: `SELFTEST=cell3` inverts BT's capacity and exits 1; BU/BV's gap and conservation
+are the differentials. The control leg proves BT is not vacuous.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **A store that can drain inside the sampling window cannot assert a rate.** The first BV attempt
+   seeded 100,000 and waited 16 ticks; the cell hit 0 after ~19 ticks and the equality failed
+   (`ΔE = 76,000` against `4,000 × 23`). The window is now `ctl wait 4` (9 ticks observed) so the
+   store is still moving at both reads; the failed log is kept outside the evidence tree.
+2. **Two timing flakes in the older leg blocked the selftest from reaching BT.** Phase AP read an
+   armed-but-unspent `lost` notice (needs `last=lost` with `pulses` unchanged); BR counted 14 of 16
+   seeded stars when two were in flight between the hopper and slot reads. The focused selftest
+   avoids replaying them; AP's in-flight case is now accepted as upstream's random discard.
+3. **Stale `native-*` tags.** The previous 0.1.8 two-mod tag was deleted before building so the
+   launcher could not select it. The new single-mod tag is `native-0a875da-2297fa36feae` and the
+   two-mod e2e build is `native-0a875da-c0540063b510` (`native-mods.json` names 0.1.9).
+
+### Upstream defects fixed (slice 10)
+
+None adopted (the cell's runtime was already correct). Two *documented* decisions: the `cell3`
+`copy_components` wrapper is not carried (the cell2 precedent — a recipe that could never craft),
+while its plain `power_core3` recipe is carried and proven uncraftable without the parent's
+`rftoolsbase:dimensionalshard`; and the connected-cell `upper`/`lower` models stay omitted (the
+slice-3 simplification).
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
@@ -1545,12 +1634,14 @@ then the catalyst, then the writes, then the move) are upstream's own. Two *docu
    payload is the saved compound (the store); the engine keeps container items apart from it, and
    upstream copies them through its own `item_inventory` component. A user notices: a broken
    fuelled generator keeps its FE but not its coal.
-9. ~~**The powercell (`cell1/2/3`)**~~ — **ported in slice 3 for `cell1` and `cell2`** (the block,
-   the buffer, the six face modes, the adjacency network and the output push; the wrench's mode
-   toggle is the `/rftoolspower side` command, which needs no carrier). Still open: **`cell3`**
-   (20,000,000 FE, 4,000 FE a side — the same code with a third content block and recipe), the
-   **smart-wrench item** itself (`rftoolsbase:smartwrench`, `ports/rftoolsbase` gap 12), the
-   **powercell GUI** and the **powercell card**'s dimensional-cell linking.
+9. ~~**The powercell (`cell1/2/3`)**~~ — **ported in slice 3 for `cell1`/`cell2` and slice 10 for
+   `cell3`** (the block, the buffer, the six face modes, the adjacency network and the output push;
+   the wrench's mode toggle is the `/rftoolspower side` command, which needs no carrier). The tier-3
+   numbers came from the jar's `PowerCellConfig.class` (20,000,000 FE, 4,000 a side). Still open:
+   the **smart-wrench item** itself (`rftoolsbase:smartwrench`, `ports/rftoolsbase` gap 12), the
+   **powercell GUI** and the **powercell card**'s dimensional-cell linking. `cell3`'s own
+   `copy_components` recipe is deliberately not carried (the cell2 precedent); its plain
+   `power_core3` recipe is carried and proven uncraftable without the parent's dimensional shard.
 10. ~~**The endergenic generator with the pearl injector**~~ — **ported in slice 4** (the charge
     window, the hit table, the flight, the hold, the link, the push with its 2,000 FE reserve, and
     the injector's 18-slot buffer; the wrench's link is the `/rftoolspower enderlink` command).
@@ -1675,8 +1766,8 @@ then the catalyst, then the writes, then the move) are upstream's own. Two *docu
 
 | family | state |
 |---|---|
-| `cell1`/`cell2`: block, item, plain-cube model, animated texture, tags, creative tab, lang | tested (U: placed, read the six faces and the store back; Y: a cell2 placed) |
-| the 500,000 / 4,000,000 FE buffer, per tier, through the network | tested (U, X, Y; unit tests pin all three tiers) |
+| `cell1`/`cell2`/`cell3`: block, item, plain-cube model, animated texture, tags, creative tab, lang | tested (U: placed, read the six faces and the store back; Y: a cell2; BT: a cell3 placed from its item with 5,000 FE reads `tier=3 local=5000/20000000 network=5000/20000000 cells=1`) |
+| the 500,000 / 4,000,000 / 20,000,000 FE buffer, per tier, through the network | tested (U, X, Y, BT, BU; unit tests pin all three tiers from `PowerCellConfig`) |
 | the six face modes, all `NONE` on a fresh cell | tested (U: `sides=none,×6`; V: a `NONE` face refuses 100,000 FE over 40 ticks) |
 | INPUT: exactly 250 a tick for a lone tier-1 cell, 312 for a pair | tested (W: `ΔE == 250 × Δt` on both stores; unit tests pin 250 and 312) |
 | OUTPUT: 250 a tick out of one face, from the network's store | tested (Z: `−7,250` over 29 ticks; at rest the two stores still add to 100,000) |
@@ -1690,36 +1781,55 @@ then the catalyst, then the writes, then the move) are upstream's own. Two *docu
 | `cell1`'s recipe | `blocked(rftoolsbase:machine_frame-absent)` (AC proves the pattern crafts nothing) |
 | the power core's recipe | tested (AC: crafts once, consumes its diamond, redstone block and three redstones) |
 | `cell2`'s recipe | not ported: McJtyLib's `copy_components` wrapper needs `power_core2`, whose recipe needs `rftoolsbase:dimensional_shard` (the parent) — it could never craft here, so it is not carried |
-| the smart wrench, the GUI, the powercell card, `cell3` | not ported (gap 9) |
+| `cell3`: 20,000,000 FE capacity and 4,000 a side (5,000 in a pair) | tested (BT: 5,000/20,000,000; BU: a cell3 beside a cell1 shares 5,000/20,500,000 over two cells, a cell3 with an air gap reads 0/20,000,000; BV: a lone cell3's OUTPUT moves `4,000 × Δt` from the two replies' own `t=`, receiver gains the same; BW: a pair moves `5,000 × Δt`; `SELFTEST=cell3` inverts BT) |
+| the carried `power_core3` recipe and item | tested (BX: the plain recipe with stones where `rftoolsbase:dimensionalshard` belongs crafts nothing; `give @s rftoolspower:power_core3` works; `rftoolspower:cell4` is refused). `cell3`'s `copy_components` recipe is not carried (cell2 precedent) |
+| the smart wrench, the GUI, the powercell card | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–9; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–10; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
 
-## Verification (slice 9 run)
+## Verification (slice 10 run — every compile gate forwarded to `AdLf-PC`)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **150 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **152 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 188,685 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.8 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `188685 bytes, SHA-256 49885b17…` (`sdk-check.log`) |
-| `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `made for` / `fits` (`sdk-fits.log`) |
-| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 140 entries |
-| `tools/assemble_content.py --check` | `ok: 163 entries re-derive exactly` |
-| the leg | `PASS` + `EXIT:0`; `SELFTEST_INFUSER=1` `EXIT:1`; control `EXIT:1`; `--strict` 26/26 |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 199,035 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.9 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `199035 bytes, SHA-256 1e6beecf…` (`sdk-check.log`) |
+| `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits.log`) |
+| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 154 entries, R9 clean |
+| `tools/assemble_content.py --check` | `ok: 177 entries re-derive exactly` |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST=cell3` `EXIT:1`; control `EXIT:1`; `--strict` 29/29 |
+
+Every SDK gate was run as `build-slot.sh run --job G11-rftoolspower --port ports/rftoolspower
+--step …` and the runner printed `build-slot: forwarding … to the remote runner`; the hostname is
+`AdLf-PC`. The launcher game build and all three e2e legs stayed local (the exported instance, the
+offscreen renderer and the control game are on this box). No `BUILD_LOCAL=1` was used.
 
 The red proof for slice 9's rules is `ports/_shared/evidence/rftoolspower/red-infuser.log`:
-`test result: FAILED. 132 passed; 12 failed`, every failure `not yet implemented`. The green
-`sdk-test.log` was regenerated **after** the 0.1.8 build, so its `PACKAGE` line names `49885b17…` /
-188,685 B. The launcher's own build printed `Compiling rftoolspower (1 of 1)` and exported
-`native-0a875da-8f913c1a928e` (`native-mods.json` names version 0.1.8).
+`test result: FAILED. 132 passed; 12 failed`, every failure `not yet implemented`. The slice-10 red
+proof is `red-cell3.log`: `FAILED. 150 passed; 1 failed`, `not yet implemented: cell3's saved block
+entity type is not written yet`. The green `sdk-test.log` was regenerated **after** the 0.1.9 build,
+so its `PACKAGE` line names `1e6beecf…` / 199,035 B. The launcher's own build printed `Compiling
+rftoolspower (1 of 1)` and exported `native-0a875da-2297fa36feae`; the two-mod e2e export is
+`native-0a875da-c0540063b510` (`native-mods.json` names version 0.1.9).
 
-## Artifact (0.1.8)
+## Artifact (0.1.9)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 188,685 B | `49885b17eefb49dc54ae8cb400a05a85f6125201d09f0bef564fdc1a26bb559d` | 140 |
+| `rftoolspower.hmod` (port root) | 199,035 B | `1e6beecff03678042053c3a4d2bc52fded2c1bc41cbe2984ebbc876bbe16bb35` | 154 |
+
+Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
+`check` green, both `fits` green, `verify-sdk-package.py` 1/1 (`package matches the tree`, R9
+clean), and the three 0.1.9 legs ran on these bytes (their `PACKAGE` lines name them).
+
+## Artifact (0.1.8, historical)
+
+| File | Size | SHA-256 | Entries |
+|---|---:|---|---:|
+| `rftoolspower.hmod` (0.1.8 record) | 188,685 B | `49885b17eefb49dc54ae8cb400a05a85f6125201d09f0bef564fdc1a26bb559d` | 140 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1 (including `package matches the
