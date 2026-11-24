@@ -76,6 +76,57 @@ pub fn infused_burn_ticks(fuel: Fuel, infused: i32) -> u32 {
     base.saturating_add(bonus)
 }
 
+/// The FE one tick of holding an endergenic pearl costs at a given infusion
+/// (`EndergenicTileEntity.java:353`, `1.21_neo` @ `e44463ca`):
+/// `rf = (long)(rf * (3.0f - factor) / 3.0f)` with `rf = rfToHoldPearl` (500).
+/// Single precision and a truncating cast, as upstream's `float factor` forces.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "upstream's rfToHoldPearl is 500, exactly representable as a float"
+)]
+#[must_use]
+pub fn endergenic_hold_cost(infused: i32) -> i32 {
+    let cost = RF_TO_HOLD as f32 * (3.0f32 - infused_factor(infused)) / 3.0f32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "upstream casts (long)(rf * (3 - factor) / 3) with factor in 0..1"
+    )]
+    let cost = cost as i64;
+    i32::try_from(cost).unwrap_or(i32::MAX)
+}
+
+/// The FE a pearl arriving at `mode`/`age` pays at a given infusion
+/// (`EndergenicTileEntity.java:578-579`, the same commit): two truncations,
+/// `(long)(rfPerHit[mode] * powergenFactor)` then `(long)(rf * (factor + 2.0f) / 2.0f)`,
+/// before the age bonus. Factor 1 at mode 1 is **300**, not 600: the `x2` is
+/// powergenFactor, applied once.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the table's biggest value times powergenFactor is 25,600, exact as a float"
+)]
+#[must_use]
+pub fn endergenic_pearl_gain(mode: i32, age: i32, infused: i32) -> i32 {
+    if mode <= IDLE || mode > MAX_CHARGE {
+        return 0;
+    }
+    let index = usize::try_from(mode).unwrap_or(0);
+    let table = RF_PER_HIT.get(index).copied().unwrap_or(0);
+    // :578 - `long rf = (long)(rfPerHit[chargingMode] * powergenFactor.get());`
+    let base = table * POWERGEN_FACTOR;
+    // :579 - `rf = (long)(rf * (infusable.getInfusedFactor() + 2.0f) / 2.0f);`
+    let scaled = base as f32 * (infused_factor(infused) + 2.0f32) / 2.0f32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "upstream casts (long)(rf * (factor + 2) / 2) with factor in 0..1"
+    )]
+    let scaled = scaled as i64;
+    let mut rf = i32::try_from(scaled).unwrap_or(i32::MAX);
+    // The age bonus is applied after the infusion step, exactly as upstream's lines 581-586.
+    let bonus = (age.max(0) * AGE_STEP).min(AGE_CAP);
+    rf += rf * bonus / 100;
+    rf
+}
+
 /// What the generator offers the charge-slot item this tick (upstream
 /// `handleChargingItem`: `min(CHARGEITEMPERTICK, storedPower)`, then the item's
 /// own handler caps it at its remaining room).
@@ -1004,13 +1055,19 @@ impl Endergenic {
         }
     }
 
-    /// Pay [`RF_TO_HOLD`]; false when the store cannot, which loses the pearl.
+    /// Pay [`RF_TO_HOLD`] with no infusion; false when the store cannot.
     pub fn hold(&mut self) -> bool {
-        if self.energy < RF_TO_HOLD {
+        self.hold_infused(0)
+    }
+
+    /// Pay one tick's [`endergenic_hold_cost`]; false when the store cannot, which loses the pearl.
+    pub fn hold_infused(&mut self, infused: i32) -> bool {
+        let cost = endergenic_hold_cost(infused);
+        if self.energy < cost {
             return false;
         }
-        self.energy -= RF_TO_HOLD;
-        self.spent += i64::from(RF_TO_HOLD);
+        self.energy -= cost;
+        self.spent += i64::from(cost);
         true
     }
 
@@ -1040,22 +1097,21 @@ impl Endergenic {
         true
     }
 
-    /// The FE a pearl arriving at `mode` with `age` is worth: the table times the powergen
-    /// factor, plus up to a doubling for the pearl's age (upstream's `receivePearl`).
+    /// The FE a pearl arriving at `mode` with `age` is worth, with no infusion.
     #[must_use]
     pub fn gain(mode: i32, age: i32) -> i32 {
-        if mode <= IDLE || mode > MAX_CHARGE {
-            return 0;
-        }
-        let index = usize::try_from(mode).unwrap_or(0);
-        let base = RF_PER_HIT.get(index).copied().unwrap_or(0) * POWERGEN_FACTOR;
-        let bonus = (age.max(0) * AGE_STEP).min(AGE_CAP);
-        base + base * bonus / 100
+        endergenic_pearl_gain(mode, age, 0)
     }
 
-    /// A pearl arrives (`receivePearl`): inside the window it pays and the generator starts
-    /// holding; at idle or while already holding both pearls are lost and nothing is paid.
+    /// A pearl arrives with no infusion (`receivePearl`).
     pub fn receive(&mut self, age: i32) -> Option<i32> {
+        self.receive_infused(age, 0)
+    }
+
+    /// A pearl arrives at a given infusion: inside the window it pays the artefact's two-step
+    /// float gain and the generator starts holding; at idle or while already holding both pearls
+    /// are lost and nothing is paid.
+    pub fn receive_infused(&mut self, age: i32, infused: i32) -> Option<i32> {
         match self.charging {
             HOLDING => {
                 self.discard(Loss::WhileHolding);
@@ -1067,7 +1123,7 @@ impl Endergenic {
             }
             mode => {
                 self.arrived_at = mode;
-                let gained = Self::gain(mode, age);
+                let gained = endergenic_pearl_gain(mode, age, infused);
                 self.gained += i64::from(gained);
                 self.energy = clamp_endergenic(self.energy.saturating_add(gained));
                 self.charging = HOLDING;
@@ -2726,6 +2782,54 @@ mod tests {
     // --- the endergenic generator -------------------------------------------------------------
 
     #[test]
+    fn an_infused_hold_costs_333_a_tick_not_500() {
+        // EndergenicTileEntity.java:353: rf = (long)(500 * (3 - factor) / 3).
+        assert_eq!(endergenic_hold_cost(0), 500, "un-infused is upstream's 500");
+        assert_eq!(
+            endergenic_hold_cost(MAX_INFUSE),
+            333,
+            "factor 1: (long)(500*2/3)"
+        );
+        assert_eq!(
+            endergenic_hold_cost(128),
+            416,
+            "factor 0.5: (long)(500*2.5/3)"
+        );
+    }
+
+    #[test]
+    fn an_infused_pearl_pays_the_artefacts_two_step_float_gain() {
+        // EndergenicTileEntity.java:578-579: (long)(rfPerHit[mode]*2), then
+        // (long)(rf*(factor+2)/2). The dispatch prose's 600 double-counts powergenFactor.
+        assert_eq!(endergenic_pearl_gain(1, 0, 0), 200, "mode 1: 100*2");
+        assert_eq!(
+            endergenic_pearl_gain(1, 0, MAX_INFUSE),
+            300,
+            "factor 1: (long)(200*3/2) = 300, NOT 600"
+        );
+        assert_eq!(
+            endergenic_pearl_gain(1, 0, 128),
+            250,
+            "factor 0.5: (long)(200*2.5/2)"
+        );
+        assert_eq!(
+            endergenic_pearl_gain(10, 0, MAX_INFUSE),
+            38_400,
+            "mode 10: (long)(25,600*3/2)"
+        );
+        assert_eq!(
+            endergenic_pearl_gain(0, 0, MAX_INFUSE),
+            0,
+            "idle pays nothing"
+        );
+        assert_eq!(
+            endergenic_pearl_gain(1, 20, MAX_INFUSE),
+            600,
+            "age 20 doubles the 300"
+        );
+    }
+
+    #[test]
     fn the_hit_table_is_upstreams_own() {
         assert_eq!(RF_PER_HIT[0], 0, "an idle generator pays nothing");
         assert_eq!(RF_PER_HIT[1], 100);
@@ -2854,6 +2958,37 @@ mod tests {
         assert!(!generator.hold(), "200 FE cannot pay the 500 a tick");
         assert_eq!(generator.energy, 200, "a failed hold spends nothing");
         assert_eq!(generator.spent, 1_000);
+    }
+
+    #[test]
+    fn an_infused_hold_takes_333_a_tick_from_the_store() {
+        let mut generator = Endergenic::new();
+        generator.energy = 1_000;
+        generator.charging = HOLDING;
+        assert!(generator.hold_infused(MAX_INFUSE));
+        assert_eq!(generator.energy, 667);
+        assert_eq!(
+            generator.spent, 333,
+            "the artefact truncates 500*2/3 to 333"
+        );
+        assert!(generator.hold_infused(MAX_INFUSE));
+        assert_eq!(generator.energy, 334);
+        assert_eq!(generator.spent, 666);
+    }
+
+    #[test]
+    fn a_pearl_arriving_at_an_infused_generator_pays_300_not_600() {
+        let mut generator = Endergenic::new();
+        generator.start_charging();
+        assert_eq!(generator.receive_infused(0, MAX_INFUSE), Some(300));
+        assert_eq!(generator.gained, 300);
+        assert_eq!(generator.energy, 300);
+        assert_eq!(generator.arrived_at, 1, "the first charging mode");
+        assert_eq!(
+            Endergenic::gain(1, 0),
+            200,
+            "the un-infused path is unchanged"
+        );
     }
 
     #[test]

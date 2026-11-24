@@ -301,3 +301,11 @@ The infusable factor adds no block, item, texture or data file: the carrier is t
 `rftoolspower:power_core1` item in a third container slot, and its `rftoolspower:infusable_data`
 component is installed by `Hooks::component_types` (code, not content). `assemble_content.py --check`
 still re-derives the same 177 entries; the packed `assets/` and `data/` are byte-identical to 0.1.10.
+
+## Slice 13 — no content change
+
+The endergenic's infusable factors add no block, item, texture or data file: the carrier is again the
+existing `rftoolspower:power_core1` item, now in the endergenic's own single slot, and its
+`rftoolspower:infusable_data` component is installed by `Hooks::component_types` (code, not content).
+The slot is declared in code (`endergenic_container()`), not content. `assemble_content.py --check`
+still re-derives the same 177 entries; the packed `assets/` and `data/` are byte-identical to 0.1.11.

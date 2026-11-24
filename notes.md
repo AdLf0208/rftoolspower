@@ -2,9 +2,9 @@
 # powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor;
 # slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator;
 # slice 9: the blazing infuser; slice 10: `cell3`; slice 11: the charge-item slot; slice 12: the
-# infusable upgrade factor)
+# infusable upgrade factor; slice 13: the endergenic generator's infusable factors)
 
-> **Current state (2026-11-24): slice 12, package 0.1.11 at pin
+> **Current state (2026-11-24): slice 13, package 0.1.12 at pin
 > `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 11 adds the coal
 > generator's **charge-item slot**: an energy item in slot 1 is charged at 1,000 FE a tick out of
 > the generator's own store, through the pin's `horizon:item_energy` capability, and a powercell item
@@ -39,7 +39,12 @@
 > `/rftoolspower agitator <pos> [nonce]` and its lock checkbox is
 > `/rftoolspower agitatelock <pos> <slot> on|off [nonce]`; the infuser's readout is
 > `/rftoolspower infuser <pos> [nonce]`; the generator now reads its **infusion carrier** (slot 2) in
-> the same `/rftoolspower info` line as `carrier/infused/factor/rf`.
+> the same `/rftoolspower info` line as `carrier/infused/factor/rf`. Slice 13 adds the **endergenic
+> generator's own infusion carrier** (slot 0): the artefact's `:353` hold
+> `(long)(500 × (3 − factor) / 3)` (**333 FE a tick** at factor 1, against 500) and its `:578-579`
+> gain `(long)(rfPerHit × 2)` then `(long)(rf × (factor + 2) / 2)` (**300 FE** at mode 1 and factor
+> 1, against 200 — the dispatch prose's 600 double-counts powergenFactor). `/rftoolspower
+> endergenic` now prints `carrier/infused/factor` too.
 >
 > **Format:** one flat SDK `.hmod` — `horizon-mod.toml` (`api = "0.2"`, `[native]` pin) +
 > `Cargo.toml` + `src/lib.rs` (`impl mod_api::Hooks`) + `src/runtime.rs` (pure) + `src/support.rs`
@@ -1849,6 +1854,139 @@ clamp on `getInfusedFactor`. Two *documented deviations*:
 | persistence of the saved `infusable` int | not in game (the unit test pins the round trip; the carrier lives in the container, which does not ride on a broken item — documented deviation) |
 | the upgrade-item family and the machine-infuser GUI | not ported (gap 3's carrier is this port's own component on an existing item; no GUI at this tier) |
 
+## Slice 13 — the endergenic's infusable factors (package 0.1.12)
+
+Gap line it comes from (`## Gaps` below): **gap 10** — *"Still open in this family: … the
+**infusable factors** in the hold and the gain (no upgrade slot in this port), and the 5-second
+statistics window the HUD averages"*. This slice takes the two float rules; the statistics window is
+a client HUD feature and stays out of tier. Tier: still **machines** — one more insert-only slot on
+the existing endergenic block entity and two float rules in its existing tick, with no new block,
+renderer, GUI or hook. The coal generator's FUEL_SLOT 0 / CHARGE_SLOT 1 / UPGRADE_SLOT 2 are
+unchanged, so every other family's leg still runs.
+
+### The arithmetic, read from the artefact first (`1.21_neo` @ `e44463ca`)
+
+`EndergenicTileEntity.java`, verbatim:
+
+```java
+// :350-353, the hold
+long rf = EndergenicConfiguration.rfToHoldPearl.get();          // 500
+rf = (long) (rf * (3.0f - infusable.getInfusedFactor()) / 3.0f);
+...
+// :578-579, the arrival gain (TWO truncations)
+long rf = (long) (rfPerHit[chargingMode] * EndergenicConfiguration.powergenFactor.get()); // x2.0
+rf = (long) (rf * (infusable.getInfusedFactor() + 2.0f) / 2.0f);
+rf += rf * a / 100;                                             // the age bonus, after both
+```
+
+`factor = infused / 256.0f` (McJtyLib `IInfusable`, `maxInfuse = 256`). At factor 1 the hold is
+`(long)(500 × 2 / 3) = 333` and a mode-1 pearl pays `(long)(100 × 2) = 200` then `(long)(200 × 3 /
+2) = 300`. **The dispatch prose's `gained == 600` is an arithmetic error**: it applies
+powergenFactor twice. The formula the same dispatch quotes — and the jar — give 300. Both rules are
+carried with the artefact's single-precision products and truncating casts; the unit tests pin the
+`infused=1` style truncations the in-game window cannot see.
+
+### The carrier gate (first in-game command of the slice)
+
+Slice 12 proved `rftoolspower:infusable_data` on `power_core1` in the coal generator's slot 2. The
+gate here is that the same typed component is accepted by the **endergenic's** own slot. Upstream's
+endergenic container is `empty(...)` — its factor is an implicit `ITEM_INFUSABLE` component applied
+at placement — so this port declares one insert-only carrier slot (slot 0), read every tick. Phase
+CC gives a `power_core1[rftoolspower:infusable_data={infused:256}]`, clicks it into the endergenic
+in survival, and reads it back: `carrier rftoolspower:power_core1 infused 256 factor 1.000`. The
+gate passed; no chat command ever sets the factor. Had it failed, the slice would have stopped with
+`blocked(infusable-carrier)` and the gate log as evidence.
+
+### What changed
+
+- `runtime.rs`: `endergenic_hold_cost` and `endergenic_pearl_gain` (the two pure float rules),
+  `Endergenic::{hold_infused, receive_infused}`; `hold()`/`receive()` delegate with factor 0 so all
+  older rules and legs are unchanged.
+- `support.rs`: `ENDERGENIC_INFUSE_SLOT = 0`, a one-slot `endergenic_container()` registered on the
+  block, the carrier's int read in `tick_endergenic` for `hold_infused` and from the **destination's**
+  live slot in `deliver_pearl` for `receive_infused`; the `endergenic` readout gains
+  `carrier/infused/factor`. The click is owned by the global `right_click_block` (API 21), as the
+  blazing generator's is: the endergenic's plain `iron_block` template has no `useItemOn`, so a block
+  item would otherwise be placed against the machine. The Part no longer answers `use_item_on`.
+- No content change: the carrier is an existing item and the component is installed by
+  `Hooks::component_types`; `assemble_content.py --check` still re-derives the same 177 entries.
+
+### Red → green (unit, verbatim)
+
+`ports/_shared/evidence/rftoolspower/red-enderfactor.log`: `test result: FAILED. 160 passed; 2
+failed`, verbatim `not yet implemented: endergenic_hold_cost is not written yet` and `not yet
+implemented: endergenic_pearl_gain is not written yet`. Green: **165 passed; 0 failed**
+(`sdk-test.log`, regenerated after the final 0.1.12 build and naming its sha).
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `Compiling rftoolspower (1 of 1)`, single-mod
+`native-0a875da-9ce8dccaf5cc`, two-mod e2e build `native-0a875da-29952fb57a7a`
+(`native-mods.json` names **0.1.12**). The stale `0a875da-3d288b05a395` / `44fd54c31c1d` tags were
+removed before the build so the launcher could not select the previous source.
+
+| log | verdict |
+|---|---|
+| `e2e-enderfactor.log` | **PASS**, `EXIT:0` — phases A–CE (the whole port) |
+| `e2e-enderfactor-selftest.log` | `FAIL: selftest: the enderfactor assertions are alive — gain: the pearl paid 450 FE at mode 2 (artefact: 3 x 150 = 450), so asserting the un-infused 300 fails; hold: a held pearl spent 7659 FE in 23 ticks (333 a tick), so asserting the un-infused 500 a tick fails`, `EXIT:1` |
+| `e2e-enderfactor-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=38 ok=38 missing-exit=0 bad-exit=0` (all prior
+legs stay green). Every log's `PACKAGE` line names the delivered `b98f7cbc…` / 208,103 B.
+
+| phase | what it asserts (observed) |
+|---|---|
+| CC | the endergenic's slot holds `rftoolspower:power_core1` with `infused 256 factor 1.000`, read back from the reply's parsed `CARRIER`/`INFUSED`/`FACTOR` — the carrier gate, no command shortcut |
+| CD | a pearl that lands at **mode 1** pays `gained=300` from two replies: `t=12763 spent=10323` → `t=12785 spent=17649`; `Δspent = 7,326 = 333 × 22` game ticks. A first attempt landed at **mode 2** and paid `450 = 3 × 150`, then hit upstream's 0.6 % discard mid-window and was retried on a fresh destination — both modes prove the artefact's 3×-table rule, and the discard retry proves the window can fail |
+| CE | a stone clicked on the infusion slot changes nothing (`INFUSED` stays 256), stays in the **server's** `Inventory`, and nothing is placed against the machine |
+
+Counterfactual: `SELFTEST=enderfactor` asserts the un-infused **200**/500 on the infused generator
+and prints the real 450/333 before its single `EXIT:1`, so both assertions can fail. The control leg
+proves a fresh generator cannot even be placed without this package.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **The endergenic's click needed the global owner.** A first design kept the Part's
+   `use_item_on`; a stone click on the `iron_block`-template endergenic places the stone against it
+   (slice 7's measured trap). The click is now owned by `on_right_click_block`, the Part answers
+   nothing, and phase CE proves the stone stays server-side.
+2. **A window can be cut by upstream's random discard.** The first CD attempt landed at mode 2, paid
+   450, then recorded `reason="Random pearl discard"` inside the hold window; the leg treats that as
+   inconclusive and repeats the shot on a fresh destination, with the discard named in the log. The
+   accepted attempt's two replies carry their own `t=`/`spent=` and close 333 × Δt exactly.
+3. **The selftest must run after every helper is defined.** An early `SELFTEST` dispatch called
+   `enderfactor_phases` before `give_injector`/`place_held` were parsed (`command not found`,
+   `EXIT:127`); the dispatch is now at the tail beside the other phase calls.
+4. **The remote pull excludes `*.rs`.** `build-slot.sh ... -- cargo fmt` formats the far copy but the
+   pull does not bring it back; `cargo fmt` is applied locally (it is not a build/test step) and
+   re-checked through the slot runner.
+
+### Upstream defects fixed
+
+None adopted: both float rules, including their truncations, are upstream's own. Two *documented*
+deviations:
+
+- **No upgrade-item family / implicit component.** Upstream's infusion is `ITEM_INFUSABLE` on the
+  machine item, applied when placed; this port carries the same int on an existing item in a slot,
+  read every tick. A broken machine therefore loses its infusion (the engine keeps container items
+  apart from the `block_entity_data` payload — gap 8's shape).
+- **The carrier is insert-only and the slot has no GUI.** Upstream's endergenic container is empty
+  and its GUI shows statistics; here a click fills the one slot and `/rftoolspower endergenic` is the
+  readout (the harness stand-in used by every other family).
+
+### Coverage of the endergenic infusable factors (slice 13)
+
+| family | state |
+|---|---|
+| the carrier slot and the typed component on it | tested (CC: `infused 256 factor 1.000` read back from the live slot; the unit test pins the one-slot insert-only container) |
+| `(long)(500 × (3 − factor) / 3)` hold cost | tested (CD: 7,326 FE over 22 ticks = 333 a tick; the unit tests pin 500/333/416 and the truncating cast) |
+| `(long)(rfPerHit × 2)` then `(long)(rf × (factor + 2) / 2)` gain | tested (CD: mode 1 → 300, mode 2 → 450, both = 3 × the table; the unit tests pin 200/300/250/38,400 and the 1/256 truncation; `SELFTEST=enderfactor` inverts both) |
+| the carrier read from the destination on arrival | tested (CD: the reply names `carrier`/`infused` on the destination after the shot) |
+| the un-infused differential | tested (`SELFTEST=enderfactor`: 450/333 observed against the asserted 300/500; the older AF/AG legs still pay 200 at mode 1) |
+| a stone refused in the slot | tested (CE: server-side stone, `INFUSED` unchanged, nothing placed) |
+| persistence of the carrier on a broken item | not in game (the engine keeps container items apart from the payload — documented deviation) |
+| the 5-second HUD statistics window, the GUI and the renderer | not ported (gap 10; client features outside a `machines` slice) |
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
@@ -1891,8 +2029,10 @@ clamp on `getInfusedFactor`. Two *documented deviations*:
     three events, and the mode on the broken item; the GUI picker is
     `/rftoolspower endermonitor <pos> <mode|status> [nonce]`). Still open in this family: the
     **endergenic GUI** (`GuiEndergenic`: the stats list, the destination display) and its
-    **renderer** (the floating pearl, the good/bad flash), the **infusable factors** in the hold and
-    the gain (no upgrade slot in this port), and the **5-second statistics window** the HUD averages.
+    **renderer** (the floating pearl, the good/bad flash), and the **5-second statistics window** the
+    HUD averages. ~~The **infusable factors** in the hold and the gain~~ — **ported in slice 13**:
+    the same int component in the endergenic's own slot, the artefact's `:353` hold (333 a tick at
+    factor 1) and `:578-579` gain (300 at mode 1, 3 × the table), proven in game (CC/CD/CE).
 11. ~~**The power level** display (`PowerLevelTileEntity`, the monitor's sibling — same tick, but a
     0..9 ratio written straight to the redstone output and no level state)~~ — **ported in slice
     6** (the 20-then-10 tick, `stored * 10 / capacity` clamped 0..9, the display-face output and
@@ -1933,7 +2073,7 @@ clamp on `getInfusedFactor`. Two *documented deviations*:
 | the two recipes | `blocked(rftoolsbase:machine_frame-absent)`: the endergenic's also needs `rftoolsbase:infused_enderpearl` and an empty `#c:ender_pearls`, the injector's an empty `#c:chests` — AK proves both patterns craft nothing here |
 | the ender monitor, its three modes and the `fireMonitors` notice | tested (AN–AQ: the mode from its item and the command, the one-tick pulse, the lost differential, the idle landing that pulses both modes; see the ender-monitor table below) |
 | the endergenic GUI, the stats window and the renderer (the floating pearl, the good/bad flash) | not ported (gap 10; no GUI and no renderer in a `machines` slice) |
-| the infusable factors on the hold and the gain | not ported (gap 3) |
+| the infusable factors on the hold and the gain | tested (slice 13: CC/CD/CE — carrier gate, 300 at mode 1 / 450 at mode 2 = 3 × table, 333 a tick hold, stone refused; `SELFTEST=enderfactor` inverts both) |
 | the comparator output and TOP/Jade | not ported (gap 6) |
 
 ## Coverage of the ender monitor family (slice 5)
@@ -2027,7 +2167,40 @@ clamp on `getInfusedFactor`. Two *documented deviations*:
 | the smart wrench, the GUI, the powercell card | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review (slices 1–12; slice 12 kept both infusion rules in `runtime.rs` as pure functions tested red-first, used `#[must_use]` with the artefact's float arithmetic as the source and narrow `#[expect(…, reason = …)]` for the two truncating casts, folded the carrier and its level into one semantic argument when clippy counted eight, and re-read every gate's `PACKAGE` sha; slice 11 kept the charge rule in `runtime.rs` as a pure `charge_step` tested red-first; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review (slices 1–13; slice 13 kept the two endergenic float rules in `runtime.rs` as pure functions tested red-first, carried the artefact's single-precision truncating casts with narrow `#[expect(…, reason = …)]`, moved the click to the single global owner so a stone is never placed, and re-read every gate's `PACKAGE` sha; slice 12 kept both infusion rules in `runtime.rs` as pure functions tested red-first, used `#[must_use]` with the artefact's float arithmetic as the source and narrow `#[expect(…, reason = …)]` for the two truncating casts, folded the carrier and its level into one semantic argument when clippy counted eight, and re-read every gate's `PACKAGE` sha; slice 11 kept the charge rule in `runtime.rs` as a pure `charge_step` tested red-first; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
+
+## Verification (slice 13 run — every compile gate forwarded to `AdLf-PC`)
+
+| command | result |
+|---|---|
+| `cargo test --offline` | **165 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the final package sha) |
+| `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
+| `cargo fmt --check` | clean (`sdk-fmt.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 208,103 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.12 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `208103 bytes, SHA-256 b98f7cbc…` (`sdk-check.log`) |
+| `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits.log`) |
+| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, R9 clean, no local `Block`/`Item` type |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST=enderfactor` `EXIT:1`; control `EXIT:1`; `--strict` 38/38 |
+
+The red proof is `../_shared/evidence/rftoolspower/red-enderfactor.log`: `test result: FAILED. 160
+passed; 2 failed`, both `not yet implemented: … is not written yet`. The green `sdk-test.log` was
+regenerated **after** the final 0.1.12 build. The launcher printed `Compiling rftoolspower (1 of 1)`
+and exported `native-0a875da-9ce8dccaf5cc`; the two-mod e2e export is
+`native-0a875da-29952fb57a7a` (`native-mods.json` names 0.1.12). The e2e legs, the launcher build and
+the control game stayed local (the exported instance, the offscreen renderer and the unmodded
+control game are here); no `BUILD_LOCAL=1` was used for any Rust step.
+
+## Artifact (0.1.12)
+
+| File | Size | SHA-256 | Entries |
+|---|---:|---|---:|
+| `rftoolspower.hmod` (port root) | 208,103 B | `b98f7cbc05f4778656c02366ae5f451b4a3848873b3e722a0795c8f7902d95df` | 154 |
+
+Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
+`check` green, both `fits` green, `verify-sdk-package.py` 1/1 (`package matches the tree`, R9 clean),
+and the three 0.1.12 legs ran on these bytes (their `PACKAGE` lines name them). The package was built
+after the last packed edit (`horizon-mod.toml`, `Cargo.toml`, `README.md` and `src/`); only unpacked
+docs, `tools/e2e.sh`, `tools/parse_ender.py` and probe logs changed afterwards.
 
 ## Verification (slice 12 run — every compile gate forwarded to `AdLf-PC`)
 
@@ -2082,23 +2255,27 @@ artifact (141,168 B, `26485b9a…`, 105 entries) is the slice-6 record; the 0.1.
 
 ## Next slice
 
-- **Family:** the **endergenic generator's infusable factors** — gap 10's remaining line, *"the
-  infusable factors in the hold and the gain (no upgrade slot in this port)"*. Now that slice 12 has
-  the component and the slot pattern, this is one more slot on an existing block entity and two
-  float rules in its existing tick, with no new block, hook or renderer. It fits `machines`.
-- **Gap line it comes from:** gap 10 — *"Still open in this family: … the infusable factors in the
-  hold and the gain (no upgrade slot in this port), and the 5-second statistics window the HUD
-  averages."* (the statistics window is a client HUD feature and stays out of tier).
-- **Artefact to follow (already read at `e44463ca`):** `EndergenicTileEntity.java:353` makes the hold
-  cost `(long)(500 × (3 − factor) / 3)` and `:579` makes the arrival gain
-  `(long)(rfPerHit[mode] × 2 × (factor + 2) / 2)`; both reuse `infused_factor` from `runtime.rs`.
-- **Gate before code:** confirm the same `rftoolspower:infusable_data` component works on the
-  injector's/endergenic's carried items (slice 12 proved it on `power_core1`); no SDK change is
-  expected. If the carrier cannot be clicked into the endergenic's third slot, stop with
-  `blocked(infusable-carrier)` rather than setting the factor by command.
-- **In-game assertion that would prove it:** with a carrier at `infused=256` (factor 1.0), a pearl
-  that lands at mode 1 must pay `gained == 600` (200 × 2 × 3/2) instead of the un-infused 200, read
-  from `/rftoolspower endergenic <pos> <nonce>`; a held pearl must spend `(long)(500 × 2/3) = 333`
-  a tick instead of 500 (`spent % Δt`), both computed from two replies' own values. A
-  `SELFTEST=enderfactor` run asserts the un-infused 200/500 and exits 1; a stone in the slot is
-  refused and stays server-side.
+- **Family:** the **dimensional cell** (gap 11's *"the rest of the mod: the dimensional cell (with
+  its card-linked networks)"*). It is the largest remaining machine family: block entities with a
+  buffer, six face modes and a card that links cells across distance. It fits `machines` — no new
+  GUI or renderer; the card's data is a mod component on an existing item, the pattern slices 7/12/13
+  proved at this pin. The endergenic's own GUI, renderer and 5-second HUD window (gap 10) are client
+  features and stay out of tier.
+- **Gap line it comes from:** gap 11 — *"The rest of the mod: the dimensional cell (with its
+  card-linked networks) …"* — the only machine-tier family still unported.
+- **Artefact to follow:** read `modules/dimensionalcell/` in the existing `1.21_neo` @ `e44463ca`
+  checkout first (`DimensionalCellTileEntity`, `DimensionalCellConfiguration`, the card item and
+  the four tiers' `data/` classes). Carry the artefact's per-tier capacities and per-side rates
+  rather than inferring them from the powercell; the recipe ingredients may need the parent's
+  `rftoolsbase:dimensional_shard` and a `#c:` tag 26.3 lacks, in which case record it
+  `blocked(parent-absent)` the way the other recipes are, but still carry the plain ones.
+- **Gate before code:** confirm the card's typed component (reuse `rftoolspower:infusable_data` only
+  if its shape fits; otherwise add a new one via `Hooks::component_types`) round-trips on an existing
+  carried item and binds to a cell's network id. If the pin cannot express the link, stop with
+  `blocked(dimensional-cell-carrier)` and the probe log rather than setting the link by chat command.
+- **In-game assertion that would prove it:** two cells linked by the card and more than a block apart
+  (so adjacency cannot explain it) must read one shared store/capacity in `/rftoolspower cell`-style
+  readouts, and an FE insert into one must raise the other's store by exactly the artefact's
+  per-side rate × Δt from the two replies' own `t=` values; an unlinked cell of the same tier stays
+  at its own capacity (the differential). A `SELFTEST=dimensionalcell` run asserts a lone cell's
+  capacity on the pair and exits 1.

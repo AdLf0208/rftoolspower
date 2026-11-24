@@ -4,13 +4,15 @@
 The mod prints one line:
 
     Endergenic at 302,101,84: energy=800/5000000 charging=-1 age=0 pearls=0 fired=1 dropped=0 \
-        gained=800 spent=0 arrived=4 reason="none" dest=304,101,86 distance=1 t=4242 nonce=9
+        gained=800 spent=0 arrived=4 reason="none" dest=304,101,86 distance=1 \
+        carrier rftoolspower:power_core1 infused 256 factor 1.000 t=4242 nonce=9
 
 and this script answers:
 
     ok=1
     X=302 Y=101 Z=84 ENERGY=800 ECAP=5000000 CHARGING=-1 AGE=0 PEARLS=0 FIRED=1 DROPPED=0
-    GAINED=800 SPENT=0 ARRIVED=4 REASON=none DEST=304,101,86 DISTANCE=1 T=4242 NONCE=9
+    GAINED=800 SPENT=0 ARRIVED=4 REASON=none DEST=304,101,86 DISTANCE=1
+    CARRIER=rftoolspower:power_core1 INFUSED=256 FACTOR=1.000 T=4242 NONCE=9
 
 `ok=0` (and exit 1) when the line is not an endergenic readout, so a refusal can never be mistaken
 for a reading. Usage: parse_ender.py "<reply line>"
@@ -28,6 +30,7 @@ LINE = re.compile(
     r"pearls=(?P<pearls>\d+) fired=(?P<fired>\d+) dropped=(?P<dropped>\d+) "
     r"gained=(?P<gained>-?\d+) spent=(?P<spent>-?\d+) arrived=(?P<arrived>-?\d+) "
     r'reason="(?P<reason>[^"]*)" dest=(?P<dest>[^ ]+) distance=(?P<distance>\d+) '
+    r"carrier (?P<carrier>[^ ]+) infused (?P<infused>-?\d+) factor (?P<factor>[\d.]+) "
     r"t=(?P<t>-?\d+)(?: nonce=(?P<nonce>\S+))?$"
 )
 
@@ -48,6 +51,9 @@ NAMES = {
     "reason": "REASON",
     "dest": "DEST",
     "distance": "DISTANCE",
+    "carrier": "CARRIER",
+    "infused": "INFUSED",
+    "factor": "FACTOR",
     "t": "T",
     "nonce": "NONCE",
 }

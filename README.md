@@ -3,7 +3,7 @@
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.11**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.12**.
 
 Nine families so far (the coal generator gained the infusion factor in slice 12):
 
@@ -56,7 +56,9 @@ Nine families so far (the coal generator gained the infusion factor in slice 12)
 - a pearl that lands **inside the charging window** pays `rfPerHit[mode] × 2` — **200 FE** at mode 1
   up to **25,600 FE** at mode 10 — plus up to a **doubling** for its age; one that lands while the
   generator is idle is **lost** and pays nothing;
-- a landed pearl is held for **500 FE a tick** and fired again on the next pulse;
+- a landed pearl is held for **500 FE a tick** and fired again on the next pulse (slice 13 adds an
+  **infusion carrier** in the generator's own slot: a factor 0…1 scales the gain by `(factor+2)/2`
+  — **300 FE** at mode 1 at full infusion — and the hold by `(3−factor)/3` — **333 FE a tick**);
 - the buffer is **5,000,000 FE** and pushes out up to **20,000 FE a tick**, keeping a **2,000 FE**
   reserve to hold pearls with;
 - a link is a **2-tick flight** for a three-block gap, the injector holds **18 pearls**, and the

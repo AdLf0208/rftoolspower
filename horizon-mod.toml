@@ -1,6 +1,6 @@
 id = "rftoolspower"
 name = "RFTools Power"
-version = "0.1.11"
+version = "0.1.12"
 description = """A port of RFTools Power for Horizon: the Coal Generator, which burns coal, charcoal or a
 coal block for 600 ticks each (nine times that for a block) at 60 FE a tick into a 500,000 FE
 buffer, lights its own front while it burns, takes fuel from a hopper or a right click, gives its

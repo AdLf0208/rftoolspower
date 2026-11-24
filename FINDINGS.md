@@ -184,3 +184,26 @@ Per the directive the port registers its own int component `rftoolspower:infusab
 component's field named `infused` (McJtyLib's `ItemInfusable`) and an existing carried item as the
 carrier in a third generator slot. Upstream applies the component when the machine is placed; here
 it is read from the slot every tick, so a broken machine loses its infusion — a documented deviation.
+
+## Slice 13: the endergenic's two float rules (read at the same commits)
+
+Files read in the upstream `1.21_neo` checkout @ `e44463ca`:
+
+| File | What it gave |
+|---|---|
+| `modules/endergenic/blocks/EndergenicTileEntity.java` | `:353` `rf = (long)(rf * (3.0f - factor) / 3.0f)` with `rf = rfToHoldPearl` (500); `:578` `rf = (long)(rfPerHit[mode] * powergenFactor.get())`; `:579` `rf = (long)(rf * (infusable.getInfusedFactor() + 2.0f) / 2.0f)`; the age bonus `rf += rf * a / 100` is applied **after** both truncations. The endergenic's container is `empty(CONTAINER_ENDERGENIC, be)` — no slots — and its factor is a `DefaultInfusable` implicit component (`@Cap(type = INFUSABLE)`, `applyImplicitComponents(input.get(Registration.ITEM_INFUSABLE))`, saved under `"infusable"`). |
+| `modules/endergenic/EndergenicConfiguration.java` | `rfToHoldPearl` default 500; `powergenFactor` default **2.0** (`defineInRange("powergenFactor", 2.0, …)`). |
+| the same `rfPerHit` table read in slice 4 | index 1 = 100, index 10 = 12,800; the base is multiplied by 2 once before the infusion step. |
+
+**The load-bearing finding, against the dispatch:** at factor 1 the hold is `(long)(500 × 2/3) =
+333` and a mode-1 pearl pays `(long)(100 × 2) = 200` then `(long)(200 × 3/2) = **300**`. The dispatch
+prose's `gained == 600` applies powergenFactor twice; the jar and the formula the dispatch itself
+quotes both give 300. The port implements the artefact's two separate truncations, not a rounded
+rewrite, and the in-game leg additionally observed 450 at mode 2 (3 × 150) at two modes.
+
+**The shape at this pin:** upstream's factor rides on the machine item and is applied at placement;
+there is no upgrade slot. This port reuses slice 12's `rftoolspower:infusable_data` int on an existing
+item in the endergenic's own single slot, read every tick for both rules and from the destination's
+live slot on arrival. The click is owned by the global `right_click_block` (API 21), as the blazing
+generator's is, because the endergenic's plain `iron_block` template has no `useItemOn` for a Part to
+replace — otherwise a stone in the hand is placed against the machine.

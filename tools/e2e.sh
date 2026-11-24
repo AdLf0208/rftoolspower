@@ -152,6 +152,12 @@
 #     tick, proved from two info replies' own t=/energy=/burn= values (ΔE == 90 × Δburn)
 #  CB the un-infused generator gives 60 × Δburn and a 600-tick burn (the differential), and a stone
 #     in the infusion slot is refused and stays in the server's inventory
+#  CC the endergenic accepts the typed infusion component in its own slot: the readout names the
+#     carrier and reads infused=256 / factor=1.000 (the carrier gate — no chat-command shortcut)
+#  CD a mode-1 pearl pays rfPerHit[mode] × 2 × (factor+2)/2 = 300 at full infusion (not the prose's
+#     600), and a held pearl spends (long)(500 × (3-factor)/3) = 333 a tick, both from two replies'
+#     own t=/spent= values; the un-infused 200/500 are the counterfactual
+#  CE a stone in the endergenic's infusion slot is refused, kept server-side and not placed
 #
 # SELFTEST=factor inverts CA (it asserts the un-infused 60 FE a tick on the infused machine) and
 # exits non-zero;
@@ -164,7 +170,9 @@
 # SELFTEST_POWERLEVEL=1 inverts the power level's 5 (it asserts the brief's mistaken 4);
 # SELFTEST_BLAZING=1 asserts a rod at its ceiling makes no FE (AZ inverted) and exits non-zero;
 # SELFTEST_AGITATOR=1 asserts a rod alone rises the brief's 10 a tick (BH inverted) and exits 1;
-# SELFTEST_INFUSER=1 asserts the brief's old 10-tick infuser period (BR inverted) and exits 1.
+# SELFTEST_INFUSER=1 asserts the brief's old 10-tick infuser period (BR inverted) and exits 1;
+# SELFTEST=enderfactor inverts CC/CD (the un-infused 200 gain / 500 hold on an infused generator)
+# and exits 1. CC checks the carrier gate first: a typed component in the endergenic's own slot.
 # CONTROL=1 runs phase A on the Nightly WITHOUT this package (CONTROL_GAME, exported by
 # launcher-game.sh): the generator item does not exist, so A fails and the log says why.
 set -Eeuo pipefail
@@ -204,6 +212,13 @@ SELFTEST_POWERLEVEL=${SELFTEST_POWERLEVEL:-0}
 SELFTEST_BLAZING=${SELFTEST_BLAZING:-0}
 SELFTEST_AGITATOR=${SELFTEST_AGITATOR:-0}
 SELFTEST_INFUSER=${SELFTEST_INFUSER:-0}
+# `SELFTEST=enderfactor` inverts CC/CD: it asserts the un-infused 200 gain / 500 hold on the
+# infused generator and exits 1, so both artefact assertions can fail.
+SELFTEST_ENDERFACTOR=0
+if [ "$SELFTEST" = enderfactor ]; then
+    SELFTEST_ENDERFACTOR=1
+    SELFTEST=0
+fi
 CONTROL=${CONTROL:-0}
 KEEP=${KEEP:-0}
 WORLD=RFToolsPowerE2E
@@ -1044,6 +1059,156 @@ if [ "$SELFTEST_FACTOR" = 1 ]; then
     infusable_phases
     fail "selftest: the infusion inversion did not fail"
 fi
+
+# The endergenic's infusable factors are a function so `SELFTEST=enderfactor` can run just CC/CD.
+enderfactor_phases() {
+# --- the endergenic generator's infusable factors (slice 13) ---------------------------------
+# `EndergenicTileEntity.java` @ e44463ca, read first:
+#   :353   rf = rfToHoldPearl (500); rf = (long)(rf * (3.0f - factor) / 3.0f);
+#   :578   rf = (long)(rfPerHit[mode] * powergenFactor (2.0));
+#   :579   rf = (long)(rf * (factor + 2.0f) / 2.0f);   then the age bonus
+# Factor 1: the gain is 3x the table (mode 1 = 100*3 = 300), the hold 333 FE a tick. The dispatch
+# prose's 600 double-counts powergenFactor; the artefact and its own quoted formula both give 300.
+CARRIER_ITEM="$CORE[rftoolspower:infusable_data={infused:256}]"
+
+echo "== CC: the carrier gate — a typed component is accepted by the endergenic's slot =="
+ctl close >/dev/null 2>&1 || true
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+EFX=$SX; EFY=101; EFZ=190
+ctl command "execute in minecraft:the_end run tp @s $EFX.5 101 $((EFZ + 4)).5" >/dev/null
+ctl wait 40 >/dev/null
+for attempt in 1 2 3; do
+    ctl command "execute in minecraft:the_end run fill $((EFX - 3)) 100 186 $((EFX + 5)) 100 198 minecraft:stone" >/dev/null
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$EFX" 100 "$EFZ")" = minecraft:stone ] && break
+    ctl wait 40 >/dev/null
+done
+[ "$(block_name "$EFX" 100 "$EFZ")" = minecraft:stone ] || fail "no floor under the endergenic infusion arena"
+ctl command "execute in minecraft:the_end run fill $((EFX - 3)) 101 186 $((EFX + 5)) 108 198 minecraft:air" >/dev/null
+ctl wait 8 >/dev/null
+
+# Place a fresh, seeded destination and click the carrier into its one slot. A survival click is
+# needed so the stack actually leaves the hand, as in the coal generator's infusion phases.
+place_infused_dest() {
+    ctl command "gamemode creative" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl command "execute in minecraft:the_end run setblock $EFX $EFY $((EFZ + 3)) minecraft:air" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl command "give @s $ENDER[minecraft:block_entity_data={id:\"$ENDERGENIC_ENTITY\",energy:20000}]" >/dev/null
+    ctl wait 8 >/dev/null
+    place_held "$EFX" "$EFY" $((EFZ + 3)) "$ENDER"
+    ctl command "gamemode survival" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl command "item replace entity @s hotbar.0 with $CARRIER_ITEM 1" >/dev/null
+    ctl wait 8 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((EFX - 2)).5 101 $((EFZ + 3)).5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl look-at "$EFX.5" 101.5 "$((EFZ + 3)).5" >/dev/null \
+        || fail "cannot aim at the infusion destination $EFX,$EFY,$((EFZ + 3))"
+    ctl interact "$EFX" "$EFY" $((EFZ + 3)) >/dev/null
+    ctl wait 10 >/dev/null
+    ender_state "$EFX" "$EFY" $((EFZ + 3))
+    [ "$CARRIER" = "$CORE" ] \
+        || fail "blocked(infusable-carrier): the endergenic slot holds '$CARRIER', expected $CORE"
+    [ "$INFUSED" = 256 ] \
+        || fail "blocked(infusable-carrier): the component was not read: infused=$INFUSED, expected 256"
+    [ "$FACTOR" = 1.000 ] \
+        || fail "blocked(infusable-carrier): the factor is $FACTOR, expected 1.000"
+    ctl command "gamemode creative" >/dev/null
+    ctl wait 4 >/dev/null
+}
+place_infused_dest
+echo "  GATE: the endergenic's slot holds $CARRIER with infused=$INFUSED factor=$FACTOR"
+
+# The destination exists now, so the source can be linked to it.
+give_injector
+place_injector "$((EFX + 1))" "$EFY" "$EFZ" east
+give_ender
+place_held "$EFX" "$EFY" "$EFZ" "$ENDER"
+link "$EFX" "$EFY" "$EFZ" "$EFX" "$EFY" $((EFZ + 3))
+ender_state "$EFX" "$EFY" "$EFZ"
+[ "$DEST" = "$EFX,101,$((EFZ + 3))" ] || fail "the source did not link to the destination: '$DEST'"
+
+echo "== CD: a mode-1 pearl pays the artefact's 300 and a held pearl spends 333 a tick =="
+# Upstream's 0.6%-a-tick discard can end a hold inside a sampling window. A window whose `dropped`
+# counter moved is inconclusive; the shot is repeated on a fresh destination (up to three times).
+CD_ATTEMPT=0
+while :; do
+    CD_ATTEMPT=$((CD_ATTEMPT + 1))
+    [ "$CD_ATTEMPT" = 1 ] || place_infused_dest
+    ender_state "$EFX" "$EFY" $((EFZ + 3))
+    D0=$DROPPED; S0=$SPENT; T0=$T
+    pearl_into_injector "$((EFX + 1))" "$EFY" "$EFZ"
+    pulse_fill "$EFX" 102 "$EFZ" "$((EFX + 1))" 102 $((EFZ + 3))
+    ctl wait 14 >/dev/null
+    ender_state "$EFX" "$EFY" "$EFZ"
+    [ "$FIRED" -ge "$CD_ATTEMPT" ] || fail "the source fired $FIRED pearls after $CD_ATTEMPT attempts"
+    ender_state "$EFX" "$EFY" $((EFZ + 3))
+    [ "$ARRIVED" -ge 1 ] && [ "$ARRIVED" -le 15 ] \
+        || fail "the pearl arrived at mode $ARRIVED, outside the 1..15 window"
+    EXPECT=$(( RF_PER_HIT[ARRIVED] * 3 ))
+    UNINFUSED=$(( RF_PER_HIT[ARRIVED] * 2 ))
+    if [ "$SELFTEST_ENDERFACTOR" = 1 ] && [ "$GAINED" != "$UNINFUSED" ]; then
+        SELFTEST_GAIN_FAIL=1
+        SELFTEST_GAIN_NOTE="the pearl paid $GAINED FE at mode $ARRIVED (artefact: 3 x ${RF_PER_HIT[ARRIVED]} = $EXPECT), so asserting the un-infused $UNINFUSED fails"
+        echo "(selftest gain: $SELFTEST_GAIN_NOTE)" >&2
+    fi
+    [ "$GAINED" = "$EXPECT" ] \
+        || fail "the pearl paid $GAINED FE at mode $ARRIVED, expected $EXPECT (rfPerHit ${RF_PER_HIT[ARRIVED]} x 2 x (1+2)/2; the artefact's :578-579, not the prose's 600)"
+    [ "$INFUSED" = 256 ] || fail "the carrier changed during the shot: infused=$INFUSED"
+    A_DROPPED=$DROPPED; A_SPENT=$SPENT; A_T=$T
+    [ "$A_DROPPED" = "$D0" ] || { echo "  attempt $CD_ATTEMPT: a pearl was discarded before the first read; repeating" >&2; continue; }
+    ctl wait 14 >/dev/null
+    ender_state "$EFX" "$EFY" $((EFZ + 3))
+    [ "$DROPPED" = "$A_DROPPED" ] || { echo "  attempt $CD_ATTEMPT: a pearl was discarded inside the hold window; repeating" >&2; continue; }
+    H_DT=$((T - A_T)); H_DS=$((SPENT - A_SPENT))
+    [ "$H_DT" -ge 8 ] || fail "the hold window is only $H_DT ticks"
+    if [ "$SELFTEST_ENDERFACTOR" = 1 ] && [ "$H_DS" != $((500 * H_DT)) ]; then
+        SELFTEST_HOLD_FAIL=1
+        SELFTEST_HOLD_NOTE="a held pearl spent $H_DS FE in $H_DT ticks (333 a tick), so asserting the un-infused 500 a tick fails"
+        echo "(selftest hold: $SELFTEST_HOLD_NOTE)" >&2
+    fi
+    [ "$H_DS" = $((333 * H_DT)) ] \
+        || fail "a held pearl spent $H_DS FE over $H_DT ticks ($((H_DS / H_DT)) a tick), expected 333 x $H_DT = $((333 * H_DT)) (the artefact's (long)(500*(3-1)/3))"
+    break
+done
+[ "$CD_ATTEMPT" -le 3 ] || fail "three hold windows were all cut by the upstream discard"
+if [ "${SELFTEST_GAIN_FAIL:-0}" = 1 ] || [ "${SELFTEST_HOLD_FAIL:-0}" = 1 ]; then
+    fail "selftest: the enderfactor assertions are alive — gain: ${SELFTEST_GAIN_NOTE:-passed as un-infused}; hold: ${SELFTEST_HOLD_NOTE:-passed as un-infused}"
+fi
+
+echo "== CE: a stone in the infusion slot is refused, kept server-side and not placed =="
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl command "item replace entity @s hotbar.0 with $STONE 1" >/dev/null
+ctl wait 6 >/dev/null
+ctl select 1 >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $((EFX - 2)).5 101 $((EFZ + 3)).5" >/dev/null
+ctl wait 6 >/dev/null
+ctl look-at "$EFX.5" 101.5 "$((EFZ + 3)).5" >/dev/null || fail "cannot aim at the destination for the stone"
+ctl interact "$EFX" "$EFY" $((EFZ + 3)) >/dev/null
+ctl wait 10 >/dev/null
+ender_state "$EFX" "$EFY" $((EFZ + 3))
+[ "$INFUSED" = 256 ] || fail "the stone changed the infusion level: $INFUSED"
+SERVER=$(server_inventory)
+case "$SERVER" in
+    *'"minecraft:stone"'*) ;;
+    *) fail "the server lost the stone: a refused infusion click must change nothing ($SERVER)" ;;
+esac
+for cell in "$((EFX - 1)) 101 $((EFZ + 3))" "$EFX 102 $((EFZ + 3))" "$EFX 101 $((EFZ + 4))"; do
+    [ "$(block_name $cell)" = minecraft:air ] \
+        || fail "the refused stone was placed against the endergenic at $cell ($(block_name $cell))"
+done
+echo "  a stone is refused in the endergenic's infusion slot, kept on the server and nothing is placed"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+}
 
 echo "== A: a generator placed from its item is empty and dark =="
 place_generator "$SX" 101 0
@@ -3760,8 +3925,14 @@ ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  the parent's dimensional shard and machine frame are the recipe's limit here"
 
-cell3_phases
-chargeitem_phases
-infusable_phases
+if [ "$SELFTEST_ENDERFACTOR" = 1 ]; then
+    enderfactor_phases
+    fail "selftest: the enderfactor inversion did not fail"
+else
+    cell3_phases
+    chargeitem_phases
+    infusable_phases
+    enderfactor_phases
+fi
 
-echo "PASS: the coal generator's infusion carrier raised its burn to 750 ticks (600 + (int)(600*0.5/2)) and its rate to 90 FE a tick (60 + (long)(60*0.5)), the two info replies' own t=/energy=/burn= closing ΔE == 90 × Δburn, while the un-infused generator gave 60 × Δburn and a 600-tick burn and a stone in the infusion slot was refused and stayed server-side. Earlier: the coal generator's charge slot inserted exactly 1,000 FE a tick into a powercell item's own energy component, the two info replies' t= closing the rate, and the store fell by exactly what the item gained; a stone in that slot was refused and kept on the server. Earlier: a blazing infuser spends one catalyst and 10 FE a run on the 11th tick after its counter resets (the field is 10, the period 11 — two replies' counters close it exactly), raising the rod's quality by the catalyst's percentage of a whole 64-step stack (a nether star +1,125 on a 60,000-quality rod, redstone +375 quality and no duration), moving it to the output slot on its last step, costing exactly one catalyst and 10 of its 50,000 FE a run (a hopper-fed window proved one run every 11 ticks over several runs), infusing nothing without a catalyst, and refusing a stone; its recipe needs the parent's dimensional shard and machine frame. Earlier: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+echo "PASS: the endergenic generator's infusion carrier was accepted in its own slot (infused=256 factor=1.000), a mode-1 pearl paid the artefact's 300 FE (rfPerHit[1] x 2 x (1+2)/2, not the prose's 600), a held pearl spent 333 FE a tick ((long)(500 x (3-1)/3)) from two replies' own game-time stamps, and a stone in the slot was refused and kept server-side. Earlier: the coal generator's infusion carrier raised its burn to 750 ticks (600 + (int)(600*0.5/2)) and its rate to 90 FE a tick (60 + (long)(60*0.5)), the two info replies' own t=/energy=/burn= closing ΔE == 90 × Δburn, while the un-infused generator gave 60 × Δburn and a 600-tick burn and a stone in the infusion slot was refused and stayed server-side. Earlier: the coal generator's charge slot inserted exactly 1,000 FE a tick into a powercell item's own energy component, the two info replies' t= closing the rate, and the store fell by exactly what the item gained; a stone in that slot was refused and kept on the server. Earlier: a blazing infuser spends one catalyst and 10 FE a run on the 11th tick after its counter resets (the field is 10, the period 11 — two replies' counters close it exactly), raising the rod's quality by the catalyst's percentage of a whole 64-step stack (a nether star +1,125 on a 60,000-quality rod, redstone +375 quality and no duration), moving it to the output slot on its last step, costing exactly one catalyst and 10 of its 50,000 FE a run (a hopper-fed window proved one run every 11 ticks over several runs), infusing nothing without a catalyst, and refusing a stone; its recipe needs the parent's dimensional shard and machine frame. Earlier: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

@@ -55,6 +55,13 @@ const CHARGE_SLOT: usize = 1;
 const UPGRADE_SLOT: usize = 2;
 /// Three slots: fuel, the charge item and the infusion carrier.
 const SLOTS: usize = 3;
+/// The endergenic's infusion carrier slot. Upstream's endergenic container is `empty(...)` — the
+/// factor is McJtyLib's `ITEM_INFUSABLE` implicit component on the block's item, applied at
+/// placement — so this port carries the same int on an existing item in this one slot. The
+/// generator has no other slots, so it is slot 0 here.
+const ENDERGENIC_INFUSE_SLOT: usize = 0;
+/// The endergenic's single carrier slot.
+const ENDERGENIC_SLOTS: usize = 1;
 /// The block's `lit` property, which the `minecraft:furnace` template already declares.
 const KEY_LIT: &str = "lit";
 /// The saved store, under the key the energy capability reads (`ModEnergyBuffer`'s amount).
@@ -231,6 +238,7 @@ pub(crate) fn declare(
         .blocks(&["endergenic"])
         .build();
     let block = r.block_key(ENDERGENIC);
+    r.block_container(&block, endergenic_container());
     r.block_energy(&block, endergenic_battery());
     let item = r.item_key(ENDERGENIC);
     r.item_part(item, EndergenicItemPart);
@@ -2661,6 +2669,7 @@ pub(crate) fn on_right_click_block(
     };
     let block = block_id(&*host, level, click.pos);
     let handled = match block.as_deref() {
+        Some(ENDERGENIC) => endergenic_carrier_click(host, click, click.stack),
         Some(BLAZING) => blazing_click(host, click, click.stack),
         Some(AGITATOR) => agitator_click(host, click, click.stack),
         Some(INFUSER) => infuser_click(host, click, click.stack),
@@ -4057,6 +4066,20 @@ pub(crate) fn fire_monitors(
     }
 }
 
+/// The infusion int on the carrier in the endergenic's one slot, read from the live block entity
+/// (the same route `/rftoolspower info` uses for the coal generator). A missing generator, slot or
+/// component reads 0 — upstream's un-infused default.
+fn endergenic_infused_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> i32 {
+    host.block_entity(level, pos)
+        .and_then(|entity| {
+            entity
+                .item_slot(host, ENDERGENIC_INFUSE_SLOT as u32)
+                .ok()
+                .flatten()
+        })
+        .map_or(0, |stack| infused_of(&stack))
+}
+
 /// The generator at `pos`, if the block there is one.
 fn endergenic_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<Endergenic> {
     if block_id(&*host, level, pos).as_deref() != Some(ENDERGENIC) {
@@ -4112,7 +4135,10 @@ pub(crate) fn deliver_pearl(host: &mut dyn ServerHost, level: LevelRef, dest: [i
     let Some(mut state) = endergenic_at(host, level, dest) else {
         return;
     };
-    let gained = state.receive(age);
+    // Upstream reads `DefaultInfusable` from the *destination's* implicit component when its
+    // `receivePearl` runs; here the factor is read from the carrier in that generator's one slot.
+    let infused = endergenic_infused_at(&*host, level, dest);
+    let gained = state.receive_infused(age, infused);
     write_endergenic_at(host, level, dest, &state);
     // Upstream's `receivePearl` fires `arrived` before it branches, and a miss then also fires
     // `lost` through `discardPearl`: an arrival outside the window pulses both monitor modes.
@@ -4172,9 +4198,16 @@ pub(crate) fn tick_endergenic(
     level: Option<LevelRef>,
     pos: [i32; 3],
     saved: &mut Tag,
+    items: &mut [Option<ItemStack>],
 ) -> bool {
     let before = read_endergenic(saved);
     let mut state = before.clone();
+    // The carrier's own component is read every tick, as upstream reads `DefaultInfusable` from its
+    // `ITEM_INFUSABLE` component on the machine item (applied when the machine is placed).
+    let infused = items
+        .get(ENDERGENIC_INFUSE_SLOT)
+        .and_then(Option::as_ref)
+        .map_or(0, infused_of);
     let arrivals = state.tick_pearls();
     if let Some(level) = level {
         for (destination, age) in arrivals {
@@ -4206,7 +4239,7 @@ pub(crate) fn tick_endergenic(
         Pulse::None => match state.charging {
             IDLE => {}
             HOLDING => {
-                if !state.hold() {
+                if !state.hold_infused(infused) {
                     state.discard(Loss::NotEnoughEnergy);
                     notify_monitors(host, level, pos, MonitorMode::LostPearl);
                 }
@@ -4320,6 +4353,8 @@ pub(crate) fn tick_injector(
 pub(crate) fn endergenic_line(
     pos: [i32; 3],
     state: &Endergenic,
+    carrier: Option<&str>,
+    infused: i32,
     t: i64,
     nonce: Option<&str>,
 ) -> String {
@@ -4332,7 +4367,7 @@ pub(crate) fn endergenic_line(
     format!(
         "Endergenic at {},{},{}: energy={}/{} charging={} age={} pearls={} fired={} dropped={} \
          gained={} spent={} arrived={} reason=\"{reason}\" dest={destination} distance={} \
-         t={t}{suffix}",
+         carrier {} infused {infused} factor {:.3} t={t}{suffix}",
         pos[0],
         pos[1],
         pos[2],
@@ -4347,6 +4382,8 @@ pub(crate) fn endergenic_line(
         state.spent,
         state.arrived_at,
         state.distance,
+        carrier.unwrap_or("empty"),
+        infused_factor(infused),
     )
 }
 
@@ -4360,8 +4397,26 @@ pub(crate) fn endergenic_status_line(
     let Some(state) = endergenic_at(host, level, pos) else {
         return NO_ENDERGENIC.to_owned();
     };
+    // The carrier is read from the live slot, not from the saved copy the tick writes (which can be
+    // a tick behind a just-clicked carrier) — the coal generator's `info` uses the same route.
+    let carrier = host.block_entity(level, pos).and_then(|entity| {
+        entity
+            .item_slot(&*host, ENDERGENIC_INFUSE_SLOT as u32)
+            .ok()
+            .flatten()
+    });
+    let report = carrier
+        .as_ref()
+        .map(|stack| (stack.item().id(&*host).to_owned(), infused_of(stack)));
     let t = level.game_time(&*host).unwrap_or(0);
-    endergenic_line(pos, &state, t, nonce)
+    endergenic_line(
+        pos,
+        &state,
+        report.as_ref().map(|(id, _)| id.as_str()),
+        report.as_ref().map_or(0, |(_, infused)| *infused),
+        t,
+        nonce,
+    )
 }
 
 /// Link a generator to its destination (`setDestination`, the wrench's link): the pearl it fires
@@ -4442,6 +4497,19 @@ pub(crate) fn injector_status_line(
     let attached = find_generator(&*host, level, pos);
     let t = level.game_time(&*host).unwrap_or(0);
     injector_line(pos, pearls, attached, t, nonce)
+}
+
+/// The endergenic's container: one insert-only infusion carrier every face reaches. Upstream's
+/// container is empty (the factor rides on the block item's implicit component); this port's
+/// carrier is a real item in this slot, read by the tick, so it is kept in rather than given back.
+pub(crate) fn endergenic_container() -> ModContainer {
+    ModContainer {
+        slots: ENDERGENIC_SLOTS,
+        faces: std::array::from_fn(|_| vec![ENDERGENIC_INFUSE_SLOT]),
+        inputs: vec![ENDERGENIC_INFUSE_SLOT],
+        outputs: vec![],
+        menu: None,
+    }
 }
 
 /// The injector's container: eighteen pearl slots every face reaches, insert-only (upstream's
@@ -4690,19 +4758,42 @@ pub(crate) fn ender_monitor_click(
     Some(InteractionResult::Success)
 }
 
-/// A click on the endergenic reads its status (there is no GUI in this slice).
-pub(crate) fn endergenic_click(
+/// A right click on the endergenic: an infusion carrier goes in its one slot, anything else is
+/// refused with a line, and an empty hand prints the readout. Owned by the global
+/// `right_click_block` (API 21) for the same reason as the blazing generator's: the endergenic's
+/// plain `iron_block` template has no `useItemOn` for a Part to replace, so a block item in the
+/// hand would otherwise be placed against the machine.
+pub(crate) fn endergenic_carrier_click(
     host: &mut dyn ServerHost,
     click: &BlockClick<'_>,
+    held: Option<&ItemStack>,
 ) -> Option<InteractionResult> {
     let level = host.level(click.dimension.key().id())?;
     if block_id(&*host, level, click.pos).as_deref() != Some(ENDERGENIC) {
         return None;
     }
-    let line = endergenic_status_line(host, level, click.pos, None);
-    if let Some(player) = host.player(click.player) {
-        let _ = player.action_bar(host, Text::literal(line));
+    let Some(held) = held.filter(|stack| stack.count() > 0) else {
+        let line = endergenic_status_line(host, level, click.pos, None);
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal(line));
+        }
+        return Some(InteractionResult::Success);
+    };
+    if held.get(&Infusable).is_none() {
+        let refused = item_id(&*host, held);
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(
+                host,
+                Text::literal(format!("{refused} is not an infusion carrier")),
+            );
+        }
+        return Some(InteractionResult::Success);
     }
+    let hand = ItemPlace::PlayerHand {
+        player: click.player,
+        hand: click.hand,
+    };
+    insert_from_hand(host, level, click.pos, held, &hand, ENDERGENIC_INFUSE_SLOT);
     Some(InteractionResult::Success)
 }
 
@@ -4838,27 +4929,12 @@ impl ItemPart for EndergenicItemPart {
     }
 }
 
-/// The endergenic generator: it ticks, and a click reads it.
+/// The endergenic generator: it ticks. The click is owned by `on_right_click_block` so a block item
+/// is never placed against the machine and the carrier is not handled twice.
 pub(crate) struct EndergenicPart;
 
 #[mod_api::horizon_part]
-impl BlockPart for EndergenicPart {
-    fn use_item_on(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut UseItemOnEvent<'_>,
-    ) -> Option<InteractionResult> {
-        endergenic_click(host, event.click)
-    }
-
-    fn use_without_item(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut UseWithoutItemEvent<'_>,
-    ) -> Option<InteractionResult> {
-        endergenic_click(host, event.click)
-    }
-}
+impl BlockPart for EndergenicPart {}
 
 #[mod_api::horizon_part]
 impl BlockEntityPart for EndergenicPart {
@@ -4880,8 +4956,12 @@ impl BlockEntityPart for EndergenicPart {
     fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         let pos = event.pos;
         let level = in_place_level(host);
+        if event.entity.items.len() != ENDERGENIC_SLOTS {
+            event.entity.items.resize(ENDERGENIC_SLOTS, None);
+        }
         let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
-        let changed = tick_endergenic(host, level, pos, &mut saved);
+        let items = &mut event.entity.items;
+        let changed = tick_endergenic(host, level, pos, &mut saved, items);
         if let Tag::Compound(nbt) = saved {
             event.entity.nbt = nbt;
         }
@@ -5262,7 +5342,7 @@ impl BlockEntityPart for InfuserPart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{MAX_BURN, MAX_LEVEL, PERCENT, TICKS_PER_COAL};
+    use crate::runtime::{MAX_BURN, MAX_INFUSE, MAX_LEVEL, PERCENT, TICKS_PER_COAL};
     fn compound() -> Tag {
         Tag::Compound(Compound::new())
     }
@@ -6033,18 +6113,25 @@ mod tests {
         state.gained = 800;
         state.arrived_at = 4;
         assert_eq!(
-            endergenic_line([300, 101, 2], &state, 4242, Some("9")),
+            endergenic_line(
+                [300, 101, 2],
+                &state,
+                Some("rftoolspower:power_core1"),
+                MAX_INFUSE,
+                4242,
+                Some("9")
+            ),
             "Endergenic at 300,101,2: energy=800/5000000 charging=-1 age=0 pearls=0 fired=0 \
              dropped=0 gained=800 spent=0 arrived=4 reason=\"none\" dest=10,101,6 distance=2 \
-             t=4242 nonce=9"
+             carrier rftoolspower:power_core1 infused 256 factor 1.000 t=4242 nonce=9"
         );
         let mut fresh = Endergenic::new();
         fresh.last_loss = Some(Loss::WhileIdle);
         assert_eq!(
-            endergenic_line([300, 101, 4], &fresh, 7, None),
+            endergenic_line([300, 101, 4], &fresh, None, 0, 7, None),
             "Endergenic at 300,101,4: energy=0/5000000 charging=0 age=0 pearls=0 fired=0 \
              dropped=0 gained=0 spent=0 arrived=-2 reason=\"Pearl arrived while idle\" dest=none \
-             distance=0 t=7"
+             distance=0 carrier empty infused 0 factor 0.000 t=7"
         );
     }
 
@@ -6058,6 +6145,24 @@ mod tests {
             injector_line([300, 102, 4], 0, None, 1, None),
             "Pearl Injector at 300,102,4: pearls=0 generator=none t=1"
         );
+    }
+
+    #[test]
+    fn the_endergenic_has_one_insert_only_infusion_slot() {
+        let container = endergenic_container();
+        assert_eq!(container.slots, ENDERGENIC_SLOTS, "one carrier, no menu");
+        assert_eq!(
+            ENDERGENIC_INFUSE_SLOT, 0,
+            "the generator has no other slots"
+        );
+        assert_eq!(
+            container.outputs,
+            Vec::<usize>::new(),
+            "the carrier stays in"
+        );
+        for face in container.faces {
+            assert_eq!(face, vec![ENDERGENIC_INFUSE_SLOT], "every face reaches it");
+        }
     }
 
     #[test]

@@ -1,24 +1,36 @@
-# RFTools Power — validation record (slice 12, package 0.1.11)
+# RFTools Power — validation record (slice 13, package 0.1.12)
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, mod API `0.2`, game 26.3. Package **0.1.11**.
-This slice adds the coal generator's **infusable upgrade factor** (gap 3): an int 0–256 component on
-an existing carried item in a third slot raises the rate to `60 + (long)(60 × factor)` FE a tick and
-the burn to `600 + (int)(600 × factor / 2)` ticks, exactly upstream's float rules. The pin has no
-infusable component, so this port's own `rftoolspower:infusable_data` carries the int (McJtyLib's
-scale and field name `infused`; the block-NBT key stays `infusable`). Every command below ran on
-2026-11-24; the logs are under `ports/_shared/evidence/rftoolspower/` and
-`ports/_shared/evidence/rftoolspower-e2e/`, and each package gate prints the `.hmod` sha it ran against.
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, mod API `0.2`, game 26.3. Package **0.1.12**.
+This slice adds the **endergenic generator's infusable factors** (gap 10): a carrier in the
+generator's own slot raises the arrival gain from `rfPerHit[mode] × 2` to
+`(long)((long)(rfPerHit[mode] × 2) × (factor + 2) / 2)` — **300 FE** at mode 1 and factor 1 — and
+lowers the hold from 500 to `(long)(500 × (3 − factor) / 3)` = **333 FE a tick**, with the artefact's
+single-precision products and truncating casts. Every command below ran on 2026-11-24; the logs are
+under `ports/_shared/evidence/rftoolspower/` and `ports/_shared/evidence/rftoolspower-e2e/`, and each
+package gate prints the `.hmod` sha it ran against.
 
-## The component gate (first command of the slice)
+## The arithmetic, read first from the artefact
 
-`grep -ri infus ports/_shared/sdk/0a875da/` → no matches: the pin has no infusable component or
-capability, so the gate passed on the directive's own terms — carry the factor as this port's own int
-component (`rftoolspower:infusable_data`), the way the blazing rod's `blazing_rod_data` is carried.
-No upstream item was invented and no chat command sets the factor. The artefact was read first at
-`1.21_neo` @ `e44463ca`: `handlePowerGeneration`'s `burning += (int)(burning * factor / 2.0f)` and
-`getRfPerTick`'s `rf += (long)(rf * factor)`, with McJtyLib `IInfusable.getInfusedFactor() =
-(float) infused / maxInfuse`, `maxInfuse = 256`.
+`EndergenicTileEntity.java` at `1.21_neo` @ `e44463cacddb85155839373b42d39bc705d618c0` (the exact
+ATM10 jar's version), line 353: `rf = (long)(rf * (3.0f - factor) / 3.0f)` with `rf = 500`;
+lines 578-579: `rf = (long)(rfPerHit[mode] * powergenFactor (2.0))` then
+`rf = (long)(rf * (factor + 2.0f) / 2.0f)`, then the age bonus. `factor = infused / 256.0f`.
+
+**The dispatch prose's `gained == 600` is wrong**: it applies powergenFactor twice. Both the jar
+and the formula the same dispatch quotes give **300** at mode 1. The port follows the artefact and
+says so in the e2e log and report; the in-game leg additionally observed 450 at mode 2 (3 × 150),
+confirming the 3×-table rule at two modes.
+
+## The carrier gate (first in-game check of the slice)
+
+Slice 12 proved the typed component `rftoolspower:infusable_data` on `power_core1` in the coal
+generator's slot 2. Phase CC gives the same item with `{infused:256}` to the **endergenic**, clicks it
+into its own slot in survival, and reads it back from the reply:
+`carrier rftoolspower:power_core1 infused 256 factor 1.000`. The gate passed, so the slice was
+implemented rather than `blocked(infusable-carrier)`; no chat command ever sets the factor. The
+upstream endergenic container is `empty(...)` (the factor is an implicit `ITEM_INFUSABLE` component
+on the block item), so this slot is the port's carrier for the same int.
 
 ## The ladder — all compile gates forwarded to `AdLf-PC`
 
@@ -29,21 +41,20 @@ far box is `AdLf-PC`. No `BUILD_LOCAL=1` was used.
 
 | step | command | result |
 |---|---|---|
-| unit tests | `tools/gates.sh test` | **160 passed; 0 failed** — `sdk-test.log`, `PACKAGE … sha256=12edfec1… bytes=205875` |
+| unit tests | `tools/gates.sh test` | **165 passed; 0 failed** — `sdk-test.log`, `PACKAGE … sha256=b98f7cbc… bytes=208103` |
 | clippy | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings**, exit 0 — `sdk-clippy.log` |
 | fmt | `cargo fmt --check` | clean, exit 0 — `sdk-fmt.log` |
-| build 1 / 2 | `rm -f Cargo.lock && cargo horizon-mod build`, twice | both `205,875 B`, sha256 `12edfec1…`; `cmp`-identical — `sdk-build-1.log`, `sdk-build-2.log` |
-| check | `cargo horizon-mod check rftoolspower.hmod` | exit 0, `0.1.11 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `205875 bytes, SHA-256 12edfec1…` — `sdk-check.log` |
+| build 1 / 2 | `rm -f Cargo.lock && cargo horizon-mod build`, twice | both `208,103 B`, sha256 `b98f7cbc…`; `cmp`-identical — `sdk-build-1.log`, `sdk-build-2.log` |
+| check | `cargo horizon-mod check rftoolspower.hmod` | exit 0, `0.1.12 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `208103 bytes, SHA-256 b98f7cbc…` — `sdk-check.log` |
 | fits (pin) | `cargo horizon-mod fits … --build 0a875da` | `0a875da  made for` — `sdk-fits.log` |
 | fits (another) | `cargo horizon-mod fits … --build 0b14f8a` | `0b14f8a  fits` — `sdk-fits.log` |
 | package gate | `python3 ports/tools/verify-sdk-package.py rftoolspower` | **1/1** (`package matches the tree`, R9 clean, no local `Block`/`Item` type) |
 
-The red proof is `ports/_shared/evidence/rftoolspower/red-factor.log`:
-`test result: FAILED. 156 passed; 3 failed`, verbatim
-`not yet implemented: infused_burn_ticks is not written yet`,
-`not yet implemented: infused_factor is not written yet`,
-`not yet implemented: generator_rf_per_tick is not written yet`. The green `sdk-test.log` was
-regenerated **after** the 0.1.11 build, so its `PACKAGE` line names `12edfec1…` / 205,875 B.
+The red proof is `ports/_shared/evidence/rftoolspower/red-enderfactor.log`:
+`test result: FAILED. 160 passed; 2 failed`, verbatim
+`not yet implemented: endergenic_hold_cost is not written yet`,
+`not yet implemented: endergenic_pearl_gain is not written yet`. The green `sdk-test.log` was
+regenerated **after** the 0.1.12 build, so its `PACKAGE` line names `b98f7cbc…` / 208,103 B.
 
 ## In game — these legs stayed local
 
@@ -53,58 +64,55 @@ control game live here. Each leg is logged with its `PACKAGE` line and ends `EXI
 
 | leg | command | result |
 |---|---|---|
-| build (package) | `launcher-game.sh build rftoolspower` | `Compiling rftoolspower (1 of 1)`, `native-0a875da-3d288b05a395`, exported — `native-build.log` |
-| build (package + receiver) | `tools/build-e2e-game.sh` | `native-0a875da-44fd54c31c1d`, `rfpowerharness` 0.1.0 and `rftoolspower` **0.1.11** — `native-build-modset.log` |
-| main | `tools/e2e.sh` (A–BX + BY/BZ + CA/CB) | **PASS**, `EXIT:0`; `PACKAGE … sha256=12edfec1… bytes=205875` — `e2e-factor.log` |
-| selftest (factor) | `SELFTEST=factor tools/e2e.sh` (CA inverted) | `FAIL: selftest: the infused generator made 3330 FE over 37 ticks (90 a tick), so asserting the un-infused 60 a tick fails — the assertion is alive`, `EXIT:1` — `e2e-factor-selftest.log` |
-| control | `CONTROL=1 tools/e2e.sh` (unmodded Nightly) | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` — `e2e-factor-control.log` |
+| build (package) | `launcher-game.sh build rftoolspower` | `Compiling rftoolspower (1 of 1)`, `native-0a875da-9ce8dccaf5cc`, exported — `native-build.log` |
+| build (package + receiver) | `tools/build-e2e-game.sh` | `native-0a875da-29952fb57a7a`, `rfpowerharness` 0.1.0 and `rftoolspower` **0.1.12** — `native-build-modset.log` |
+| main | `tools/e2e.sh` (A–CE) | **PASS**, `EXIT:0`; `PACKAGE … sha256=b98f7cbc… bytes=208103` — `e2e-enderfactor.log` |
+| selftest (enderfactor) | `SELFTEST=enderfactor tools/e2e.sh` (CC/CD inverted) | `FAIL: selftest: the enderfactor assertions are alive — gain: the pearl paid 450 FE at mode 2 (artefact: 3 x 150 = 450), so asserting the un-infused 300 fails; hold: a held pearl spent 7659 FE in 23 ticks (333 a tick), so asserting the un-infused 500 a tick fails`, `EXIT:1` — `e2e-enderfactor-selftest.log` |
+| control | `CONTROL=1 tools/e2e.sh` (unmodded Nightly) | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` — `e2e-enderfactor-control.log` |
 
-`python3 ports/tools/check-e2e-logs.py rftoolspower-e2e --strict` → `logs=35 ok=35
-missing-exit=0 bad-exit=0` (the slice-1…11 logs stay beside the new ones and are still green; the two
-component-field probes are in `ports/rftoolspower/debug/`, outside the evidence tree).
+`python3 ports/tools/check-e2e-logs.py rftoolspower-e2e --strict` → `logs=38 ok=38
+missing-exit=0 bad-exit=0` (the 35 prior legs stay green). The probes used while designing the leg
+live in `ports/rftoolspower/debug/`, outside the evidence tree.
 
-The slice's new parsed assertions are in `notes.md` (phases CA/CB); the numbers a reader should
+The slice's new parsed assertions are in `notes.md` (phases CC/CD/CE); the numbers a reader should
 check first:
 
-- **the burn and the rate**: the carrier reads `infused 128 factor 0.500 rf 90`, and one coal starts
-  `burning 744/750` (`750 = 600 + (int)(600 × 0.5 / 2)`); over two replies naming `t=242 → 279` the
-  store rises `540 → 3,870` — **+3,330 = 90 × 37**;
-- **the differential**: a generator with no carrier starts a 600-tick burn and makes exactly
-  **60 × Δburn**;
-- **the refusal**: a stone clicked on the infusion slot changes nothing, stays in the server-side
-  `Inventory`, and is not placed against the machine;
-- **the artefact's float casts**: `60 × (1 + factor)` is exact at factor 0.5, but `infused=1` gives
-  no extra FE and one extra tick — the unit tests pin the truncation the in-game window cannot see.
+- **the carrier gate**: the endergenic's own reply names `carrier rftoolspower:power_core1 infused
+  256 factor 1.000` — the component round-trips on the endergenic, not just the coal generator;
+- **the gain**: a pearl landing at mode 1 paid **300** (`t=12763`) against the un-infused 200, and a
+  first attempt at mode 2 paid **450** = 3 × 150. Both are the artefact's `(long)(table × 2)` then
+  `(long)(rf × (factor+2)/2)`, not the dispatch prose's 600;
+- **the hold**: two replies naming `t=12763 → 12785` showed `spent=10323 → 17649`, i.e. **7,326 FE
+  over 22 ticks = 333 a tick**, against upstream's 500. A first window was cut by the artefact's own
+  0.6 % discard (`reason="Random pearl discard"`) and was retried on a fresh destination — the retry
+  is the proof the window can fail;
+- **the refusal**: a stone clicked on the endergenic's infusion slot changes nothing, stays in the
+  server-side `Inventory`, and is not placed against the machine.
 
 ## The delivered package
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `ports/rftoolspower/rftoolspower.hmod` | 205,875 B | `12edfec12d1537c8d72e4ff3dafbb789addbf684dce4d1667173cbcf3a2a65a9` | 154 |
+| `ports/rftoolspower/rftoolspower.hmod` | 208,103 B | `b98f7cbc05f4778656c02366ae5f451b4a3848873b3e722a0795c8f7902d95df` | 154 |
 
 No packed `Cargo.lock`; `src/runtime.rs` inside the archive is byte-identical to the tree file
 (`verify-sdk-package.py`), and every packed file is the tree's bytes (`package matches the tree`).
 The package was built **after the last packed edit** (`horizon-mod.toml`, `Cargo.toml`, `README.md`
 and `src/` — all packed). Only `notes.md`, `VALIDATION.md`, `FINDINGS.md`, `CONTENT.md`,
-`tools/e2e.sh`, `tools/parse_info.py` and the harness `.in` files changed afterwards, and none of them
-is packed. The earlier 0.1.10 artifact was 202,754 B / `acf020a0…` / 154 entries.
+`tools/e2e.sh`, `tools/parse_ender.py` and the debug probes changed afterwards, and none of them is
+packed. The earlier 0.1.11 artifact was 205,875 B / `12edfec1…` / 154 entries.
 
 ## Probes that are not evidence, and how they were avoided
 
-- A `horizon-ctl` run outside a lease can execute another port's `horizon-client` from the shared
-  target; every leg here was built into the same export the e2e then ran, and the export's
-  `native-mods.json` names exactly `rfpowerharness` 0.1.0 and `rftoolspower` 0.1.11.
-- The first in-game attempt put the carrier in slot 2 but read `infused 0`: the component's *field*
-  was `infusable` in code while the `/give` (and McJtyLib's `ItemInfusable`) uses `infused`. Two
-  probes (`debug/probe-component-field.log`, `debug/probe-saved-nbt.log`) named the stack and block
-  NBT; the fix separated the component field `infused` from the block-NBT key `infusable`.
-- A local shell variable named `CARRIER` was clobbered by `info`'s `eval` (the readout now prints a
-  `CARRIER=` field). The e2e uses `UPGRADE_ITEM`, and the parsed `CARRIER` is an assertion.
-- A store still moving is not conserved across two sequential reads; CA/CB use the two replies'
-  own `t=` and paired burn deltas, never a wall-clock sleep, as the earlier slices do.
-- `SELFTEST=factor` is the focused inversion: CA asserts the un-infused 60 FE a tick and the leg
-  fails with its `EXIT:1` naming the real 90, so the rate assertion can fail. The control leg proves
-  a fresh generator cannot even be placed without this package.
-- Before each build, the stale `native-*` tags carrying this mod were removed so the launcher could
-  not select a build of the previous source version; one retry was needed when another port's
-  launcher build held the shared native-build lock.
+- A forwarded `cargo fmt` reformatted only the remote copy (the runner's pull excludes `*.rs`); the
+  formatting was applied locally and re-checked through the slot runner. No build ran locally.
+- The e2e's focused selftest dispatch had to move to the tail: `enderfactor_phases` calls helpers
+  (`give_injector`, `place_held`, `link`) defined much later in the script, and an early dispatch
+  exited 127 (`command not found`) before reaching the game. The green leg and the `EXIT:1` selftest
+  carry the corrected script.
+- The two stale `native-*` tags carrying this mod (`3d288b05a395`, `44fd54c31c1d`) were deleted
+  before the build so the launcher could not select a build of the previous source.
+- The carrier is consumed into slot 0, so it is **not** in the player's inventory afterwards; the
+  "stays server-side" assertion belongs only to the refused stone.
+- Two sequential reads of a moving store are not comparable; CC/CD use the replies' own `t=` and
+  paired `spent=` deltas, and a window whose `dropped` counter moved is retried rather than asserted.
