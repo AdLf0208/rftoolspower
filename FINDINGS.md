@@ -185,6 +185,30 @@ component's field named `infused` (McJtyLib's `ItemInfusable`) and an existing c
 carrier in a third generator slot. Upstream applies the component when the machine is placed; here
 it is read from the slot every tick, so a broken machine loses its infusion — a documented deviation.
 
+## Slice 14: the dimensional cell (read at the same commits)
+
+`modules/dimensionalcell/` at `1.21_neo` @ `e44463cacddb85155839373b42d39bc705d618c0`:
+
+- `DimensionalCellConfiguration.java:24-36` — `rfPerTick=5000`, `rfPerNormalCell=1,000,000`,
+  `advancedFactor=4`, `simpleFactor=4`, `powercellChargePerTick=30000`;
+- `DimensionalCellTileEntity.java:406-411` — `getPowerFactor` is 1 simple / 4 normal / 16 advanced,
+  so capacity (`rfPerNormalCell × factor / simpleFactor`, `:480`/`:558`) is 250k/1M/4M and
+  `getRfPerTickPerSide` (`:364`, minus the infusion term) is 1,250/5,000/20,000;
+- `:139-167` — the six `Mode`s `none`/`input`/`output` cycle NONE → INPUT → OUTPUT → NONE;
+  `:443-460` takes FE only through an INPUT face; `:319-344` pushes out of OUTPUT faces;
+- `:381-399` — slot 0 takes a `PowerCellCardItem`; an unlinked card (`id=-1`) allocates a channel
+  and is written back, and the cell's `DimensionalCellData.networkId` is set to it;
+  `items/PowerCellCardItem.java` stores the id under `ITEM_POWERCARD_DATA`, a record `{id}` whose
+  empty id is -1 (`data/PowerCardData.java`);
+- `DimensionalCellNetwork.java:117-125` — one saved `energy` int per channel, capacity summed over
+  members (normal 1×, advanced 4×, simple ¼), with distance-based extraction cost factors that this
+  port does not carry (no RFTools dimensions at this pin).
+
+The port follows these numbers exactly. Its pool is the sum of the member cells' saved stores
+instead of the world-data int, because the pin has no world-data attachment or block-entity
+enumeration; the channel index is rebuilt from the cells' saved ids on their tick. Documented in
+`notes.md` and proven in game in phases DA–DE.
+
 ## Slice 13: the endergenic's two float rules (read at the same commits)
 
 Files read in the upstream `1.21_neo` checkout @ `e44463ca`:

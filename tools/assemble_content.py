@@ -224,6 +224,11 @@ LANG = {
     "block.rftoolspower.blazing_generator": "Blazing Generator",
     "block.rftoolspower.blazing_agitator": "Blazing Agitator",
     "block.rftoolspower.blazing_infuser": "Blazing Infuser",
+    "block.rftoolspower.dimensionalcell": "Dimensional Cell",
+    "block.rftoolspower.dimensionalcell_simple": "Dimensional Cell (Simple)",
+    "block.rftoolspower.dimensionalcell_advanced": "Dimensional Cell (Advanced)",
+    "block.rftoolspower.dimensionalcell_creative": "Dimensional Cell (Creative)",
+    "item.rftoolspower.powercell_card": "Powercell Card",
     "item.rftoolspower.power_core1": "Power Core (Low)",
     "item.rftoolspower.power_core3": "Power Core (High)",
     "item.rftoolspower.blazing_rod": "Blazing Rod",
@@ -246,6 +251,11 @@ CREATIVE_TAB = {
         "rftoolspower:blazing_generator",
         "rftoolspower:blazing_agitator",
         "rftoolspower:blazing_infuser",
+        "rftoolspower:dimensionalcell",
+        "rftoolspower:dimensionalcell_simple",
+        "rftoolspower:dimensionalcell_advanced",
+        "rftoolspower:dimensionalcell_creative",
+        "rftoolspower:powercell_card",
         "rftoolspower:blazing_rod",
         "rftoolspower:power_core1",
         "rftoolspower:power_core3",
@@ -281,6 +291,10 @@ TAGS = {
         "rftoolspower:blazing_generator",
         "rftoolspower:blazing_agitator",
         "rftoolspower:blazing_infuser",
+        "rftoolspower:dimensionalcell",
+        "rftoolspower:dimensionalcell_simple",
+        "rftoolspower:dimensionalcell_advanced",
+        "rftoolspower:dimensionalcell_creative",
     ],
 }
 
@@ -297,6 +311,14 @@ CELL_DECL = {
     },
     "item": True,
 }
+
+# A dimensional cell is the same McJtyLib STANDARD_IRON block as a powercell: a plain full cube.
+# Its six face modes are saved in the block entity, not in block states (no renderer in this tier).
+DIM_CELL_DECL = dict(CELL_DECL)
+
+# The card is a plain 64-stack item; the jar's item model has a custom `linked` predicate that
+# 26.3 does not know, so this package uses its `layer0` texture without the overrides.
+CARD_DECL = {"template": "minecraft:stick"}
 
 # `EndergenicModule.ENDERGENIC`: `Properties.of().strength(2.0f).sound(METAL).noOcclusion()` with
 # `RotationType.NONE` — a full cube, no facing. `PEARL_INJECTOR` takes BlockBuilder's default
@@ -951,6 +973,71 @@ def build(out: Path) -> None:
     write(
         out / f"data/rftoolspower/advancement/recipes/misc/{INFUSER}.json",
         json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{INFUSER}.json")),
+    )
+
+    # --- the dimensional cell (slice 14): four tiers, each a plain cube from the jar's own
+    # `block/dimcell/` texture, a block entity and an item. The cell recipes carry but need the
+    # parent's machine frame / infused diamond, so they craft nothing in this build; the card's
+    # plain recipe uses only vanilla items and is proven in game.
+    for name, texture in (
+        ("dimensionalcell", "dimensionalcell"),
+        ("dimensionalcell_simple", "dimensionalcellsimple"),
+        ("dimensionalcell_advanced", "dimensionalcelladvanced"),
+        ("dimensionalcell_creative", "dimensionalcellcreative"),
+    ):
+        write(
+            out / f"assets/rftoolspower/blockstates/{name}.json",
+            {"variants": {"": {"model": f"rftoolspower:block/{name}"}}},
+        )
+        write(
+            out / f"assets/rftoolspower/models/block/{name}.json",
+            {
+                "parent": "minecraft:block/cube_all",
+                "textures": {"all": f"rftoolspower:block/dimcell/{texture}"},
+            },
+        )
+        write(
+            out / f"assets/rftoolspower/models/item/{name}.json",
+            {"parent": f"rftoolspower:block/{name}"},
+        )
+        write(
+            out / f"assets/rftoolspower/items/{name}.json",
+            {"model": {"model": f"rftoolspower:item/{name}", "type": "minecraft:model"}},
+        )
+        binary(
+            out / f"assets/rftoolspower/textures/block/dimcell/{texture}.png",
+            read_jar(POWER, f"assets/rftoolspower/textures/block/dimcell/{texture}.png"),
+        )
+        write(out / f"data/rftoolspower/horizon/block/{name}.json", DIM_CELL_DECL)
+        write(out / f"data/rftoolspower/loot_table/blocks/{name}.json", plain_loot(name))
+        if name != "dimensionalcell_creative":
+            write(out / f"data/rftoolspower/recipe/{name}.json", patched_recipe(name))
+            write(
+                out / f"data/rftoolspower/advancement/recipes/misc/{name}.json",
+                json.loads(read_jar(POWER, f"data/rftoolspower/advancement/recipes/misc/{name}.json")),
+            )
+
+    card_model = json.loads(read_jar(POWER, "assets/rftoolspower/models/item/powercell_card.json"))
+    card_model.pop("overrides", None)
+    write(out / "assets/rftoolspower/models/item/powercell_card.json", card_model)
+    write(
+        out / "assets/rftoolspower/items/powercell_card.json",
+        {
+            "model": {
+                "model": "rftoolspower:item/powercell_card",
+                "type": "minecraft:model",
+            }
+        },
+    )
+    binary(
+        out / "assets/rftoolspower/textures/item/powercellcarditem.png",
+        read_jar(POWER, "assets/rftoolspower/textures/item/powercellcarditem.png"),
+    )
+    write(out / "data/rftoolspower/horizon/item/powercell_card.json", CARD_DECL)
+    write(out / "data/rftoolspower/recipe/powercell_card.json", patched_recipe("powercell_card"))
+    write(
+        out / "data/rftoolspower/advancement/recipes/misc/powercell_card.json",
+        json.loads(read_jar(POWER, "data/rftoolspower/advancement/recipes/misc/powercell_card.json")),
     )
 
 

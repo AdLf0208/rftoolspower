@@ -1,0 +1,18 @@
+{
+  "category": "misc",
+  "key": {
+    "g": "minecraft:gold_nugget",
+    "p": "minecraft:paper",
+    "r": "minecraft:redstone"
+  },
+  "pattern": [
+    "rgr",
+    "gpg",
+    "rgr"
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:powercell_card"
+  },
+  "type": "minecraft:crafting_shaped"
+}

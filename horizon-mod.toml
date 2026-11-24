@@ -1,6 +1,6 @@
 id = "rftoolspower"
 name = "RFTools Power"
-version = "0.1.12"
+version = "0.1.13"
 description = """A port of RFTools Power for Horizon: the Coal Generator, which burns coal, charcoal or a
 coal block for 600 ticks each (nine times that for a block) at 60 FE a tick into a 500,000 FE
 buffer, lights its own front while it burns, takes fuel from a hopper or a right click, gives its
@@ -33,7 +33,9 @@ output slots unless their slot is locked, over a 50,000 FE buffer that takes 100
 spends 10; and the Blazing Infuser, which spends one catalyst and 10 FE a run on every 11th tick
 to raise the input rod's quality and duration by the catalyst's percentage of a whole 64-step
 stack (a nether star +120 %, redstone +40 % quality only), moves the rod to its output slot when
-its last infusion step is used, and stores 50,000 FE."""
+its last infusion step is used, and stores 50,000 FE; and the Dimensional Cell (simple / normal /
+advanced / creative), a 250,000 / 1,000,000 / 4,000,000 FE buffer with six face modes whose
+powercell card carries a typed channel id linking cells across distance into one shared store."""
 authors = ["McJty", "Horizon native mod contributors"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside the carried data/ and assets/. The id is the resource namespace and the only identity:

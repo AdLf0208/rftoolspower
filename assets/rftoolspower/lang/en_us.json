@@ -6,6 +6,10 @@
   "block.rftoolspower.cell2": "Powercell (Medium)",
   "block.rftoolspower.cell3": "Powercell (High)",
   "block.rftoolspower.coalgenerator": "Coal Generator",
+  "block.rftoolspower.dimensionalcell": "Dimensional Cell",
+  "block.rftoolspower.dimensionalcell_advanced": "Dimensional Cell (Advanced)",
+  "block.rftoolspower.dimensionalcell_creative": "Dimensional Cell (Creative)",
+  "block.rftoolspower.dimensionalcell_simple": "Dimensional Cell (Simple)",
   "block.rftoolspower.ender_monitor": "Ender Monitor",
   "block.rftoolspower.endergenic": "Endergenic",
   "block.rftoolspower.pearl_injector": "Pearl Injector",
@@ -14,6 +18,7 @@
   "item.rftoolspower.blazing_rod": "Blazing Rod",
   "item.rftoolspower.power_core1": "Power Core (Low)",
   "item.rftoolspower.power_core3": "Power Core (High)",
+  "item.rftoolspower.powercell_card": "Powercell Card",
   "itemGroup.rftoolspower": "RFTools Power",
   "message.rftoolspower.shiftmessage": "<Press Shift>"
 }

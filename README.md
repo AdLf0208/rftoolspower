@@ -1,11 +1,12 @@
 # RFTools Power for Horizon — the Coal Generator, the Power Monitor, the Power Level, the
-# Powercell, the Endergenic, the Ender Monitor, and the Blazing Generator, Agitator and Infuser
+# Powercell, the Endergenic, the Ender Monitor, the Blazing Generator, Agitator and Infuser, and
+# the Dimensional Cell
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.12**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.13**.
 
-Nine families so far (the coal generator gained the infusion factor in slice 12):
+Ten families so far (slice 14 adds the dimensional cell):
 
 **The Coal Generator** (slice 1)
 
@@ -128,6 +129,20 @@ Nine families so far (the coal generator gained the infusion factor in slice 12)
   held item never acts on the machine;
 - reads out through `/rftoolspower infuser <pos> [nonce]`.
 
+**The Dimensional Cell** (slice 14)
+
+- four tiers: **250,000 / 1,000,000 / 4,000,000 FE** (simple / normal / advanced, creative shares
+  the advanced numbers) and **1,250 / 5,000 / 20,000 FE a side a tick** — the artefact's
+  `rfPerNormalCell`, `simpleFactor` and `advancedFactor`, not the powercell's numbers;
+- six faces default to `NONE`, take FE only through an `INPUT` face and push through an `OUTPUT`
+  face (`/rftoolspower dimside <pos> <face> NONE|INPUT|OUTPUT`);
+- a **powercell card** carries the channel as this package's typed
+  `rftoolspower:powercard_data={id:N}` component; clicking a linked card into a cell joins it to
+  every other cell with the same id, near or far, so they read **one store and one summed capacity**;
+- reads out through `/rftoolspower dimcell <pos> [nonce]`; the card's own id is read with
+  `/rftoolspower card [nonce]`. The three cell recipes need the parent's machine frame or infused
+  diamond and craft nothing in this build; the card's purely vanilla recipe does craft.
+
 ## Build
 
 ```sh
@@ -146,7 +161,7 @@ packed.
 | `src/support.rs` | the glue: every block entity Part, the container and buffer declarations, the ticks, the clicks, the drops, the redstone, the `fireMonitors` notice, the blazing rod's item component and the commands |
 | `src/lib.rs` | the one `impl mod_api::Hooks` |
 | `assets/`, `data/` | the carried content, built by `tools/assemble_content.py` |
-| `tools/e2e.sh` | the in-game leg (phases A–BS) |
+| `tools/e2e.sh` | the in-game leg (phases A–BS, BT–BW and DA–DE) |
 | `tools/build-e2e-game.sh`, `tools/harness-receiver/` | the e2e-only energy receiver the push is proven against (never in the `.hmod`) |
 | `notes.md` | the slices, the evidence, the gaps |
 | `FINDINGS.md` | the upstream behaviour extracted (analysis only) |

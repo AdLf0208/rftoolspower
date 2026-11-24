@@ -1,4 +1,46 @@
-# RFTools Power — validation record (slice 13, package 0.1.12)
+# RFTools Power — validation record (slice 14, package 0.1.13)
+
+## Slice 14 — the dimensional cell (2026-11-24)
+
+Pin `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` + mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, mod API `0.2`, game 26.3. Package **0.1.13**, sha
+`ca86febbbb54b4642faf9c90185c260532227f5e63c48e36ce5b1a670c11ab1b`, 230,612 B, 194 entries.
+
+The artefact's capacities/rates came from `DimensionalCellConfiguration.java` at `1.21_neo`
+@ `e44463ca` — `rfPerTick=5000` (:26), `rfPerNormalCell=1,000,000` (:29), `simpleFactor=4` (:36),
+`advancedFactor=4` (:33) — and `getPowerFactor` (:406): simple 250,000/1,250, normal 1,000,000/5,000,
+advanced 4,000,000/20,000. The carrier gate passed: `/rftoolspower card` read
+`Card: item=rftoolspower:powercell_card net=7 nonce=240` off the live held stack, and the clicked
+simple cell read `net=7`; no chat command set a link.
+
+Every compile gate was invoked through `build-slot.sh run --job W1-rftoolspower --port
+ports/rftoolspower --step …`, forwarding to `AdLf-PC` (no `BUILD_LOCAL=1`).
+
+| step | result |
+|---|---|
+| red | `165 passed; 5 failed` — `not yet implemented: dim_tier_capacity / dim_tier_per_side / dim_card_network / dim_pool / dim_receive is not written yet` (`red-dimensionalcell.log`) |
+| green test | **171 passed; 0 failed** (`sdk-test.log`, regenerated after the final build, naming the delivered sha) |
+| clippy / fmt | 0 warnings / clean (`sdk-clippy.log`, `sdk-fmt.log`) |
+| build 1 / 2 | both 230,612 B, sha `ca86feb…`, `cmp`-identical, no packed `Cargo.lock` |
+| check | `0.1.13 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, exit 0 |
+| fits | `0a875da made for` / `0b14f8a fits`, exit 0 |
+| package gate | `verify-sdk-package.py rftoolspower` → **1/1** (`package matches the tree`, R9 clean) |
+| game build | `Compiling rftoolspower (1 of 1)`; single `native-0a875da-227fab837d01`, two-mod `native-0a875da-80f83af1b992` (`rftoolspower` 0.1.13) |
+| main leg | `e2e-dimensionalcell.log` — **PASS, `EXIT:0`** (A–BS, BT–BW, DA–DE) |
+| control | `e2e-dimensionalcell-control.log` — unmodded game cannot place the generator, `EXIT:1` |
+| selftest | `e2e-dimensionalcell-selftest.log` — asserts the normal 1,000,000 capacity on the simple pair, observes 250,000, `EXIT:1` |
+| strict | `check-e2e-logs.py rftoolspower-e2e --strict` → `logs=41 ok=41 missing-exit=0 bad-exit=0` |
+
+The decisive parsed assertions: DA's gate reply; DB's `tier=simple local=0/250000 network=0/500000
+n=2 net=7` at **both** cells four blocks apart against `n=1 net=-1 network=0/250000` at the unlinked
+cell; DC's `22500 → 65000` over 34 ticks = `1,250 × 34` at cell B; DD's `75000 → 43750` over 25
+ticks = `1,250 × 25` with the receiver gaining FE; DE's crafted-and-consumed card recipe. The
+carry-over cell recipes are `blocked(parent-absent)` (no `rftoolsbase:machine_frame` or
+`infused_diamond` in this build). Full transcript and coverage: `notes.md` §Slice 14.
+
+---
+
+## Historical — slice 13, package 0.1.12
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
 `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, mod API `0.2`, game 26.3. Package **0.1.12**.

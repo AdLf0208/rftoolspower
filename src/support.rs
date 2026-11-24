@@ -23,16 +23,17 @@ use mod_api::{
 use crate::runtime::{
     AGITATOR_CAPACITY, AGITATOR_INSERT_PER_TICK, AGITATOR_OUTPUTS, AGITATOR_SLOTS,
     AGITATOR_USE_PER_TICK, Agitator, BLAZING_CAPACITY, BLAZING_SLOTS, Blazing, BlazingSlot,
-    CAPACITY, Catalyst, Cell, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK, EnderMonitor, Endergenic,
-    FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE, INFUSER_CAPACITY, INFUSER_CATALYST,
-    INFUSER_COUNTER_START, INFUSER_INPUT, INFUSER_INSERT_PER_TICK, INFUSER_OUTPUT, INFUSER_SLOTS,
-    INJECTOR_SLOTS, Infuser, Loss, MAX_DISTANCE, MAX_INFUSE, MONITOR_SIGNAL, Monitor, MonitorMode,
-    NETWORK_MAX, OBSERVE_TICKS, PEARL, PowerLevel, Pulse, ROD_START_STEPS, Rod, RodSlot, SideMode,
-    Sides, Tier, as_capability, capacity as network_capacity, charge_step, clamp_agitator,
-    clamp_blazing, clamp_endergenic, clamp_energy, clamp_infuser, clamped_energy,
-    generator_rf_per_tick, infused_factor, network_valid, pearl_lost, receive as network_receive,
-    restored, rf_per_tick, rising_edge, send_amount, stored as network_stored,
-    take as network_take,
+    CAPACITY, Catalyst, Cell, DimCell, DimTier, ENDERGENIC_CAPACITY, EXTRACT_PER_TICK,
+    EnderMonitor, Endergenic, FIRST_POWER_OBSERVE_TICKS, Fuel, Generator, HOLDING, IDLE,
+    INFUSER_CAPACITY, INFUSER_CATALYST, INFUSER_COUNTER_START, INFUSER_INPUT,
+    INFUSER_INSERT_PER_TICK, INFUSER_OUTPUT, INFUSER_SLOTS, INJECTOR_SLOTS, Infuser, Loss,
+    MAX_DISTANCE, MAX_INFUSE, MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX, OBSERVE_TICKS,
+    PEARL, PowerLevel, Pulse, ROD_START_STEPS, Rod, RodSlot, SideMode, Sides, Tier, as_capability,
+    capacity as network_capacity, charge_step, clamp_agitator, clamp_blazing, clamp_endergenic,
+    clamp_energy, clamp_infuser, clamped_energy, dim_capacity, dim_card_network, dim_receive,
+    dim_stored, generator_rf_per_tick, infused_factor, network_valid, pearl_lost,
+    receive as network_receive, restored, rf_per_tick, rising_edge, send_amount,
+    stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -230,6 +231,26 @@ pub(crate) fn declare(
     declare_cell(r, context, CELL1_TYPE, "cell1", CELL1, Tier::One);
     declare_cell(r, context, CELL2_TYPE, "cell2", CELL2, Tier::Two);
     declare_cell(r, context, CELL3_TYPE, "cell3", CELL3, Tier::Three);
+
+    // The dimensional cell: one block entity type for all four tiers, each with the pool's own
+    // energy capability and a card slot. The link comes from the card's typed component.
+    let kind = r
+        .block_entity_type(DIM_TYPE)
+        .blocks(&[
+            "dimensionalcell",
+            "dimensionalcell_simple",
+            "dimensionalcell_advanced",
+            "dimensionalcell_creative",
+        ])
+        .build();
+    for block in [DIM_CELL, DIM_SIMPLE, DIM_ADVANCED, DIM_CREATIVE] {
+        declare_dim_cell(r, block);
+    }
+    if let Err(error) = r.block_entity_part(&kind, DimCellPart) {
+        context.refuse(&format!(
+            "rftoolspower: the dimensional cell part was refused: {error}"
+        ));
+    }
 
     // The endergenic generator: a type, the buffer the monitor reads (5,000,000 FE, nothing in or
     // out through the capability — it pushes on its own tick), its Part and its item's Part.
@@ -2398,6 +2419,9 @@ pub(crate) fn declare_component(types: &mut Vec<String>) {
     if !types.iter().any(|known| known == INFUSABLE_DATA) {
         types.push(INFUSABLE_DATA.to_owned());
     }
+    if !types.iter().any(|known| known == POWERCARD_DATA) {
+        types.push(POWERCARD_DATA.to_owned());
+    }
 }
 
 /// A saved float, 0 when absent or of another type.
@@ -2669,6 +2693,9 @@ pub(crate) fn on_right_click_block(
     };
     let block = block_id(&*host, level, click.pos);
     let handled = match block.as_deref() {
+        Some(DIM_CELL | DIM_SIMPLE | DIM_ADVANCED | DIM_CREATIVE) => {
+            dim_cell_click(host, click, click.stack)
+        }
         Some(ENDERGENIC) => endergenic_carrier_click(host, click, click.stack),
         Some(BLAZING) => blazing_click(host, click, click.stack),
         Some(AGITATOR) => agitator_click(host, click, click.stack),
@@ -3492,6 +3519,9 @@ pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
         "rftoolspower agitator <pos:block_pos> [nonce:word]",
         "rftoolspower agitatelock <pos:block_pos> <slot:integer> <lock:word> [nonce:word]",
         "rftoolspower infuser <pos:block_pos> [nonce:word]",
+        "rftoolspower dimcell <pos:block_pos> [nonce:word]",
+        "rftoolspower dimside <pos:block_pos> <face:word> <mode:word>",
+        "rftoolspower card [nonce:word]",
     ] {
         commands.push(Command::op(usage, OPERATOR_LEVEL));
     }
@@ -3613,6 +3643,9 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             | "band"
             | "cell"
             | "side"
+            | "dimcell"
+            | "dimside"
+            | "card"
             | "endergenic"
             | "injector"
             | "enderlink"
@@ -3630,6 +3663,24 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         )));
         return Flow::Cancel;
     }
+    // `card` names no block: it reads the channel off the player's held card component, which is
+    // the carrier gate's parsed assertion. It never writes a link.
+    if subcommand == "card" {
+        let player = match event.source {
+            mod_api::CommandSource::Player { player, .. } => *player,
+            _ => {
+                let _ = host.commands().feedback(Text::literal("Card: no player"));
+                return Flow::Cancel;
+            }
+        };
+        let line = format!(
+            "{}{}",
+            card_status_line(host, player),
+            nonce_of(event).map_or(String::new(), |nonce| format!(" nonce={nonce}"))
+        );
+        let _ = host.commands().feedback(Text::literal(line));
+        return Flow::Cancel;
+    }
     let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
         return Flow::Continue;
     };
@@ -3639,6 +3690,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
             "monitor" | "band" => NO_MONITOR,
             "powerlevel" => NO_POWER_LEVEL,
             "cell" | "side" => NO_CELL,
+            "dimcell" | "dimside" => NO_DIM_CELL,
             "endergenic" | "enderlink" => NO_ENDERGENIC,
             "injector" => NO_INJECTOR,
             "endermonitor" => NO_ENDER_MONITOR,
@@ -3658,6 +3710,14 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
         "powerlevel" => power_level_status_line(host, level, *pos, nonce_of(event)),
         "cell" => cell_status_line(host, level, *pos, nonce_of(event)),
         "side" => set_side(
+            host,
+            level,
+            *pos,
+            word_of(event, "face").unwrap_or_default(),
+            word_of(event, "mode").unwrap_or_default(),
+        ),
+        "dimcell" => dim_cell_status_line(host, level, *pos, nonce_of(event)),
+        "dimside" => set_dim_side(
             host,
             level,
             *pos,
@@ -3700,6 +3760,642 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
     };
     let _ = host.commands().feedback(Text::literal(line));
     Flow::Cancel
+}
+
+// ---------------------------------------------------------------------------
+// The dimensional cell (`modules/dimensionalcell`, artefact @ e44463ca)
+// ---------------------------------------------------------------------------
+
+/// The normal tier (`DimensionalCellModule.DIMENSIONAL_CELL`: 1,000,000 FE, 5,000 a side).
+pub(crate) const DIM_CELL: &str = "rftoolspower:dimensionalcell";
+/// The simple tier (`DIMENSIONAL_CELL_SIMPLE`: 250,000 FE, 1,250 a side).
+const DIM_SIMPLE: &str = "rftoolspower:dimensionalcell_simple";
+/// The advanced tier (`DIMENSIONAL_CELL_ADVANCED`: 4,000,000 FE, 20,000 a side).
+const DIM_ADVANCED: &str = "rftoolspower:dimensionalcell_advanced";
+/// The creative tier (`DIMENSIONAL_CELL_CREATIVE`: advanced numbers, free FE every tick).
+const DIM_CREATIVE: &str = "rftoolspower:dimensionalcell_creative";
+/// One block entity type serves all four blocks: the tier is read from the block's id.
+const DIM_TYPE: &str = "dimensionalcell_block_entity";
+/// The card's own item (`DimensionalCellModule.POWERCELL_CARD`), carried as content.
+const POWERCELL_CARD: &str = "rftoolspower:powercell_card";
+/// The card's typed component (`DimensionalCellModule.ITEM_POWERCARD_DATA`, `PowerCardData`).
+const POWERCARD_DATA: &str = "rftoolspower:powercard_data";
+/// The saved channel id; -1 means "no card" (upstream's `PowerCardData.EMPTY`).
+const KEY_NETWORK: &str = "network";
+/// What a read where no dimensional cell stands answers.
+const NO_DIM_CELL: &str = "No RFTools Power dimensional cell there.";
+/// The card slot of the cell's container (upstream's `SLOT_CARD`).
+const DIM_CARD_SLOT: usize = 0;
+/// One slot: the card. The copy slot and the charge-item slot are not carried (recorded in notes).
+const DIM_SLOTS: usize = 1;
+
+/// The card's channel id: upstream's `PowerCardData` record with its single int `id`.
+struct PowerCard;
+
+impl Component for PowerCard {
+    type Value = i32;
+
+    fn id(&self) -> &str {
+        POWERCARD_DATA
+    }
+
+    fn decode(&self, value: &Tag) -> Option<i32> {
+        match value {
+            Tag::Int(id) => Some(*id),
+            Tag::Long(id) => Some(i32::try_from(*id).unwrap_or(-1)),
+            Tag::Compound(_) => Some(int_or(value, "id", -1)),
+            _ => None,
+        }
+    }
+
+    fn encode(&self, id: i32) -> Tag {
+        Tag::compound([("id", Tag::Int(id))])
+    }
+}
+
+/// The channel a card stack names, -1 when it carries no link.
+fn card_network(stack: &ItemStack) -> i32 {
+    stack.get(&PowerCard).unwrap_or(-1)
+}
+
+/// The channel registry. The pin has no world-data attachment and no way to enumerate block
+/// entities, so each cell registers `(dimension, pos)` under its card's channel on its tick;
+/// members are re-validated against their own saved id on every read, so a broken or unlinked
+/// cell cannot inflate a pool. Upstream's `DimensionalCellNetwork` is a saved world-data map;
+/// this in-memory index is rebuilt from the world over the first tick after a load (a documented
+/// deviation).
+type DimMembers = HashSet<(mod_api::DimensionKey, [i32; 3])>;
+
+static DIM_CHANNELS: LazyLock<Mutex<HashMap<i32, DimMembers>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register a linked cell's position under its channel.
+fn dim_register(level: LevelRef, pos: [i32; 3], network: i32) {
+    let Some(channel) = dim_card_network(network) else {
+        return;
+    };
+    if let Ok(mut channels) = DIM_CHANNELS.lock() {
+        channels
+            .entry(channel)
+            .or_default()
+            .insert((level.dimension(), pos));
+    }
+}
+
+/// The members of a channel, positions ordered so the pool is deterministic, asked cell first.
+fn dim_members(level: LevelRef, pos: [i32; 3], network: i32) -> Vec<[i32; 3]> {
+    let mut others = {
+        let Ok(channels) = DIM_CHANNELS.lock() else {
+            return Vec::new();
+        };
+        channels
+            .get(&network)
+            .map(|set| {
+                let mut positions: Vec<[i32; 3]> = set
+                    .iter()
+                    .filter(|(dimension, at)| *dimension == level.dimension() && *at != pos)
+                    .map(|(_, at)| *at)
+                    .collect();
+                positions.sort_unstable();
+                positions
+            })
+            .unwrap_or_default()
+    };
+    others.insert(0, pos);
+    others
+}
+
+/// The cell at `pos`: its tier, clamped store and saved channel (-1 unlinked).
+fn dim_cell_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<DimCell> {
+    let tier = DimTier::of_block(&block_id(&*host, level, pos)?)?;
+    let entity = host.block_entity(level, pos)?;
+    let saved = Tag::Compound(entity.data(&*host)?);
+    Some(DimCell {
+        tier,
+        energy: clamped_dim_energy(tier, int(&saved, KEY_ENERGY)),
+        network: int_or(&saved, KEY_NETWORK, -1),
+    })
+}
+
+/// One cell's store clamped to its own tier's capacity.
+fn clamped_dim_energy(tier: DimTier, energy: i32) -> i32 {
+    energy.clamp(0, tier.capacity())
+}
+
+/// Write a cell's store and channel back, keeping the block entity type's id.
+fn write_dim_cell(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    energy: i32,
+    network: i32,
+) -> bool {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return false;
+    };
+    let Some(mut saved) = entity.data(&*host) else {
+        return false;
+    };
+    saved.insert(KEY_ENERGY.into(), Tag::Int(energy));
+    saved.insert(KEY_NETWORK.into(), Tag::Int(network));
+    entity.replace_data(host, saved).unwrap_or(false)
+}
+
+/// The pool the cell at `pos` belongs to, the asked cell first. An unlinked cell is its own pool.
+fn dim_pool(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    self_state: Option<DimCell>,
+) -> Vec<DimCell> {
+    let Some(asked) = self_state.or_else(|| dim_cell_at(host, level, pos)) else {
+        return Vec::new();
+    };
+    let mut cells = vec![asked];
+    let Some(network) = dim_card_network(asked.network) else {
+        return cells;
+    };
+    for at in dim_members(level, pos, network) {
+        if at == pos {
+            continue;
+        }
+        let Some(cell) = dim_cell_at(host, level, at) else {
+            continue;
+        };
+        if cell.network == network {
+            cells.push(cell);
+        }
+    }
+    cells
+}
+
+/// The six face modes of a dimensional cell, saved in the powercell's own six-digit string.
+fn dim_sides(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Sides {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return Sides::fresh();
+    };
+    let Some(saved) = entity.data(host) else {
+        return Sides::fresh();
+    };
+    read_sides_from(&Tag::Compound(saved))
+}
+
+/// `DimensionalCellTileEntity.SidedHandler`: the pool's store and capacity, taking FE only
+/// through an `INPUT` face and never giving any out through the capability (it pushes on tick).
+struct DimEnergy {
+    at: BlockSide,
+}
+
+impl DimEnergy {
+    fn pool(&self, host: &mut dyn ServerHost) -> Vec<DimCell> {
+        dim_pool(host, self.at.level, self.at.pos, None)
+    }
+}
+
+impl EnergyHandler for DimEnergy {
+    fn amount(&self, host: &mut dyn ServerHost) -> u32 {
+        u32::try_from(dim_stored(&self.pool(host)).min(i64::from(i32::MAX))).unwrap_or(0)
+    }
+
+    fn capacity(&self, host: &mut dyn ServerHost) -> u32 {
+        u32::try_from(dim_capacity(&self.pool(host)).min(i64::from(i32::MAX))).unwrap_or(0)
+    }
+
+    fn insert(&self, host: &mut dyn ServerHost, _tx: &Transaction, amount: u32) -> u32 {
+        if amount == 0 {
+            return 0;
+        }
+        let Some(face) = self.at.side else {
+            return 0;
+        };
+        if dim_sides(&*host, self.at.level, self.at.pos).get(face_index(face)) != SideMode::Input {
+            return 0;
+        }
+        let mut cells = self.pool(host);
+        if cells.is_empty() {
+            return 0;
+        }
+        let before: Vec<i32> = cells.iter().map(|cell| cell.energy).collect();
+        let taken = dim_receive(&mut cells, amount);
+        for (index, cell) in cells.iter().enumerate() {
+            if before[index] == cell.energy {
+                continue;
+            }
+            let positions = dim_members(self.at.level, self.at.pos, cells[0].network);
+            if let Some(at) = positions.get(index).copied() {
+                let _ = write_dim_cell(host, self.at.level, at, cell.energy, cell.network);
+            }
+        }
+        taken
+    }
+
+    fn extract(&self, _host: &mut dyn ServerHost, _tx: &Transaction, _amount: u32) -> u32 {
+        0
+    }
+}
+
+/// Declare one dimensional-cell block: one shared block entity type, a custom energy capability
+/// and a Part. Called for each of the four tier ids.
+fn declare_dim_cell(r: &mut dyn Registrar, block_id: &str) {
+    let block = r.block_key(block_id);
+    r.block_container(&block, dim_container());
+    r.block_capability(&ENERGY, &block, |_host, at, _state, entity| {
+        entity.map(|_| Box::new(DimEnergy { at }) as Box<dyn EnergyHandler>)
+    });
+    let item = r.item_key(block_id);
+    r.item_part(item, DimCellItemPart);
+}
+
+/// A placed dimensional cell clamps the store a `block_entity_data` item carried to its own tier.
+pub(crate) struct DimCellItemPart;
+
+#[mod_api::horizon_part]
+impl ItemPart for DimCellItemPart {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        let Some(level) = event
+            .placer
+            .and_then(|player| player.level(&*host))
+            .or_else(|| in_place_level(host))
+        else {
+            return;
+        };
+        let Some(tier) = DimTier::of_block(&block_id(&*host, level, event.pos).unwrap_or_default())
+        else {
+            return;
+        };
+        let Some(cell) = dim_cell_at(host, level, event.pos) else {
+            return;
+        };
+        let energy = clamped_dim_energy(tier, cell.energy);
+        if energy == cell.energy {
+            return;
+        }
+        let _ = write_dim_cell(host, level, event.pos, energy, cell.network);
+    }
+}
+
+/// A dimensional cell: it ticks to push out of its `OUTPUT` faces, registers its channel and a
+/// click reads it (or inserts a card).
+pub(crate) struct DimCellPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for DimCellPart {
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseItemOnEvent<'_>,
+    ) -> Option<InteractionResult> {
+        dim_cell_click(host, event.click, event.click.stack)
+    }
+
+    fn use_without_item(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseWithoutItemEvent<'_>,
+    ) -> Option<InteractionResult> {
+        dim_cell_click(host, event.click, None)
+    }
+}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for DimCellPart {
+    fn block_entity(
+        &self,
+        _level: LevelSide,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        let pos = event.pos;
+        let level = in_place_level(host);
+        if event.entity.items.len() != DIM_SLOTS {
+            event.entity.items.resize(DIM_SLOTS, None);
+        }
+        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+        let Some(tier) = level
+            .and_then(|level| DimTier::of_block(&block_id(&*host, level, pos).unwrap_or_default()))
+        else {
+            if let Tag::Compound(nbt) = saved {
+                event.entity.nbt = nbt;
+            }
+            *event.reply = BlockEntityTickReply::Unchanged;
+            return;
+        };
+        let own = DimCell {
+            tier,
+            energy: clamped_dim_energy(tier, int(&saved, KEY_ENERGY)),
+            network: int_or(&saved, KEY_NETWORK, -1),
+        };
+        if let Some(level) = level {
+            dim_register(level, pos, own.network);
+        }
+        let changed = tick_dim_cell(host, level, pos, own, &mut saved);
+        if let Tag::Compound(nbt) = saved {
+            event.entity.nbt = nbt;
+        }
+        if !changed {
+            *event.reply = BlockEntityTickReply::Unchanged;
+        }
+    }
+}
+
+/// One dimensional-cell tick: push each `OUTPUT` face's per-side budget into its neighbour,
+/// spending it from the pool (upstream's `sendOutEnergy`:319-344). Cells never push into one
+/// another — linked cells share a pool, they do not feed each other.
+fn tick_dim_cell(
+    host: &mut dyn ServerHost,
+    level: Option<LevelRef>,
+    pos: [i32; 3],
+    own: DimCell,
+    saved: &mut Tag,
+) -> bool {
+    let Some(level) = level else {
+        return false;
+    };
+    // A block entity is out of the world during its own tick, so a host read of this cell's
+    // saved compound can be stale (the powercell's tick has the same rule): read `saved`.
+    let sides = read_sides_from(saved);
+    if !sides.any_output() {
+        return false;
+    }
+    let mut cells = dim_pool(host, level, pos, Some(own));
+    if cells.is_empty() {
+        return false;
+    }
+    let mut budget = dim_stored(&cells);
+    let per_face = i64::from(own.tier.per_side());
+    let mut moved = 0_i64;
+    for (face, direction) in Direction::ALL.into_iter().enumerate() {
+        if sides.get(face) != SideMode::Output || budget == 0 {
+            continue;
+        }
+        let normal = direction.normal();
+        let target = [pos[0] + normal[0], pos[1] + normal[1], pos[2] + normal[2]];
+        if DimTier::of_block(&block_id(&*host, level, target).unwrap_or_default()).is_some() {
+            continue;
+        }
+        let Some(handler) = level.capability(host, &ENERGY, target, Some(direction.opposite()))
+        else {
+            continue;
+        };
+        let offer = u32::try_from(budget.min(per_face)).unwrap_or(0);
+        if offer == 0 {
+            continue;
+        }
+        let received = host
+            .transaction(|host, tx| -> Result<u32, ()> { Ok(handler.insert(host, tx, offer)) })
+            .unwrap_or(0)
+            .min(offer);
+        budget -= i64::from(received);
+        moved += i64::from(received);
+    }
+    if moved == 0 {
+        return false;
+    }
+    let before: Vec<i32> = cells.iter().map(|cell| cell.energy).collect();
+    let mut left = u32::try_from(moved).unwrap_or(0);
+    for cell in cells.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let take = left.min(u32::try_from(cell.energy.max(0)).unwrap_or(0));
+        cell.energy -= i32::try_from(take).unwrap_or(0);
+        left -= take;
+    }
+    let positions = dim_members(level, pos, cells[0].network);
+    let mut written = false;
+    for (index, cell) in cells.iter().enumerate() {
+        if before[index] == cell.energy {
+            continue;
+        }
+        if index == 0 {
+            set_int(saved, KEY_ENERGY, cell.energy);
+            written = true;
+        } else if let Some(at) = positions.get(index).copied()
+            && write_dim_cell(host, level, at, cell.energy, cell.network)
+        {
+            written = true;
+        }
+    }
+    written
+}
+
+/// One dimensional cell's readout line, as `/rftoolspower dimcell` and a click print it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dim_cell_line(
+    pos: [i32; 3],
+    cell: &DimCell,
+    stored: i64,
+    capacity: i64,
+    cells: usize,
+    sides: Sides,
+    t: i64,
+    nonce: Option<&str>,
+) -> String {
+    let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+    format!(
+        "Dimensional Cell at {},{},{}: tier={} local={}/{} network={}/{} n={} net={} sides={} t={t}{suffix}",
+        pos[0],
+        pos[1],
+        pos[2],
+        cell.tier.name(),
+        cell.energy,
+        cell.tier.capacity(),
+        stored.min(i64::from(i32::MAX)),
+        capacity.min(i64::from(i32::MAX)),
+        cells,
+        cell.network,
+        sides.names(),
+    )
+}
+
+/// The readout for the cell at `pos`, or [`NO_DIM_CELL`].
+pub(crate) fn dim_cell_status_line(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    nonce: Option<&str>,
+) -> String {
+    let Some(cell) = dim_cell_at(host, level, pos) else {
+        return NO_DIM_CELL.to_owned();
+    };
+    let cells = dim_pool(host, level, pos, None);
+    let t = level.game_time(&*host).unwrap_or(0);
+    dim_cell_line(
+        pos,
+        &cell,
+        dim_stored(&cells),
+        dim_capacity(&cells),
+        cells.len(),
+        dim_sides(&*host, level, pos),
+        t,
+        nonce,
+    )
+}
+
+/// Set one face of a dimensional cell (the stand-in for upstream's smart wrench).
+pub(crate) fn set_dim_side(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    face_name: &str,
+    mode_name: &str,
+) -> String {
+    if DimTier::of_block(&block_id(&*host, level, pos).unwrap_or_default()).is_none() {
+        return NO_DIM_CELL.to_owned();
+    }
+    let Some(face) = dir_from_name(&face_name.to_ascii_lowercase()) else {
+        return format!(
+            "Dimensional Cell at {},{},{}: unknown face '{face_name}'",
+            pos[0], pos[1], pos[2]
+        );
+    };
+    let Some(mode) = SideMode::parse(mode_name) else {
+        return format!(
+            "Dimensional Cell at {},{},{}: unknown mode '{mode_name}'",
+            pos[0], pos[1], pos[2]
+        );
+    };
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_DIM_CELL.to_owned();
+    };
+    let Some(saved) = entity.data(&*host) else {
+        return NO_DIM_CELL.to_owned();
+    };
+    let mut saved = Tag::Compound(saved);
+    let mut sides = read_sides_from(&saved);
+    if !sides.set(face_index(face), mode) {
+        return NO_DIM_CELL.to_owned();
+    }
+    write_sides(&mut saved, sides);
+    if let Tag::Compound(data) = saved {
+        let _ = entity.replace_data(host, data);
+    }
+    let _ = entity.set_changed(&mut *host);
+    format!(
+        "Dimensional Cell side at {},{},{}: {} {} (sides={})",
+        pos[0],
+        pos[1],
+        pos[2],
+        dir_name(face),
+        mode.name(),
+        sides.names()
+    )
+}
+
+/// A right click on a dimensional cell: a card with a link goes into its card slot and the cell
+/// joins that channel, an empty hand reads the cell out, anything else is refused. The channel
+/// comes only from the card's typed component — never from a chat command.
+pub(crate) fn dim_cell_click(
+    host: &mut dyn ServerHost,
+    click: &BlockClick<'_>,
+    held: Option<&ItemStack>,
+) -> Option<InteractionResult> {
+    let level = host.level(click.dimension.key().id())?;
+    DimTier::of_block(&block_id(&*host, level, click.pos).unwrap_or_default())?;
+    let Some(held) = held.filter(|stack| stack.count() > 0) else {
+        let line = dim_cell_status_line(host, level, click.pos, None);
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal(line));
+        }
+        return Some(InteractionResult::Success);
+    };
+    let refused = item_id(&*host, held);
+    if refused != POWERCELL_CARD {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(
+                host,
+                Text::literal(format!("{refused} is not a powercell card")),
+            );
+        }
+        return Some(InteractionResult::Success);
+    }
+    let network = card_network(held);
+    let Some(network) = dim_card_network(network) else {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal("the card carries no link"));
+        }
+        return Some(InteractionResult::Success);
+    };
+    let hand = ItemPlace::PlayerHand {
+        player: click.player,
+        hand: click.hand,
+    };
+    let inserted = host.transaction(|host, tx| -> Result<u32, ()> {
+        let entity = host.block_entity(level, click.pos).ok_or(())?;
+        if entity
+            .item_slot(&*host, DIM_CARD_SLOT as u32)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Ok(0);
+        }
+        let mut card = held.clone();
+        card.set_count(1).map_err(|_| ())?;
+        if hand.extract(&mut *host, tx, &ItemResource::of(held), 1) != 1 {
+            return Err(());
+        }
+        entity
+            .set_item_slot(&mut *host, tx, DIM_CARD_SLOT as u32, Some(card))
+            .map_err(|_| ())?;
+        let _ = entity.set_changed(&mut *host);
+        Ok(1)
+    });
+    if inserted != Ok(1) {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal("the cell already holds a card"));
+        }
+        return Some(InteractionResult::Success);
+    }
+    let Some(entity) = host.block_entity(level, click.pos) else {
+        return Some(InteractionResult::Success);
+    };
+    let Some(mut saved) = entity.data(&*host) else {
+        return Some(InteractionResult::Success);
+    };
+    saved.insert(KEY_NETWORK.into(), Tag::Int(network));
+    let _ = entity.replace_data(host, saved);
+    dim_register(level, click.pos, network);
+    if let Some(player) = host.player(click.player) {
+        let _ = player.action_bar(
+            host,
+            Text::literal(format!("dimensional cell linked to channel {network}")),
+        );
+    }
+    Some(InteractionResult::Success)
+}
+
+/// `/rftoolspower card`: the channel carried by the player's held card, read from its own typed
+/// component. This is the carrier gate's parsed assertion; it never sets anything.
+pub(crate) fn card_status_line(host: &mut dyn ServerHost, player: mod_api::PlayerRef) -> String {
+    let place = ItemPlace::PlayerHand {
+        player: player.uuid(),
+        hand: mod_api::Hand::Main,
+    };
+    let Some(stack) = place.stack(host) else {
+        return "Card: empty hand".to_owned();
+    };
+    let id = card_network(&stack);
+    let item = stack.item().id(&*host).to_owned();
+    format!("Card: item={item} net={id}")
+}
+
+/// The dimensional cell's container: a single insert-only card slot reachable from every face.
+pub(crate) fn dim_container() -> ModContainer {
+    ModContainer {
+        slots: DIM_SLOTS,
+        faces: std::array::from_fn(|_| vec![DIM_CARD_SLOT]),
+        inputs: vec![DIM_CARD_SLOT],
+        outputs: vec![],
+        menu: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5698,10 +6394,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_fourteen_the_harness_types() {
+    fn the_commands_are_the_seventeen_the_harness_types() {
         let mut commands = Vec::new();
         declare_commands(&mut commands);
-        assert_eq!(commands.len(), 14);
+        assert_eq!(commands.len(), 17);
         assert_eq!(
             commands[0].usage, "rftoolspower info <pos:block_pos> [nonce:word]",
             "the generator readout stays as it was"
@@ -6329,6 +7025,31 @@ mod tests {
     }
 
     #[test]
+    fn the_card_component_round_trips_the_channel() {
+        for id in [-1, 0, 7, i32::MAX] {
+            let encoded = PowerCard.encode(id);
+            assert_eq!(
+                PowerCard.decode(&encoded),
+                Some(id),
+                "the channel survives its typed component"
+            );
+        }
+        assert_eq!(
+            PowerCard.decode(&Tag::compound([("id", Tag::Int(7))])),
+            Some(7),
+            "the /give spelling `{{id: 7}}`"
+        );
+        assert_eq!(PowerCard.decode(&Tag::Int(7)), Some(7), "a bare int");
+        assert_eq!(PowerCard.decode(&Tag::String("7".into())), None);
+        assert_eq!(
+            dim_card_network(-1),
+            None,
+            "an unlinked card names no channel"
+        );
+        assert_eq!(dim_card_network(7), Some(7));
+    }
+
+    #[test]
     fn the_blazing_state_reads_back_from_the_compound_it_wrote() {
         let mut state = Blazing {
             energy: 12_345,
@@ -6386,8 +7107,12 @@ mod tests {
         declare_component(&mut types);
         assert_eq!(
             types,
-            vec![ROD_DATA.to_owned(), INFUSABLE_DATA.to_owned()],
-            "both components registered once"
+            vec![
+                ROD_DATA.to_owned(),
+                INFUSABLE_DATA.to_owned(),
+                POWERCARD_DATA.to_owned(),
+            ],
+            "all three components registered once"
         );
     }
 

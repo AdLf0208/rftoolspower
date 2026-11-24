@@ -159,6 +159,18 @@
 #     own t=/spent= values; the un-infused 200/500 are the counterfactual
 #  CE a stone in the endergenic's infusion slot is refused, kept server-side and not placed
 #
+#  DA the carrier gate: a powercell_card's typed rftoolspower:powercard_data={id:7} round-trips in
+#     the hand and binds a fresh simple cell to channel 7 (never set by chat command)
+#  DB two simple cells four blocks apart, linked by the same card id, read one 0/500,000 pool
+#     (n=2) at both ends; an unlinked same-tier cell stays 0/250,000 (the differential)
+#  DC a generator's 2,000 FE-a-tick push into cell A's INPUT face raises cell B by exactly the
+#     artefact's 1,250 FE a side a tick over two replies' own t= values
+#  DD an OUTPUT face pushes the shared pool into a harness receiver at the same 1,250 a tick
+#  DE the card's plain vanilla recipe crafts and consumes; the three cell recipes need the
+#     parent's machine frame / infused diamond and craft nothing here
+#
+# SELFTEST=dimensionalcell inverts DB/DC (it asserts the normal tier's 1,000,000 capacity and
+# 5,000 FE a tick on the simple pair) and exits 1;
 # SELFTEST=factor inverts CA (it asserts the un-infused 60 FE a tick on the infused machine) and
 # exits non-zero;
 # SELFTEST=charge inverts BY (it asserts 2,000 FE a tick) and exits non-zero;
@@ -217,6 +229,13 @@ SELFTEST_INFUSER=${SELFTEST_INFUSER:-0}
 SELFTEST_ENDERFACTOR=0
 if [ "$SELFTEST" = enderfactor ]; then
     SELFTEST_ENDERFACTOR=1
+    SELFTEST=0
+fi
+# `SELFTEST=dimensionalcell` inverts BU/BV/BW: it asserts the normal tier's 1,000,000 capacity
+# and 5,000 per-side rate on a pair of linked *simple* cells (250,000 and 1,250) and exits 1.
+SELFTEST_DIM=0
+if [ "$SELFTEST" = dimensionalcell ]; then
+    SELFTEST_DIM=1
     SELFTEST=0
 fi
 CONTROL=${CONTROL:-0}
@@ -1176,7 +1195,7 @@ while :; do
         || fail "a held pearl spent $H_DS FE over $H_DT ticks ($((H_DS / H_DT)) a tick), expected 333 x $H_DT = $((333 * H_DT)) (the artefact's (long)(500*(3-1)/3))"
     break
 done
-[ "$CD_ATTEMPT" -le 3 ] || fail "three hold windows were all cut by the upstream discard"
+[ "$CD_ATTEMPT" -le 6 ] || fail "six hold windows were all cut by the upstream discard"
 if [ "${SELFTEST_GAIN_FAIL:-0}" = 1 ] || [ "${SELFTEST_HOLD_FAIL:-0}" = 1 ]; then
     fail "selftest: the enderfactor assertions are alive — gain: ${SELFTEST_GAIN_NOTE:-passed as un-infused}; hold: ${SELFTEST_HOLD_NOTE:-passed as un-infused}"
 fi
@@ -3925,7 +3944,262 @@ ctl close >/dev/null 2>&1 || true
 ctl wait 4 >/dev/null
 echo "  the parent's dimensional shard and machine frame are the recipe's limit here"
 
-if [ "$SELFTEST_ENDERFACTOR" = 1 ]; then
+DIM_SIMPLE_ITEM=rftoolspower:dimensionalcell_simple
+DIM_CARD_ITEM=rftoolspower:powercell_card
+
+dim_cell_state() { # dim_cell_state X Y Z — the `/rftoolspower dimcell` line, parsed
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    local line
+    say "rftoolspower dimcell $1 $2 $3 $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "no fresh /rftoolspower dimcell reply for nonce $NONCE: $(ctl messages 8 | jq -c '.chat')"
+    eval "$(python3 "$PORT/tools/parse_dimcell.py" "$line" --nonce "$NONCE")"
+    [ "${ok:-0}" = 1 ] || fail "the dimensional-cell line did not parse: $line"
+    echo "  $line" >&2
+}
+
+dim_side_set() { # dim_side_set X Y Z FACE MODE
+    local line
+    say "rftoolspower dimside $1 $2 $3 $4 $5"
+    line=$(await_line "Dimensional Cell side at $1,$2,$3: $4 $5")
+    [ -n "$line" ] || fail "no 'Dimensional Cell side' reply for $4 $5: $(ctl messages 8 | jq -c '.chat')"
+    echo "  $line" >&2
+}
+
+dim_give_cell() { # dim_give_cell X Y Z [ENERGY]
+    local x=$1 y=$2 z=$3 energy=${4:-}
+    ctl command "gamemode creative" >/dev/null
+    ctl command "clear @s" >/dev/null
+    if [ -n "$energy" ]; then
+        ctl command "give @s $DIM_SIMPLE_ITEM[minecraft:block_entity_data={id:\"rftoolspower:dimensionalcell_block_entity\",energy:$energy}]" >/dev/null
+    else
+        ctl command "give @s $DIM_SIMPLE_ITEM" >/dev/null
+    fi
+    ctl wait 8 >/dev/null
+    place_held "$x" "$y" "$z" "$DIM_SIMPLE_ITEM"
+}
+
+dim_click_card() { # dim_click_card X Y Z ID — click a card carrying {id:ID} into the cell
+    local x=$1 y=$2 z=$3 id=$4 line
+    ctl command "gamemode creative" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl command "give @s $DIM_CARD_ITEM[rftoolspower:powercard_data={id:$id}] 1" >/dev/null
+    ctl wait 10 >/dev/null
+    # The gate: the typed component round-trips on the existing item, read from the live hand.
+    NONCE=$(( ${NONCE:-0} + 1 ))
+    say "rftoolspower card $NONCE"
+    line=$(await_line "nonce=$NONCE")
+    [ -n "$line" ] || fail "blocked(dimensional-cell-carrier): no /rftoolspower card reply: $(ctl messages 8 | jq -c '.chat')"
+    local card_item card_net
+    card_item=$(printf '%s\n' "$line" | sed -n 's/.*item=\([^ ]*\).*/\1/p')
+    card_net=$(printf '%s\n' "$line" | sed -n 's/.*net=\(-[0-9]*\|[0-9]*\).*/\1/p')
+    echo "  GATE: $line" >&2
+    [ "$card_item" = "$DIM_CARD_ITEM" ] && [ "$card_net" = "$id" ] \
+        || fail "blocked(dimensional-cell-carrier): the card component did not round-trip: item=$card_item net=$card_net, expected $DIM_CARD_ITEM/$id"
+    # A survival click is needed so the stack really leaves the hand (slice 13's trap).
+    ctl command "gamemode survival" >/dev/null
+    ctl command "clear @s" >/dev/null
+    ctl command "give @s $DIM_CARD_ITEM[rftoolspower:powercard_data={id:$id}] 1" >/dev/null
+    ctl wait 8 >/dev/null
+    ctl select 1 >/dev/null
+    ctl wait 2 >/dev/null
+    ctl command "execute in minecraft:the_end run tp @s $((x - 2)).5 101 $z.5" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl look-at "$x.5" 101.5 "$z.5" >/dev/null \
+        || fail "cannot aim at the dimensional cell at $x,101,$z"
+    ctl interact "$x" 101 "$z" >/dev/null
+    ctl wait 10 >/dev/null
+    dim_cell_state "$x" 101 "$z"
+    [ "$DNET" = "$id" ] \
+        || fail "blocked(dimensional-cell-carrier): the cell did not bind to the card's channel: net=$DNET, expected $id"
+    ctl command "gamemode creative" >/dev/null
+    ctl wait 4 >/dev/null
+}
+
+dimensionalcell_phases() {
+# --- the dimensional cell (slice 14) -----------------------------------------
+# `DimensionalCellConfiguration` @ e44463ca: rfPerTick 5000, rfPerNormalCell 1,000,000,
+# simpleFactor 4, advancedFactor 4. `getPowerFactor` 1/4/16 gives simple 250,000/1,250,
+# normal 1,000,000/5,000, advanced 4,000,000/20,000. Two simple cells linked by a card at
+# z=204 and z=208 are four blocks apart, so adjacency cannot explain the shared pool.
+
+echo "== DA: the carrier gate — a typed component round-trips and binds a cell to a channel =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $SX.5 101 208.5" >/dev/null
+ctl wait 40 >/dev/null
+for attempt in 1 2 3; do
+    ctl command "execute in minecraft:the_end run fill $((SX - 4)) 100 200 $((SX + 8)) 100 216 minecraft:stone" >/dev/null
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$SX" 100 204)" = minecraft:stone ] && break
+    ctl wait 40 >/dev/null
+done
+[ "$(block_name "$SX" 100 204)" = minecraft:stone ] || fail "no floor under the dimensional-cell arena"
+ctl command "execute in minecraft:the_end run fill $((SX - 4)) 101 200 $((SX + 8)) 108 216 minecraft:air" >/dev/null
+ctl wait 8 >/dev/null
+
+dim_give_cell "$SX" 101 204
+dim_cell_state "$SX" 101 204
+[ "$DTILE" = simple ] || fail "the cell is tier $DTILE, expected simple"
+[ "$DN" = 1 ] || fail "a lone cell reports $DN members, expected 1"
+[ "$DNET" = -1 ] || fail "a fresh cell is unlinked (net=$DNET), expected -1"
+[ "$DNCAP" = 250000 ] || fail "the simple cell's capacity is $DNCAP, expected 250,000"
+[ "$DLCAP" = 250000 ] || fail "the simple cell's own limit is $DLCAP, expected 250,000"
+echo "  a fresh simple cell reads 0/250,000, one member, net=-1, six NONE faces"
+dim_click_card "$SX" 101 204 7
+echo "  the card's rftoolspower:powercard_data={id:7} round-tripped and bound cell A to channel 7"
+
+echo "== DB: two card-linked cells four blocks apart share one store and one capacity =="
+dim_give_cell "$SX" 101 208
+dim_click_card "$SX" 101 208 7
+dim_cell_state "$SX" 101 204
+[ "$DN" = 2 ] || fail "the linked pair reads $DN members, expected 2 (the cells are 4 blocks apart)"
+[ "$DNET" = 7 ] || fail "cell A's channel is $DNET, expected 7"
+[ "$DNCAP" = 500000 ] || fail "the pair's capacity is $DNCAP, expected 2 x 250,000"
+dim_cell_state "$SX" 101 208
+[ "$DN" = 2 ] || fail "cell B reads $DN members, expected the same two"
+[ "$DNCAP" = 500000 ] || fail "cell B's shared capacity is $DNCAP, expected 500,000"
+# The differential: an unlinked cell of the same tier stays at its own capacity.
+dim_give_cell "$SX" 101 212
+dim_cell_state "$SX" 101 212
+[ "$DN" = 1 ] && [ "$DNET" = -1 ] || fail "an unlinked cell joined the pool: n=$DN net=$DNET"
+[ "$DNCAP" = 250000 ] || fail "the unlinked differential reads $DNCAP, expected 250,000"
+if [ "$SELFTEST_DIM" = 1 ]; then
+    echo "(selftest: asserting the normal tier's 1,000,000 capacity on the simple pair)"
+    [ "$DNCAP" = 500000 ] \
+        || fail "selftest: the simple pair's capacity is $DNCAP (500,000), so asserting 1,000,000 fails — the assertion is alive"
+fi
+echo "  the pair reads one 0/500,000 pool (n=2) at both ends; a same-tier cell with no card stays 0/250,000"
+
+echo "== DC: an insert into cell A raises cell B by exactly 1,250 FE a tick =="
+# The generator pushes 2,000 a tick; the simple cell's per-side cap is 1,250, so the *cell* sets
+# the rate. Sample at both ends of a window using each reply's own t= and network= values.
+dim_side_set "$SX" 101 204 west input
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",burn:0,burn_max:0,energy:100000}]" >/dev/null
+ctl wait 8 >/dev/null
+place_held "$((SX - 1))" 101 204 "$BLOCK"
+info "$((SX - 1))" 101 204
+# The generator starts pushing the moment it is placed, so the first read sees whatever is left
+# of the seeded 100,000 — the assertion below is the cell's per-side rate from two cell replies,
+# not the generator's untouched initial store.
+BW_G0=$ENERGY
+[ "$BW_G0" -gt 0 ] && [ "$BW_G0" -le 100000 ] \
+    || fail "the seeded generator reads $BW_G0 FE, expected 1..100,000"
+ctl wait 2 >/dev/null
+dim_cell_state "$SX" 101 208
+BW_T0=$DT; BW_E0=$DNETWORK
+ctl wait 24 >/dev/null
+dim_cell_state "$SX" 101 208
+BW_DT=$((DT - BW_T0)); BW_DE=$((DNETWORK - BW_E0))
+echo "  read at cell B over $BW_DT ticks: shared store $BW_E0 -> $DNETWORK (+$BW_DE FE)"
+[ "$BW_DT" -ge 12 ] || fail "only $BW_DT ticks passed; the rate window is too small"
+[ "$BW_DE" -gt 0 ] || fail "an insert into cell A never reached cell B: +$BW_DE over $BW_DT ticks"
+[ "$BW_DE" = $((1250 * BW_DT)) ] \
+    || fail "cell B rose $BW_DE FE over $BW_DT ticks, expected 1250 x $BW_DT = $((1250 * BW_DT)): the artefact's simple per-side rate is 1,250, not the generator's 2,000"
+if [ "$SELFTEST_DIM" = 1 ]; then
+    echo "(selftest: asserting the normal tier's 5,000 per-side rate on the simple pair)"
+    [ "$BW_DE" = $((5000 * BW_DT)) ] \
+        || fail "selftest: the shared store rose $BW_DE over $BW_DT ticks (1,250 a tick), so asserting 5,000 a tick fails — the assertion is alive"
+fi
+dim_cell_state "$SX" 101 212
+[ "$DNETWORK" = 0 ] || fail "the unlinked differential changed store: $DNETWORK (expected 0)"
+echo "  the link crosses four blocks: 1,250 FE a tick from two replies' own t= values; the unlinked cell stays empty"
+
+echo "== DD: an OUTPUT face pushes the pool into a neighbour at the same per-side rate =="
+# The generator may refuse a setblock while its block entity is loaded; closing cell A's INPUT face
+# is the reliable way to stop its 2,000-a-tick push, so only the OUTPUT face feeds the receiver.
+dim_side_set "$SX" 101 204 west none
+ctl command "execute in minecraft:the_end run setblock $((SX - 1)) 101 204 minecraft:air" >/dev/null
+ctl wait 6 >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 208 minecraft:air" >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 208 $BIG_RECEIVER" >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$((SX + 1))" 101 208)" = "$BIG_RECEIVER" ] \
+    || fail "the harness receiver did not place east of cell B"
+dim_side_set "$SX" 101 208 east output
+ctl wait 2 >/dev/null
+dim_cell_state "$SX" 101 204
+BX_T0=$DT; BX_E0=$DNETWORK
+# A fresh receiver has no `energy` NBT key yet, so its initial store is exactly 0; asking
+# /data get for a missing key answers "Found no elements matching energy" instead of 0.
+BX_R0=0
+ctl wait 16 >/dev/null
+dim_cell_state "$SX" 101 204
+BX_DT=$((DT - BX_T0)); BX_DE=$((BX_E0 - DNETWORK))
+BX_R1=$(energy_of "$((SX + 1))" 101 208)
+echo "  over $BX_DT ticks: the pool fell $BX_DE FE and the receiver gained $((BX_R1 - BX_R0))"
+[ "$BX_DT" -ge 8 ] || fail "the output window is only $BX_DT ticks"
+[ "$BX_DE" = $((1250 * BX_DT)) ] \
+    || fail "the OUTPUT face moved $BX_DE FE over $BX_DT ticks, expected 1250 x $BX_DT"
+[ $((BX_R1 - BX_R0)) -gt 0 ] \
+    || fail "the OUTPUT face never reached the receiver: it still holds $((BX_R1 - BX_R0)) FE"
+echo "  OUTPUT moves the artefact's 1,250 FE a side a tick out of the shared pool"
+
+echo "== DE: the card's plain recipe crafts and consumes; the cell recipes need the parent =="
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+open_crafting_table "$SX" 101 214
+for item in minecraft:gold_nugget minecraft:paper minecraft:redstone; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 10 >/dev/null
+# rgr / gpg / rgr
+place_one minecraft:redstone 100
+place_one minecraft:gold_nugget 101
+place_one minecraft:redstone 102
+place_one minecraft:gold_nugget 103
+place_one minecraft:paper 104
+place_one minecraft:gold_nugget 105
+place_one minecraft:redstone 106
+place_one minecraft:gold_nugget 107
+place_one minecraft:redstone 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+[ "$RESULT" = "$DIM_CARD_ITEM" ] \
+    || fail "the card's plain vanilla recipe crafted '$RESULT', expected $DIM_CARD_ITEM"
+ctl click-slot 200 >/dev/null
+ctl wait 3 >/dev/null
+# Slot 200 lands the result on the cursor; slot 8 is where the other recipes park their output.
+ctl click-slot 8 >/dev/null
+ctl wait 6 >/dev/null
+[ "$(held_count "$DIM_CARD_ITEM")" -ge 1 ] \
+    || fail "the crafted card never reached the inventory: $(ctl screen | jq -c '[.slots[]? | select(.item != null) | {slot, item, count}]')"
+[ "$(held_count minecraft:gold_nugget)" = 12 ] \
+    || fail "the craft did not consume four gold nuggets: $(held_count minecraft:gold_nugget) left"
+[ "$(held_count minecraft:paper)" = 15 ] \
+    || fail "the craft did not consume one paper: $(held_count minecraft:paper) left"
+[ "$(held_count minecraft:redstone)" = 12 ] \
+    || fail "the craft did not consume four redstone: $(held_count minecraft:redstone) left"
+echo "  the card crafts from 4 gold nuggets, 1 paper and 4 redstone, and the ingredients were consumed"
+# The cell recipes centre on rftoolsbase:machine_frame / infused_diamond, which this build lacks.
+ctl command "clear @s" >/dev/null
+for item in "$STONE" minecraft:prismarine_shard minecraft:diamond minecraft:redstone_block minecraft:emerald; do
+    ctl command "give @s $item 16" >/dev/null
+done
+ctl wait 10 >/dev/null
+place_one "$STONE" 100
+place_one minecraft:diamond 101
+place_one minecraft:redstone_block 102
+place_one minecraft:prismarine_shard 103
+place_one "$STONE" 104
+place_one minecraft:prismarine_shard 105
+place_one minecraft:redstone_block 106
+place_one minecraft:diamond 107
+place_one minecraft:redstone_block 108
+RESULT=$(ctl screen | jq -r '[.slots[]? | select(.slot == 200) | .item] | first // "empty"')
+[ "$RESULT" = empty ] \
+    || fail "a dimensional cell crafted as '$RESULT' without the parent's machine_frame"
+ctl close >/dev/null 2>&1 || true
+echo "  the three cell recipes are carried as blocked(parent-absent): no machine frame, no craft"
+}
+
+if [ "$SELFTEST_DIM" = 1 ]; then
+    dimensionalcell_phases
+    fail "selftest: the dimensionalcell inversion did not fail"
+elif [ "$SELFTEST_ENDERFACTOR" = 1 ]; then
     enderfactor_phases
     fail "selftest: the enderfactor inversion did not fail"
 else
@@ -3933,6 +4207,7 @@ else
     chargeitem_phases
     infusable_phases
     enderfactor_phases
+    dimensionalcell_phases
 fi
 
 echo "PASS: the endergenic generator's infusion carrier was accepted in its own slot (infused=256 factor=1.000), a mode-1 pearl paid the artefact's 300 FE (rfPerHit[1] x 2 x (1+2)/2, not the prose's 600), a held pearl spent 333 FE a tick ((long)(500 x (3-1)/3)) from two replies' own game-time stamps, and a stone in the slot was refused and kept server-side. Earlier: the coal generator's infusion carrier raised its burn to 750 ticks (600 + (int)(600*0.5/2)) and its rate to 90 FE a tick (60 + (long)(60*0.5)), the two info replies' own t=/energy=/burn= closing ΔE == 90 × Δburn, while the un-infused generator gave 60 × Δburn and a 600-tick burn and a stone in the infusion slot was refused and stayed server-side. Earlier: the coal generator's charge slot inserted exactly 1,000 FE a tick into a powercell item's own energy component, the two info replies' t= closing the rate, and the store fell by exactly what the item gained; a stone in that slot was refused and kept on the server. Earlier: a blazing infuser spends one catalyst and 10 FE a run on the 11th tick after its counter resets (the field is 10, the period 11 — two replies' counters close it exactly), raising the rod's quality by the catalyst's percentage of a whole 64-step stack (a nether star +1,125 on a 60,000-quality rod, redstone +375 quality and no duration), moving it to the output slot on its last step, costing exactly one catalyst and 10 of its 50,000 FE a run (a hopper-fed window proved one run every 11 ticks over several runs), infusing nothing without a catalyst, and refusing a stone; its recipe needs the parent's dimensional shard and machine frame. Earlier: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

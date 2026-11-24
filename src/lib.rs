@@ -24,9 +24,12 @@
 //!   a finished rod moves to one of nine output slots unless its slot is locked; the blazing
 //!   infuser spends one catalyst and 10 FE per run (on the 11th tick and then every 11) to raise a
 //!   rod's quality and duration by the catalyst's percentage of a whole 64-step stack, and moves
-//!   the rod to its output slot when its last step is used.
+//!   the rod to its output slot when its last step is used;
+//! - the dimensional cell stores 250,000 / 1,000,000 / 4,000,000 FE by tier, takes FE only through
+//!   `INPUT` faces and pushes through `OUTPUT` ones, and lets a typed component on the powercell
+//!   card link cells at any distance into one shared store.
 //!
-//! `/rftoolspower info|monitor|powerlevel|band|cell|side|endergenic|injector|enderlink|endermonitor|blazing|agitator|agitatelock|infuser`
+//! `/rftoolspower info|monitor|powerlevel|band|cell|side|endergenic|injector|enderlink|endermonitor|blazing|agitator|agitatelock|infuser|dimcell|dimside|card`
 //! serves the harness and is the stand-in for the GUIs and the smart wrench this tier does not
 //! carry.
 //!
@@ -55,8 +58,8 @@ impl Hooks for Mod {
     /// Declare the generator's block entity type, its Part, its one fuel slot and its buffer; the
     /// monitor's; the power level's; the two powercells' Part and network energy capability; the
     /// endergenic's Part and buffer; the injector's Part and eighteen pearl slots; the ender
-    /// monitor's Part; and the blazing generator's, agitator's and infuser's Parts, slots and
-    /// buffers.
+    /// monitor's Part; the blazing generator's, agitator's and infuser's Parts, slots and
+    /// buffers; and the four dimensional-cell types, their card slots and their pool capabilities.
     fn register(&self, r: &mut dyn Registrar, context: &RegistrationContext) {
         support::declare(r, context, Arc::clone(&self.queue));
     }
@@ -72,8 +75,9 @@ impl Hooks for Mod {
         support::declare_commands(event.commands);
     }
 
-    /// The mod's own item component: a blazing rod's `{steps, time, quality, duration}`
-    /// (upstream's `BlazingModule.ITEM_BLAZING_ROD_DATA`). Registered before content loads; the
+    /// The mod's own item components: a blazing rod's `{steps, time, quality, duration}`
+    /// (`ITEM_BLAZING_ROD_DATA`), the infusion int and the powercell card's channel id
+    /// (`ITEM_POWERCARD_DATA`). Registered before content loads; the
     /// game installs the name, so a `/give` carrying it lands in the stack's patch.
     fn component_types(
         &self,

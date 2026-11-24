@@ -302,6 +302,29 @@ The infusable factor adds no block, item, texture or data file: the carrier is t
 component is installed by `Hooks::component_types` (code, not content). `assemble_content.py --check`
 still re-derives the same 177 entries; the packed `assets/` and `data/` are byte-identical to 0.1.10.
 
+## Slice 14 — the dimensional cell and the powercell card
+
+`tools/assemble_content.py --check` re-derives **218 entries** (was 177 at slice 13). Carried from
+the artefact jar `rftoolspower-1.21-7.0.6.jar` (`259ebd61…`):
+
+- four plain-cube blocks `dimensionalcell`, `_simple`, `_advanced`, `_creative` on the `iron_block`
+  template, each with the jar's own `textures/block/dimcell/dimensionalcell*.png`, blockstate, item
+  model, item definition, loot table and lang name; the six face modes are saved in the block
+  entity's six-digit string (no block-state variants, no renderer in this tier);
+- the artefact's own item `powercell_card`: its `models/item/powercell_card.json` layer0 and
+  `textures/item/powercellcarditem.png`. The jar model's custom `linked` predicate is dropped (26.3
+  does not know it), so the item always uses the unlinked texture. Declared on the `stick` template
+  (a 64-stack item) and added to the creative tab;
+- the card's shaped recipe `rgr/gpg/rgr` from gold nuggets, paper and redstone — purely vanilla, so it
+  **does** craft in this build (proven in phase DE with ingredient consumption);
+- the three cell recipes from the jar (`dimensionalcell`, `_simple`, `_advanced`) and their
+  advancements are carried, but their centre ingredients are `rftoolsbase:machine_frame` and
+  `rftoolsbase:infused_diamond`, which the parent port does not carry. They are recorded
+  `blocked(parent-absent)` and craft nothing here (phase DE). The creative cell has no recipe.
+
+The card's channel is **not** content: it is this package's typed
+`rftoolspower:powercard_data={id:N}` component, registered through `Hooks::component_types`.
+
 ## Slice 13 — no content change
 
 The endergenic's infusable factors add no block, item, texture or data file: the carrier is again the

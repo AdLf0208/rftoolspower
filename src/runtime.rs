@@ -2022,6 +2022,138 @@ pub fn clamp_infuser(energy: i32) -> i32 {
     energy.clamp(0, INFUSER_CAPACITY)
 }
 
+// ---------------------------------------------------------------------------
+// The dimensional cell (`modules/dimensionalcell`, artefact @ e44463ca)
+// ---------------------------------------------------------------------------
+
+/// `DimensionalCellConfiguration.rfPerTick` (5000 FE a side a tick at the normal tier).
+pub const DIM_RF_PER_TICK: i32 = 5_000;
+/// `DimensionalCellConfiguration.rfPerNormalCell` (1,000,000 FE).
+pub const DIM_RF_PER_NORMAL_CELL: i32 = 1_000_000;
+/// `DimensionalCellConfiguration.simpleFactor` (4).
+pub const DIM_SIMPLE_FACTOR: i32 = 4;
+/// `DimensionalCellConfiguration.advancedFactor` (4).
+pub const DIM_ADVANCED_FACTOR: i32 = 4;
+
+/// A dimensional cell's tier (`blocks/DimensionalCellType.java`), read from the block's id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DimTier {
+    /// `rftoolspower:dimensionalcell_simple` (250,000 FE, 1,250 a side).
+    Simple,
+    /// `rftoolspower:dimensionalcell` (1,000,000 FE, 5,000 a side).
+    Normal,
+    /// `rftoolspower:dimensionalcell_advanced` (4,000,000 FE, 20,000 a side).
+    Advanced,
+    /// `rftoolspower:dimensionalcell_creative` (advanced numbers, generates FE every tick).
+    Creative,
+}
+
+impl DimTier {
+    /// The tier a dimensional cell block is, or `None` for any other block.
+    #[must_use]
+    pub fn of_block(id: &str) -> Option<Self> {
+        match id {
+            "rftoolspower:dimensionalcell" => Some(Self::Normal),
+            "rftoolspower:dimensionalcell_simple" => Some(Self::Simple),
+            "rftoolspower:dimensionalcell_advanced" => Some(Self::Advanced),
+            "rftoolspower:dimensionalcell_creative" => Some(Self::Creative),
+            _ => None,
+        }
+    }
+
+    /// Upstream's `getPowerFactor`: 1 simple, 4 normal, 16 advanced/creative.
+    #[must_use]
+    pub const fn power_factor(self) -> i32 {
+        match self {
+            Self::Simple => 1,
+            Self::Normal => DIM_SIMPLE_FACTOR,
+            Self::Advanced | Self::Creative => DIM_ADVANCED_FACTOR * DIM_SIMPLE_FACTOR,
+        }
+    }
+
+    /// One cell's capacity: `rfPerNormalCell × factor / simpleFactor`
+    /// (`receiveEnergyLocal`:480 and `getMaxEnergyStored`:558).
+    #[must_use]
+    pub fn capacity(self) -> i32 {
+        // Upstream multiplies in `long`, then clamps to `int` (our factors are small enough
+        // that the product is exact in `i32`).
+        DIM_RF_PER_NORMAL_CELL * self.power_factor() / DIM_SIMPLE_FACTOR
+    }
+
+    /// The most one face moves a tick: `(int)(rfPerTick × factor / simpleFactor ×
+    /// (infusedFactor * 0.5 + 1))` at infusion zero (`getRfPerTickPerSide`:364).
+    #[must_use]
+    pub fn per_side(self) -> i32 {
+        // The `(infusedFactor * .5 + 1)` term is 1 here: this family has no infusion carrier.
+        DIM_RF_PER_TICK * self.power_factor() / DIM_SIMPLE_FACTOR
+    }
+
+    /// The readout's tier name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Normal => "normal",
+            Self::Advanced => "advanced",
+            Self::Creative => "creative",
+        }
+    }
+}
+
+/// One dimensional cell: its tier, its own stored FE and the channel its card names (-1 unlinked).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DimCell {
+    /// The cell's tier.
+    pub tier: DimTier,
+    /// The cell's own store, 0…[`DimTier::capacity`].
+    pub energy: i32,
+    /// The network id from the card's typed component; -1 when there is no card.
+    pub network: i32,
+}
+
+/// The channel a card's int names: upstream's `PowerCardData.EMPTY` id -1 is unlinked.
+#[must_use]
+pub fn dim_card_network(card_id: i32) -> Option<i32> {
+    (card_id >= 0).then_some(card_id)
+}
+
+/// What a linked pool can hold: the sum of its member cells' capacities
+/// (`DimensionalCellNetwork.calculateMaximumEnergy`:117-125).
+#[must_use]
+pub fn dim_capacity(cells: &[DimCell]) -> i64 {
+    cells
+        .iter()
+        .map(|cell| i64::from(cell.tier.capacity()))
+        .sum()
+}
+
+/// What a linked pool holds: the sum of its member cells' stores (the network's one `energy` int).
+#[must_use]
+pub fn dim_stored(cells: &[DimCell]) -> i64 {
+    cells.iter().map(|cell| i64::from(cell.energy.max(0))).sum()
+}
+
+/// Insert up to `request` into a pool, the asked cell first: capped by that cell's per-side rate
+/// (`receiveEnergyFacing`:442-460) and by the pool's free room (`receiveEnergyMulti`:462-477).
+pub fn dim_receive(cells: &mut [DimCell], request: u32) -> u32 {
+    let Some(asked) = cells.first() else {
+        return 0;
+    };
+    let mut left = request.min(u32::try_from(asked.tier.per_side()).unwrap_or(0));
+    let mut taken = 0;
+    for cell in cells.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let room = u32::try_from(cell.tier.capacity().saturating_sub(cell.energy)).unwrap_or(0);
+        let put = left.min(room);
+        cell.energy = cell.energy.saturating_add(i32::try_from(put).unwrap_or(0));
+        left -= put;
+        taken += put;
+    }
+    taken
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4167,6 +4299,78 @@ mod tests {
         assert_eq!(
             generator.energy, 60_000,
             "and the same 40,000 off the generator"
+        );
+    }
+
+    // Slice 14 — the dimensional cell (`DimensionalCellConfiguration` at e44463ca).
+
+    #[test]
+    fn a_dim_cell_tier_carries_the_artefact_capacity() {
+        assert_eq!(DimTier::Simple.capacity(), 250_000);
+        assert_eq!(DimTier::Normal.capacity(), 1_000_000);
+        assert_eq!(DimTier::Advanced.capacity(), 4_000_000);
+        assert_eq!(DimTier::Creative.capacity(), 4_000_000);
+    }
+
+    #[test]
+    fn a_dim_cell_tier_carries_the_artefact_per_side_rate() {
+        assert_eq!(DimTier::Simple.per_side(), 1_250);
+        assert_eq!(DimTier::Normal.per_side(), 5_000);
+        assert_eq!(DimTier::Advanced.per_side(), 20_000);
+        assert_eq!(DimTier::Creative.per_side(), 20_000);
+    }
+
+    #[test]
+    fn a_card_id_binds_a_cell_to_a_network() {
+        assert_eq!(
+            dim_card_network(-1),
+            None,
+            "the unlinked card names no channel"
+        );
+        assert_eq!(dim_card_network(7), Some(7));
+        assert_eq!(dim_card_network(0), Some(0));
+    }
+
+    #[test]
+    fn a_linked_pair_shares_one_pool_and_one_capacity() {
+        let cells = [
+            DimCell {
+                tier: DimTier::Simple,
+                energy: 10_000,
+                network: 7,
+            },
+            DimCell {
+                tier: DimTier::Simple,
+                energy: 20_000,
+                network: 7,
+            },
+        ];
+        assert_eq!(dim_stored(&cells), 30_000);
+        assert_eq!(dim_capacity(&cells), 500_000);
+    }
+
+    #[test]
+    fn an_insert_is_capped_by_the_asked_cells_per_side_rate() {
+        let mut cells = [
+            DimCell {
+                tier: DimTier::Simple,
+                energy: 0,
+                network: 7,
+            },
+            DimCell {
+                tier: DimTier::Simple,
+                energy: 0,
+                network: 7,
+            },
+        ];
+        assert_eq!(dim_receive(&mut cells, 100_000), 1_250);
+        assert_eq!(cells[0].energy, 1_250, "the asked cell fills first");
+        assert_eq!(cells[1].energy, 0);
+        assert_eq!(dim_receive(&mut cells, 100_000), 1_250);
+        assert_eq!(
+            dim_stored(&cells),
+            2_500,
+            "1,250 a side a tick, not 100,000"
         );
     }
 }

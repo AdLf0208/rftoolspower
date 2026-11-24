@@ -13,6 +13,11 @@
     "rftoolspower:blazing_generator",
     "rftoolspower:blazing_agitator",
     "rftoolspower:blazing_infuser",
+    "rftoolspower:dimensionalcell",
+    "rftoolspower:dimensionalcell_simple",
+    "rftoolspower:dimensionalcell_advanced",
+    "rftoolspower:dimensionalcell_creative",
+    "rftoolspower:powercell_card",
     "rftoolspower:blazing_rod",
     "rftoolspower:power_core1",
     "rftoolspower:power_core3"

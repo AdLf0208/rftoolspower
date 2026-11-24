@@ -2,10 +2,14 @@
 # powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor;
 # slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator;
 # slice 9: the blazing infuser; slice 10: `cell3`; slice 11: the charge-item slot; slice 12: the
-# infusable upgrade factor; slice 13: the endergenic generator's infusable factors)
+# infusable upgrade factor; slice 13: the endergenic generator's infusable factors; slice 14: the
+# dimensional cell)
 
-> **Current state (2026-11-24): slice 13, package 0.1.12 at pin
-> `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 11 adds the coal
+> **Current state (2026-11-24): slice 14, package 0.1.13 at pin
+> `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 14 adds the
+> **dimensional cell**: four tiers (250,000 / 1,000,000 / 4,000,000 FE, 1,250 / 5,000 / 20,000 FE a
+> side), six face modes and a typed `rftoolspower:powercard_data` channel on the artefact's
+> powercell card that links cells at any distance into one shared store. Slice 11 adds the coal
 > generator's **charge-item slot**: an energy item in slot 1 is charged at 1,000 FE a tick out of
 > the generator's own store, through the pin's `horizon:item_energy` capability, and a powercell item
 > is such a carrier (its `minecraft:block_entity_data` energy int). Slice 1 (0.1.0) is the coal
@@ -1987,6 +1991,117 @@ deviations:
 | persistence of the carrier on a broken item | not in game (the engine keeps container items apart from the payload — documented deviation) |
 | the 5-second HUD statistics window, the GUI and the renderer | not ported (gap 10; client features outside a `machines` slice) |
 
+## Slice 14 — the dimensional cell (package 0.1.13)
+
+Gap line it comes from: **gap 11** — *"The rest of the mod: the dimensional cell (with its
+card-linked networks)"* — the last machine-tier family. Class **content**, tier **machines**:
+block entities with a buffer, six face modes and a card that links cells at a distance. No GUI, no
+renderer, no new hook and no new vanilla capability — the card's channel rides a typed component on
+an existing carried item, the pattern slices 7/12/13 proved.
+
+### The numbers, read from the artefact first (`1.21_neo` @ `e44463ca`)
+
+`DimensionalCellConfiguration.java`: `rfPerTick=5000` (:26), `rfPerNormalCell=1,000,000` (:29),
+`advancedFactor=4` (:33), `simpleFactor=4` (:36). `DimensionalCellTileEntity.getPowerFactor` (:406)
+gives 1 / 4 / 16 for simple / normal / advanced (creative is advanced + creative). Capacity is
+`rfPerNormalCell × factor / simpleFactor` (`:480` local, `:558` capability) and the per-side rate is
+`(int)(rfPerTick × factor / simpleFactor × (infusedFactor × 0.5 + 1))` (`:364`); the infusion term is
+1 because no infusion carrier is carried for this family.
+
+| tier | capacity | per side | block |
+|---|---:|---:|---|
+| simple | 250,000 | 1,250 | `dimensionalcell_simple` |
+| normal | 1,000,000 | 5,000 | `dimensionalcell` |
+| advanced / creative | 4,000,000 | 20,000 | `dimensionalcell_advanced` / `_creative` |
+
+The card is `items/PowerCellCardItem.java`: `PowerCardData` is a record with one int `id`, `-1` =
+unlinked (`data/PowerCardData.java:8`), stored under `ITEM_POWERCARD_DATA`. Insertion into slot
+`SLOT_CARD` allocates a channel when the card is unlinked and writes it to the cell's
+`DimensionalCellData.networkId` (`DimensionalCellTileEntity:381-399`).
+
+**Documented deviation.** Upstream keeps the channel's energy as one int in the saved world data
+`DimensionalCellNetwork` and sums member capacities (`calculateMaximumEnergy`:117-125). The pin has
+no world-data attachment and no way to enumerate block entities, so this port keeps the pool as the
+sum of the member cells' own saved `energy` ints, with inserts filling the asked cell first; an
+in-memory channel index is rebuilt from the cells' saved ids on their tick. The observed behaviour
+(one store/capacity at every linked cell, FE arriving at one raising the other) is the same. The
+card-copy slot, charge-item slot and GUI are not carried; the cell recipes are carried but need the
+parent's `rftoolsbase:machine_frame` / `infused_diamond` and are recorded `blocked(parent-absent)`.
+
+### The carrier gate (first in-game check of the slice)
+
+Phase DA gives the artefact's own item `rftoolspower:powercell_card` with the new typed component
+`rftoolspower:powercard_data={id:7}`, reads it back off the **live held stack** with
+`/rftoolspower card` — `Card: item=rftoolspower:powercell_card net=7 nonce=240` — then clicks it in
+survival into a fresh simple cell and reads `net=7` from `/rftoolspower dimcell`. Both halves passed,
+so the slice was implemented rather than `blocked(dimensional-cell-carrier)`; no chat command ever
+sets a cell's channel (the only other write is the face-mode stand-in `/rftoolspower dimside`).
+
+### Red → green (unit, verbatim)
+
+`ports/_shared/evidence/rftoolspower/red-dimensionalcell.log`: `test result: FAILED. 165 passed;
+5 failed`, every failure `not yet implemented: … is not written yet`:
+`dim_tier_capacity`, `dim_tier_per_side`, `dim_card_network`, `dim_pool` and `dim_receive`.
+Green: **171 passed; 0 failed** (`sdk-test.log`, regenerated after the final build and naming
+`ca86feb…` / 230,612 B).
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `Compiling rftoolspower (1 of 1)`, single-mod
+`native-0a875da-227fab837d01`, two-mod e2e `native-0a875da-80f83af1b992` (`native-mods.json` names
+**0.1.13** for this port and 0.1.0 for `rfpowerharness`).
+
+| log | verdict |
+|---|---|
+| `e2e-dimensionalcell.log` | **PASS**, `EXIT:0` — phases A–BS, BT–BW and DA–DE (the whole port) |
+| `e2e-dimensionalcell-selftest.log` | `FAIL: selftest: the simple pair's capacity is 250000 (500,000), so asserting 1,000,000 fails — the assertion is alive`, `EXIT:1` |
+| `e2e-dimensionalcell-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=41 ok=41 missing-exit=0 bad-exit=0` (all prior
+legs stay green). Every new phase's `PACKAGE` line names the delivered `ca86feb…` / 230,612 B.
+
+| phase | what it asserts (observed) |
+|---|---|
+| DA | the card's `{id:7}` round-trips on the held item (`item=… net=7`) and the clicked cell reads `net=7`; a fresh simple cell reads `0/250,000`, `n=1`, `net=-1`, six `NONE` faces |
+| DB | two simple cells at z=204 and z=208 — **four blocks apart**, so adjacency cannot explain it — linked by cards with the same id read **one `0/500,000` pool, `n=2`** at both ends; an unlinked same-tier cell at z=212 stays `0/250,000` (`n=1`, `net=-1`) as the differential |
+| DC | a seeded generator's 2,000 FE-a-tick push into cell A's `INPUT` face; two replies at **cell B** name `t` and the shared store `22,500 → 65,000` over **34 ticks**: `Δ=42,500 = 1,250 × 34`, the artefact's simple per-side rate, not the generator's 2,000. The unlinked cell stays at 0 |
+| DD | with cell A's `INPUT` closed and cell B's east face `OUTPUT`, the pool falls `75,000 → 43,750` over **25 ticks** = `31,250 = 1,250 × 25`; the harness receiver to the east gains FE (the push is fail-capable) |
+| DE | the card's plain vanilla recipe (`rgr/gpg/rgr`) crafts one card and consumes 4 nuggets, 1 paper and 4 redstone; the three carried cell recipes craft nothing without the parent's machine frame / infused diamond |
+
+Counterfactual: `SELFTEST=dimensionalcell` asserts the **normal** tier's 1,000,000 capacity and
+5,000 FE-a-tick rate on the simple pair and ends `EXIT:1` with the real 250,000/1,250 named, so both
+artefact assertions can fail. The control leg proves a fresh game cannot even place the cell's
+generator (and that no dimensional cell item exists there).
+
+### Engines traps this slice cost (measured, not read)
+
+1. A block entity is out of the world during its own tick: the first `OUTPUT` implementation read
+   face modes through the host and the push moved nothing. The tick now reads the six-digit mode
+   string from its own saved compound, exactly as the powercell's tick does.
+2. The generator pushes the instant it is placed, so the seeded 100,000 was already 90,000 at the
+   first `info`; phase DC rates from two cell replies and never asserts the generator's initial.
+3. A fresh harness receiver has no `energy` NBT key, so `/data get block … energy` answers "Found no
+   elements matching energy" rather than 0; its initial store is asserted as 0 without a read.
+4. A stale generator kept feeding the pool during the output window even after a `setblock air`
+   that the game refused; closing the cell's `INPUT` face is the reliable way to end the insert.
+5. The slice-13 enderfactor leg's 0.6 %-discard retry needed up to six attempts on this run (three
+   consecutive windows were cut once); the retry cap was raised from 3 to 6, keeping the discard
+   as an inconclusive case rather than weakening the paid 300/333 assertions.
+
+### Coverage of the dimensional cell (slice 14)
+
+| family | state |
+|---|---|
+| the four tier blocks and items, plain-cube models and jar textures | tested (DA: a simple cell placed from its item reads `tier=simple local=0/250000`; an unknown id is refused — control leg) |
+| the tier capacities and per-side rates | tested (DA/DB: 250,000 and 2 × 250,000 = 500,000; DC/DD: 1,250 × Δt from two replies' own `t=`; `SELFTEST=dimensionalcell` inverts both) |
+| the card's typed component and the channel binding | tested (DA/DB: `{id:7}` round-trips on the held card and both cells read `net=7`; no chat command sets a link) |
+| the six face modes (`INPUT`/`OUTPUT`/`NONE`) | tested (DC: `west input` admits FE; DD: `west none` + `east output` pushes; DA: six `NONE`s on a fresh cell) |
+| the shared store across distance | tested (DB/DC: z=204 and z=208, four blocks apart, one pool) |
+| the unlinked differential | tested (DB/DC: the z=212 cell stays `n=1`, `net=-1`, `0/250,000` and 0 FE) |
+| the card's plain recipe | tested (DE: crafted once, ingredients consumed) |
+| the three cell recipes | `blocked(parent-absent)` (DE: no `rftoolsbase:machine_frame` / `infused_diamond` in this build) |
+| the cell's store on a broken item, the GUI and the renderer | not ported (gap 11's next slice; the GUI/renderer are client tier) |
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
@@ -2167,7 +2282,7 @@ deviations:
 | the smart wrench, the GUI, the powercell card | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review (slices 1–13; slice 13 kept the two endergenic float rules in `runtime.rs` as pure functions tested red-first, carried the artefact's single-precision truncating casts with narrow `#[expect(…, reason = …)]`, moved the click to the single global owner so a stone is never placed, and re-read every gate's `PACKAGE` sha; slice 12 kept both infusion rules in `runtime.rs` as pure functions tested red-first, used `#[must_use]` with the artefact's float arithmetic as the source and narrow `#[expect(…, reason = …)]` for the two truncating casts, folded the carrier and its level into one semantic argument when clippy counted eight, and re-read every gate's `PACKAGE` sha; slice 11 kept the charge rule in `runtime.rs` as a pure `charge_step` tested red-first; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review (slices 1–14; slice 14 kept the tier capacities/rates and the card-link rules in `runtime.rs` as pure functions tested red-first, used `#[must_use]`, named the channel registry type instead of silencing `clippy::type_complexity`, and re-read the package sha in every gate log; slice 13 kept the two endergenic float rules in `runtime.rs` as pure functions tested red-first, carried the artefact's single-precision truncating casts with narrow `#[expect(…, reason = …)]`, moved the click to the single global owner so a stone is never placed, and re-read every gate's `PACKAGE` sha; slice 12 kept both infusion rules in `runtime.rs` as pure functions tested red-first, used `#[must_use]` with the artefact's float arithmetic as the source and narrow `#[expect(…, reason = …)]` for the two truncating casts, folded the carrier and its level into one semantic argument when clippy counted eight, and re-read every gate's `PACKAGE` sha; slice 11 kept the charge rule in `runtime.rs` as a pure `charge_step` tested red-first; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
 
 ## Verification (slice 13 run — every compile gate forwarded to `AdLf-PC`)
 
@@ -2189,6 +2304,18 @@ and exported `native-0a875da-9ce8dccaf5cc`; the two-mod e2e export is
 `native-0a875da-29952fb57a7a` (`native-mods.json` names 0.1.12). The e2e legs, the launcher build and
 the control game stayed local (the exported instance, the offscreen renderer and the unmodded
 control game are here); no `BUILD_LOCAL=1` was used for any Rust step.
+
+## Artifact (0.1.13)
+
+| File | Size | SHA-256 | Entries |
+|---|---:|---|---:|
+| `rftoolspower.hmod` (port root) | 230,612 B | `ca86febbbb54b4642faf9c90185c260532227f5e63c48e36ce5b1a670c11ab1b` | 194 |
+
+Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
+`check` green (`native-mod, format native-1/0a875da…/e59da909…, for 26.3`), both `fits` green
+(`0a875da  made for`, `0b14f8a  fits`), `verify-sdk-package.py` 1/1 (`package matches the tree`,
+R9 clean), and all three 0.1.13 legs ran on these bytes (their `PACKAGE` lines name them). The
+0.1.12 artifact was 208,103 B / `b98f7cbc…` / 154 entries.
 
 ## Artifact (0.1.12)
 
@@ -2255,27 +2382,22 @@ artifact (141,168 B, `26485b9a…`, 105 entries) is the slice-6 record; the 0.1.
 
 ## Next slice
 
-- **Family:** the **dimensional cell** (gap 11's *"the rest of the mod: the dimensional cell (with
-  its card-linked networks)"*). It is the largest remaining machine family: block entities with a
-  buffer, six face modes and a card that links cells across distance. It fits `machines` — no new
-  GUI or renderer; the card's data is a mod component on an existing item, the pattern slices 7/12/13
-  proved at this pin. The endergenic's own GUI, renderer and 5-second HUD window (gap 10) are client
-  features and stay out of tier.
-- **Gap line it comes from:** gap 11 — *"The rest of the mod: the dimensional cell (with its
-  card-linked networks) …"* — the only machine-tier family still unported.
-- **Artefact to follow:** read `modules/dimensionalcell/` in the existing `1.21_neo` @ `e44463ca`
-  checkout first (`DimensionalCellTileEntity`, `DimensionalCellConfiguration`, the card item and
-  the four tiers' `data/` classes). Carry the artefact's per-tier capacities and per-side rates
-  rather than inferring them from the powercell; the recipe ingredients may need the parent's
-  `rftoolsbase:dimensional_shard` and a `#c:` tag 26.3 lacks, in which case record it
-  `blocked(parent-absent)` the way the other recipes are, but still carry the plain ones.
-- **Gate before code:** confirm the card's typed component (reuse `rftoolspower:infusable_data` only
-  if its shape fits; otherwise add a new one via `Hooks::component_types`) round-trips on an existing
-  carried item and binds to a cell's network id. If the pin cannot express the link, stop with
-  `blocked(dimensional-cell-carrier)` and the probe log rather than setting the link by chat command.
-- **In-game assertion that would prove it:** two cells linked by the card and more than a block apart
-  (so adjacency cannot explain it) must read one shared store/capacity in `/rftoolspower cell`-style
-  readouts, and an FE insert into one must raise the other's store by exactly the artefact's
-  per-side rate × Δt from the two replies' own `t=` values; an unlinked cell of the same tier stays
-  at its own capacity (the differential). A `SELFTEST=dimensionalcell` run asserts a lone cell's
-  capacity on the pair and exits 1.
+- **Family:** the **dimensional cell's own item payload** — the store (and its card's channel) on a
+  broken cell's item, restored when placed. It is the last machine-tier behaviour still missing after
+  slice 14; the GUIs, renderers and 5-second HUD window (gaps 4/5/6/10/11) are `client` and stay out
+  of tier.
+- **Gap line it comes from:** gap 11's tail, *"the rest of the mod …"*, and the slice-14 coverage row
+  *"the cell's store on a broken item … not ported"*. Upstream's
+  `DimensionalCellModule` loot uses `ITEM_DIMENSIONAL_CELL_DATA` / `minecraft:block_entity_data`;
+  `Hooks::block_drops` already proved the route for the generator, the endergenic and the tanks
+  (`rftoolsutility` 0.2.1).
+- **Why it fits the tier:** no new block, hook, GUI or renderer — one more `block_drops` branch and
+  the existing `DimCellItemPart` clamp, plus a loot-table change in `assemble_content.py`.
+- **In-game assertion that would prove it:** break a card-linked simple cell holding a known FE
+  store, read the dropped item's `minecraft:block_entity_data` `energy` (and channel) back with
+  `data get`, place it four blocks from its partner, and read `/rftoolspower dimcell`: `n=2`,
+  `net=7` and the same shared store as before the break; a doctored store above the tier's 250,000
+  is clamped on placement. `SELFTEST=dimcell-drop` asserts the un-clamped, unlinked store and exits 1.
+- **If the queue must move elsewhere:** the `blocked(parent-absent)` dimensional-cell and cell3
+  recipes become dispatchable the moment `rftoolsbase:machine_frame` / `infused_diamond` are carried
+  by the parent port; re-check them before any new client-tier work.

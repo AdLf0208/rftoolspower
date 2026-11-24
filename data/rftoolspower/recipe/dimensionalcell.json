@@ -1,0 +1,20 @@
+{
+  "category": "misc",
+  "key": {
+    "F": "rftoolsbase:machine_frame",
+    "P": "minecraft:prismarine_shard",
+    "R": "minecraft:redstone_block",
+    "d": "minecraft:diamond",
+    "e": "minecraft:emerald"
+  },
+  "pattern": [
+    "RdR",
+    "PFP",
+    "ReR"
+  ],
+  "result": {
+    "count": 1,
+    "id": "rftoolspower:dimensionalcell"
+  },
+  "type": "minecraft:crafting_shaped"
+}
