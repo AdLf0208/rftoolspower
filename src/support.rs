@@ -5,18 +5,19 @@
 //! back. Its tests pin what it *declares* (one insert-only fuel slot, a store that gives out 2,000
 //! FE a tick and takes nothing in), that the state written to the saved compound reads back, and the
 //! exact line `/rftoolspower info` prints.
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{LazyLock, Mutex};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use mod_api::{
     self, BlockClick, BlockDropsEvent, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
     BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, BlockSide, BlockSignalEvent,
-    BlockState, Command, CommandArgumentValue, Component, Compound, Direction, ENERGY,
+    BlockState, Command, CommandArgumentValue, Component, ComponentId, Compound, Direction, ENERGY,
     EnergyHandler, Flow, Host, HostSide, HostTransaction, Identifier, InteractionResult,
-    IsSignalSourceEvent, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef,
-    LevelSide, ModContainer, ModEnergyBuffer, NeighbourUpdate, OnBlockPlacedByEvent, Registrar,
-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
-    StateForPlacementEvent, Tag, Text, Transaction, UseItemOnEvent, UseWithoutItemEvent,
+    IsSignalSourceEvent, ItemComponentHandler, ItemPart, ItemPlace, ItemResource, ItemStack,
+    LevelHost, LevelRef, LevelSide, LevelTickPostEvent, ModContainer, ModEnergyBuffer,
+    NeighbourUpdate, OnBlockPlacedByEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RunModCommandEvent, ServerHost, StateForPlacementEvent, Tag, Text, Transaction, UseItemOnEvent,
+    UseWithoutItemEvent,
 };
 
 use crate::runtime::{
@@ -27,9 +28,10 @@ use crate::runtime::{
     INFUSER_COUNTER_START, INFUSER_INPUT, INFUSER_INSERT_PER_TICK, INFUSER_OUTPUT, INFUSER_SLOTS,
     INJECTOR_SLOTS, Infuser, Loss, MAX_DISTANCE, MONITOR_SIGNAL, Monitor, MonitorMode, NETWORK_MAX,
     OBSERVE_TICKS, PEARL, PowerLevel, Pulse, ROD_START_STEPS, Rod, RodSlot, SideMode, Sides, Tier,
-    as_capability, capacity as network_capacity, clamp_agitator, clamp_blazing, clamp_endergenic,
-    clamp_infuser, clamped_energy, network_valid, pearl_lost, receive as network_receive, restored,
-    rf_per_tick, rising_edge, send_amount, stored as network_stored, take as network_take,
+    as_capability, capacity as network_capacity, charge_step, clamp_agitator, clamp_blazing,
+    clamp_endergenic, clamp_energy, clamp_infuser, clamped_energy, network_valid, pearl_lost,
+    receive as network_receive, restored, rf_per_tick, rising_edge, send_amount,
+    stored as network_stored, take as network_take,
 };
 
 /// The generator block; the block entity type carries its own path.
@@ -41,11 +43,13 @@ const GENERATOR_TYPE: &str = "coalgenerator_block_entity";
 /// That type's registry id, which `minecraft:block_entity_data` tags its payload with
 /// (`TypedEntityData.loadInto` only loads data whose `id` names the block entity it is placed as).
 const GENERATOR_TYPE_ID: &str = "rftoolspower:coalgenerator_block_entity";
-/// The one slot: fuel (`CoalGeneratorTileEntity.SLOT_COALINPUT`).
+/// The fuel slot (`CoalGeneratorTileEntity.SLOT_COALINPUT`).
 const FUEL_SLOT: usize = 0;
-/// How many slots the container has. Upstream's second slot charges an energy item; that family
-/// (and the item capability it needs) is not in this slice.
-const SLOTS: usize = 1;
+/// The charge slot (`CoalGeneratorTileEntity.SLOT_CHARGEITEM`): an energy item is charged here,
+/// 1,000 FE a tick, out of the generator's store (upstream's `handleChargingItem`).
+const CHARGE_SLOT: usize = 1;
+/// Two slots: fuel and the charge item (upstream's `ContainerFactory(2)`).
+const SLOTS: usize = 2;
 /// The block's `lit` property, which the `minecraft:furnace` template already declares.
 const KEY_LIT: &str = "lit";
 /// The saved store, under the key the energy capability reads (`ModEnergyBuffer`'s amount).
@@ -120,9 +124,33 @@ const NO_CELL: &str = "No RFTools Power power cell there.";
 // What the mod declares for its block
 // ---------------------------------------------------------------------------
 
-/// Declare the generator: its block entity type and Part, its one fuel slot and its store
+/// The generators whose charge slot ticked this tick, per level, drained at the level tick's end.
+/// A block entity is out of the world during its own tick, so its item capability answers nothing
+/// there; the charge runs where every block entity is back in the world (`powah`'s queue pattern).
+#[derive(Default)]
+pub(crate) struct ChargeQueue {
+    pending: HashMap<LevelRef, BTreeSet<[i32; 3]>>,
+}
+
+impl ChargeQueue {
+    /// Queue a generator's position for the level its tick ran in.
+    fn push(&mut self, level: LevelRef, pos: [i32; 3]) {
+        self.pending.entry(level).or_default().insert(pos);
+    }
+
+    /// Everything queued for `level`, in position order (empty afterwards).
+    fn take(&mut self, level: LevelRef) -> BTreeSet<[i32; 3]> {
+        self.pending.remove(&level).unwrap_or_default()
+    }
+}
+
+/// Declare the generator: its block entity type and Part, its two slots and its store
 /// (upstream's `EntityBlock.newBlockEntity`, the items capability and the energy capability).
-pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
+pub(crate) fn declare(
+    r: &mut dyn Registrar,
+    context: &RegistrationContext,
+    queue: Arc<Mutex<ChargeQueue>>,
+) {
     // The type is declared first, then every per-block capability, then the Part: that is the
     // order the pin's registrar expects (the block's declaration is what a container or a buffer
     // hangs off).
@@ -139,7 +167,12 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
     r.item_part(item, GeneratorItemPart);
     // `block_entity_part` attaches the Part to the type's blocks as well, so registering it with
     // `block_part` first would attach it twice and the game refuses a duplicate.
-    if let Err(error) = r.block_entity_part(&kind, GeneratorPart) {
+    if let Err(error) = r.block_entity_part(
+        &kind,
+        GeneratorPart {
+            queue: Arc::clone(&queue),
+        },
+    ) {
         context.refuse(&format!(
             "rftoolspower: the coal generator part was refused: {error}"
         ));
@@ -293,6 +326,15 @@ fn declare_cell(
     });
     let item = r.item_key(block_id);
     r.item_part(item, CellItemPart);
+    // Upstream's cell item carries `mcjtylib:item_energy`; this port answers it from the same
+    // `block_entity_data` store the placed block reads, so a cell charged in the generator's slot
+    // is a real energy item (and the charge slot has something to charge).
+    r.item_capability(&mod_api::ITEM_ENERGY, block_id, move |_, place| {
+        Some(Box::new(CellItemEnergy {
+            place: place.clone(),
+            tier,
+        }) as Box<dyn EnergyHandler>)
+    });
     if let Err(error) = r.block_entity_part(&kind, CellPart { tier }) {
         context.refuse(&format!(
             "rftoolspower: the {block_path} part was refused: {error}"
@@ -300,13 +342,15 @@ fn declare_cell(
     }
 }
 
-/// The generator's container: one fuel slot every face reaches, insert-only for automation.
+/// The generator's container: a fuel slot and the charge slot, both reachable from every face.
+/// The fuel slot is insert-only (upstream `.in()`); the charge slot can be taken back
+/// (upstream `.in().out()`).
 pub(crate) fn generator_container() -> ModContainer {
     ModContainer {
         slots: SLOTS,
-        faces: std::array::from_fn(|_| vec![FUEL_SLOT]),
-        inputs: vec![FUEL_SLOT],
-        outputs: vec![],
+        faces: std::array::from_fn(|_| vec![FUEL_SLOT, CHARGE_SLOT]),
+        inputs: vec![FUEL_SLOT, CHARGE_SLOT],
+        outputs: vec![CHARGE_SLOT],
         menu: None,
     }
 }
@@ -432,6 +476,7 @@ pub(crate) fn generator_line(
     pos: [i32; 3],
     state: &Generator,
     fuel: Option<(&str, u32)>,
+    charge: Option<(&str, u32, u32, bool)>,
     t: i64,
     nonce: Option<&str>,
 ) -> String {
@@ -439,10 +484,17 @@ pub(crate) fn generator_line(
         Some((item, count)) => format!("{item} x{count}"),
         None => "empty".to_owned(),
     };
+    let charge = match charge {
+        Some((item, count, fe, cap)) => format!(
+            "{item} x{count} ({fe} FE, cap={})",
+            if cap { "yes" } else { "no" }
+        ),
+        None => "empty".to_owned(),
+    };
     let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
     format!(
         "Coal Generator at {},{},{}: {}/{} FE (burning {}/{} ticks, lit {}, fuel {fuel}, \
-         t={t}{suffix})",
+         charge {charge}, t={t}{suffix})",
         pos[0],
         pos[1],
         pos[2],
@@ -501,8 +553,8 @@ pub(crate) fn tick_generator(
     let before = read_generator(saved);
     let mut state = before.clone();
     let mut changed = false;
-    // Upstream's order: push to the neighbours first, from the store the tick started with,
-    // then burn and generate.
+    // The charge slot is filled at the level tick's end, not here: a block entity is out of the
+    // world during its own tick, so `ItemPlace::capability` answers nothing for its items.
     push_energy(host, level, pos, &mut state);
     if state.wants_fuel()
         && let Some(stack) = items.get(FUEL_SLOT).and_then(Option::clone)
@@ -520,6 +572,73 @@ pub(crate) fn tick_generator(
         mirror_lit(host, pos, state.lit());
     }
     changed
+}
+
+/// The level-tick half of the generator's charge slot. `ItemPlace::capability` answers for a block
+/// entity's items only when it is back in the world, so `handleChargingItem` runs here, not in the
+/// block entity's own tick. The FE put into the item is taken out of the generator's saved store.
+pub(crate) fn on_level_tick_post(
+    queue: &Arc<Mutex<ChargeQueue>>,
+    host: HostSide,
+    event: &mut LevelTickPostEvent,
+) {
+    let HostSide::Server(host) = host else {
+        return;
+    };
+    // The queue is only drained where this level is the one being ticked; otherwise leave it for
+    // the next tick so no generator's charge is dropped.
+    if !event.level.in_place(host) {
+        return;
+    }
+    let queued = queue
+        .lock()
+        .expect("the rftoolspower charge queue lock is held for one drain")
+        .take(event.level);
+    charge_queued(host, event.level, queued);
+}
+
+/// Charge the item in each queued generator's slot, taking exactly what moved out of its store.
+fn charge_queued(host: &mut dyn ServerHost, level: LevelRef, queued: BTreeSet<[i32; 3]>) {
+    for pos in queued {
+        if block_id(&*host, level, pos).as_deref() != Some(GENERATOR) {
+            continue;
+        }
+        let Some(entity) = host.block_entity(level, pos) else {
+            continue;
+        };
+        let Some(saved) = entity.data(&*host) else {
+            continue;
+        };
+        let stored = clamp_energy(int(&Tag::Compound(saved), KEY_ENERGY));
+        if stored == 0 {
+            continue;
+        }
+        let place = ItemPlace::BlockEntity {
+            level,
+            pos,
+            side: None,
+            slot: CHARGE_SLOT,
+        };
+        let Some(item) = place.capability(host, &mod_api::ITEM_ENERGY) else {
+            continue;
+        };
+        let room = item.capacity(host).saturating_sub(item.amount(host));
+        let asked = charge_step(stored, i32::try_from(room).unwrap_or(i32::MAX));
+        if asked == 0 {
+            continue;
+        }
+        let moved = host
+            .transaction(|host, tx| -> Result<u32, ()> {
+                Ok(item.insert(host, tx, u32::try_from(asked).unwrap_or(0)))
+            })
+            .unwrap_or(0);
+        let moved = asked.min(i32::try_from(moved).unwrap_or(i32::MAX));
+        if moved > 0 {
+            let mut patch = Compound::new();
+            patch.insert(KEY_ENERGY.into(), Tag::Int(stored - moved));
+            let _ = entity.merge_data(host, patch);
+        }
+    }
 }
 
 /// `CoalGeneratorTileEntity.handleSendingEnergy`: offer up to [`EXTRACT_PER_TICK`] to each of the
@@ -1292,6 +1411,77 @@ impl EnergyHandler for CellEnergy {
     }
 }
 
+/// A powercell's own item as `Capabilities.Energy.ITEM` (upstream's `mcjtylib:item_energy`):
+/// the store in its `minecraft:block_entity_data` payload — the very same store placement reads —
+/// so a cell charged in the generator's slot carries that FE when it is later placed.
+struct CellItemEnergy {
+    place: ItemPlace,
+    tier: Tier,
+}
+
+impl CellItemEnergy {
+    /// The item's `block_entity_data` component handler.
+    fn handler(&self) -> ItemComponentHandler {
+        ItemComponentHandler::new(
+            self.place.clone(),
+            ComponentId::new(BLOCK_ENTITY_DATA)
+                .expect("minecraft:block_entity_data is a namespaced component id"),
+        )
+    }
+
+    /// The store the payload holds, clamped to this tier's capacity.
+    fn held(&self, host: &mut dyn ServerHost) -> i32 {
+        match self.handler().read(host) {
+            Some(Tag::Compound(payload)) => {
+                clamped_energy(self.tier, int(&Tag::Compound(payload), KEY_ENERGY))
+            }
+            _ => 0,
+        }
+    }
+
+    /// Rewrite only the `energy` int, keeping the payload's block-entity type id.
+    fn rewrite(&self, host: &mut dyn ServerHost, tx: &Transaction, energy: i32) -> bool {
+        let mut payload = match self.handler().read(host) {
+            Some(Tag::Compound(payload)) => payload,
+            _ => Compound::new(),
+        };
+        payload.insert("id".into(), Tag::String(cell_type_id(self.tier).into()));
+        payload.insert(KEY_ENERGY.into(), Tag::Int(energy));
+        self.handler().write(host, tx, Some(Tag::Compound(payload)))
+    }
+}
+
+impl EnergyHandler for CellItemEnergy {
+    fn amount(&self, host: &mut dyn ServerHost) -> u32 {
+        u32::try_from(self.held(host)).unwrap_or(0)
+    }
+
+    fn capacity(&self, _host: &mut dyn ServerHost) -> u32 {
+        u32::try_from(self.tier.capacity()).unwrap_or(0)
+    }
+
+    fn insert(&self, host: &mut dyn ServerHost, tx: &Transaction, amount: u32) -> u32 {
+        let held = self.held(host);
+        let room = self.tier.capacity() - held;
+        let moved = i32::try_from(amount).unwrap_or(i32::MAX).min(room).max(0);
+        if moved > 0 && self.rewrite(host, tx, held + moved) {
+            u32::try_from(moved).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn extract(&self, host: &mut dyn ServerHost, tx: &Transaction, amount: u32) -> u32 {
+        let held = self.held(host);
+        let moved = i32::try_from(amount).unwrap_or(i32::MAX).min(held).max(0);
+        if moved > 0 && self.rewrite(host, tx, held - moved) {
+            u32::try_from(moved).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+}
+
 /// One powercell tick (`PowerCellTileEntity.tickServer` → `sendOutEnergy`): for every face whose
 /// mode is `OUTPUT`, offer up to the network's per-side budget to the block there, skipping
 /// another powercell (cells share through the network, never by pushing into each other), and
@@ -1615,18 +1805,25 @@ pub(crate) fn generator_click(
         }
         return Some(InteractionResult::Success);
     };
-    let refused = item_id(&*host, held);
-    if Fuel::of(&refused).is_none() {
-        if let Some(player) = host.player(click.player) {
-            let _ = player.action_bar(host, Text::literal(format!("{refused} is not a fuel")));
-        }
-        return Some(InteractionResult::Success);
-    }
+    let held_id = item_id(&*host, held);
     let hand = ItemPlace::PlayerHand {
         player: click.player,
         hand: click.hand,
     };
-    insert_from_hand(host, level, click.pos, held, &hand);
+    // Upstream's container accepts only a valid fuel in slot 0 and only an energy item in slot 1
+    // (`EnergyTools.isEnergyItem`); this port asks the item's own capability. A stone answers
+    // neither, so the click changes nothing and the stone stays in the hand.
+    let slot = if Fuel::of(&held_id).is_some() {
+        FUEL_SLOT
+    } else if hand.capability(host, &mod_api::ITEM_ENERGY).is_some() {
+        CHARGE_SLOT
+    } else {
+        if let Some(player) = host.player(click.player) {
+            let _ = player.action_bar(host, Text::literal(format!("{held_id} is not a fuel")));
+        }
+        return Some(InteractionResult::Success);
+    };
+    insert_from_hand(host, level, click.pos, held, &hand, slot);
     Some(InteractionResult::Success)
 }
 
@@ -1638,12 +1835,13 @@ pub(crate) fn insert_from_hand(
     pos: [i32; 3],
     held: &ItemStack,
     hand: &ItemPlace,
+    slot: usize,
 ) -> u32 {
     host.transaction(|host, tx| -> Result<u32, ()> {
         let entity = host.block_entity(level, pos).ok_or(())?;
         let key = held.item();
         let limit = host.max_stack_size(key).unwrap_or(DEFAULT_STACK);
-        let existing = entity.item_slot(&*host, FUEL_SLOT as u32).ok().flatten();
+        let existing = entity.item_slot(&*host, slot as u32).ok().flatten();
         // The slot keeps the stack it already holds; an inserted stack is the caller's own stack
         // (components and damage included), never rebuilt from an id and a count.
         let (inserted, after) = match existing {
@@ -1676,7 +1874,7 @@ pub(crate) fn insert_from_hand(
             return Err(());
         }
         entity
-            .set_item_slot(&mut *host, tx, FUEL_SLOT as u32, Some(after))
+            .set_item_slot(&mut *host, tx, slot as u32, Some(after))
             .map_err(|_| ())?;
         let _ = entity.set_changed(&mut *host);
         Ok(inserted)
@@ -3251,11 +3449,34 @@ pub(crate) fn status_line(
         .ok()
         .flatten()
         .map(|stack| (stack.item().id(&*host), stack.count()));
+    // The charge-slot item's FE is read through its own `ITEM_ENERGY` capability — the same
+    // handler the generator's tick inserts into, so the readout is the item's component value.
+    let charge = entity
+        .item_slot(&*host, CHARGE_SLOT as u32)
+        .ok()
+        .flatten()
+        .map(|stack| {
+            let item = stack.item().id(&*host).to_owned();
+            let count = stack.count();
+            let place = ItemPlace::BlockEntity {
+                level,
+                pos,
+                side: None,
+                slot: CHARGE_SLOT,
+            };
+            let handler = place.capability(&mut *host, &mod_api::ITEM_ENERGY);
+            let cap = handler.is_some();
+            let fe = handler.map_or(0, |handler| handler.amount(&mut *host));
+            (item, count, fe, cap)
+        });
     let t = level.game_time(&*host).unwrap_or(0);
     generator_line(
         pos,
         &read_generator(&Tag::Compound(saved)),
         fuel.as_ref().map(|(item, count)| (item.as_str(), *count)),
+        charge
+            .as_ref()
+            .map(|(item, count, fe, cap)| (item.as_str(), *count, *fe, *cap)),
         t,
         nonce,
     )
@@ -3403,7 +3624,9 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
 // ---------------------------------------------------------------------------
 
 /// The Coal Generator: it ticks, and a click puts fuel in its slot.
-pub(crate) struct GeneratorPart;
+pub(crate) struct GeneratorPart {
+    queue: Arc<Mutex<ChargeQueue>>,
+}
 
 #[mod_api::horizon_part]
 impl BlockPart for GeneratorPart {
@@ -3452,6 +3675,18 @@ impl BlockEntityPart for GeneratorPart {
         let changed = tick_generator(host, level, pos, &mut saved, items);
         if let Tag::Compound(nbt) = saved {
             event.entity.nbt = nbt;
+        }
+        // An item in the charge slot needs the level tick's end, where the block entity is back in
+        // the world and its item capability answers. Queue only when the slot is occupied.
+        if let Some(level) = level
+            && event
+                .entity
+                .items
+                .get(CHARGE_SLOT)
+                .is_some_and(Option::is_some)
+            && let Ok(mut queue) = self.queue.lock()
+        {
+            queue.push(level, pos);
         }
         if !changed {
             *event.reply = BlockEntityTickReply::Unchanged;
@@ -4959,19 +5194,23 @@ mod tests {
     }
 
     #[test]
-    fn the_generator_has_one_insert_only_fuel_slot() {
+    fn the_generator_has_a_fuel_slot_and_a_charge_slot() {
         let container = generator_container();
-        assert_eq!(container.slots, SLOTS, "one fuel slot");
-        assert_eq!(container.inputs, vec![FUEL_SLOT], "fuel may be inserted");
+        assert_eq!(container.slots, SLOTS, "upstream's ContainerFactory(2)");
+        assert_eq!(
+            container.inputs,
+            vec![FUEL_SLOT, CHARGE_SLOT],
+            "fuel and the charge item may be inserted"
+        );
         assert_eq!(
             container.outputs,
-            Vec::<usize>::new(),
-            "automation takes nothing back out"
+            vec![CHARGE_SLOT],
+            "only the charge slot is .out() upstream"
         );
         assert_eq!(
             container.faces,
-            std::array::from_fn(|_| vec![FUEL_SLOT]),
-            "automation reaches the slot from every face: there is no side configuration"
+            std::array::from_fn(|_| vec![FUEL_SLOT, CHARGE_SLOT]),
+            "automation reaches both slots from every face: there is no side configuration"
         );
         assert_eq!(container.menu, None, "no GUI in this slice");
     }
@@ -5038,16 +5277,17 @@ mod tests {
                 [0, 100, 0],
                 &state,
                 Some(("minecraft:coal", 4)),
+                Some(("rftoolspower:cell1", 1, 98_000, true)),
                 324,
                 Some("1")
             ),
             "Coal Generator at 0,100,0: 1940/500000 FE (burning 503/600 ticks, lit true, fuel \
-             minecraft:coal x4, t=324 nonce=1)"
+             minecraft:coal x4, charge rftoolspower:cell1 x1 (98000 FE, cap=yes), t=324 nonce=1)"
         );
         assert_eq!(
-            generator_line([200, 101, 0], &Generator::new(), None, 7, None),
+            generator_line([200, 101, 0], &Generator::new(), None, None, 7, None),
             "Coal Generator at 200,101,0: 0/500000 FE (burning 0/0 ticks, lit false, fuel empty, \
-             t=7)"
+             charge empty, t=7)"
         );
     }
 

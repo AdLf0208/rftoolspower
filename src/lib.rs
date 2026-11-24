@@ -32,15 +32,23 @@
 //!
 //! The numbers — 60 FE a tick, 600 ticks a coal, every capacity and clamp, the `rfPerHit` table —
 //! are in [`runtime`], a plain module with no `mod_api` types, so `cargo test` alone proves them.
+use std::sync::{Arc, Mutex};
+
 use mod_api::{
-    self, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+    self, Flow, Hooks, LevelTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+    ServerHost,
 };
 
 pub mod runtime;
 pub mod support;
 
 #[derive(Default)]
-struct Mod;
+struct Mod {
+    /// Generators whose charge slot ticked; drained at the level tick's end, where the block
+    /// entity is back in the world and its item capability answers (it does not during its own
+    /// tick).
+    queue: Arc<Mutex<support::ChargeQueue>>,
+}
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
@@ -50,7 +58,13 @@ impl Hooks for Mod {
     /// monitor's Part; and the blazing generator's, agitator's and infuser's Parts, slots and
     /// buffers.
     fn register(&self, r: &mut dyn Registrar, context: &RegistrationContext) {
-        support::declare(r, context);
+        support::declare(r, context, Arc::clone(&self.queue));
+    }
+
+    /// Charge the slot items after the level's tick, when every block entity is back in the world:
+    /// an item capability asked inside its own block entity tick answers nothing.
+    fn level_tick_post(&self, host: mod_api::HostSide, event: &mut LevelTickPostEvent) {
+        support::on_level_tick_post(&self.queue, host, event);
     }
 
     /// `/rftoolspower info|monitor|powerlevel|band|cell|side|endergenic|injector|enderlink|endermonitor|blazing|agitator|agitatelock|infuser …`.

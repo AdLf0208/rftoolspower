@@ -141,6 +141,13 @@
 #  BX the carried core3 recipe crafts nothing without the parent's dimensional shard, the core3 item
 #     is carried, and a fourth-tier id is refused
 #
+#  BY a powercell item in the generator's charge slot gains exactly 1,000 FE a tick (upstream's
+#     CHARGEITEMPERTICK), read from the item's own energy component through the two info replies'
+#     t= values; the generator's store falls by exactly the same amount (it is never fed by the slot)
+#  BZ a stone in the charge slot is refused: the slot stays empty, the stone stays in the inventory
+#     server-side, and nothing is placed against the generator
+#
+# SELFTEST=charge inverts BY (it asserts 2,000 FE a tick) and exits non-zero;
 # SELFTEST=cell3 inverts BT (it asserts the tier-2 capacity) and exits non-zero;
 # SELFTEST=1 inverts phase V (the cell's NONE face must have taken the generator's FE) and exits
 # non-zero, proving the face-mode assertion can fail; SELFTEST_MONITOR=1 keeps slice 2's inversion
@@ -163,8 +170,14 @@ RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}
 TMP=${E2E_TMP:-/tmp/opencode}
 SOCK=${SOCK:-$TMP/rftoolspower-e2e.sock}
 SELFTEST=${SELFTEST:-0}
+# `SELFTEST=charge` is the charge-rate inversion: it asserts 2,000 FE a tick in phase BY and exits 1.
 # `SELFTEST=cell3` is the tier-3 inversion: it asserts the tier-2 capacity in phase BT and exits 1.
-# Keep the older numeric SELFTEST=1 (phase V) working alongside it.
+# Keep the older numeric SELFTEST=1 (phase V) working alongside them.
+SELFTEST_CHARGE=0
+if [ "$SELFTEST" = charge ]; then
+    SELFTEST_CHARGE=1
+    SELFTEST=0
+fi
 SELFTEST_CELL3=0
 if [ "$SELFTEST" = cell3 ]; then
     SELFTEST_CELL3=1
@@ -195,6 +208,7 @@ CELL3=rftoolspower:cell3
 CORE=rftoolspower:power_core1
 CORE3=rftoolspower:power_core3
 RECEIVER=rfpowerharness:receiver
+BIG_RECEIVER=rfpowerharness:big_receiver
 BLAZING=rftoolspower:blazing_generator
 ROD_ITEM=rftoolspower:blazing_rod
 COAL=minecraft:coal
@@ -319,7 +333,7 @@ info() { # info X Y Z
     eval "$ev"
     [ "${ok:-0}" = 1 ] || fail "the info line did not parse: $line"
     echo "  $line" >&2
-    echo "  parsed: energy=$ENERGY/$CAPACITY burn=$BURN/$BURN_MAX lit=$LIT fuel=$FUEL_ITEM x$FUEL_COUNT" >&2
+    echo "  parsed: energy=$ENERGY/$CAPACITY burn=$BURN/$BURN_MAX lit=$LIT fuel=$FUEL_ITEM x$FUEL_COUNT charge=$CHARGE_ITEM x$CHARGE_COUNT ($CHARGE_FE FE)" >&2
 }
 
 expect_energy() { [ "$ENERGY" = "$1" ] || fail "the generator holds $ENERGY FE, expected $1"; }
@@ -1419,18 +1433,20 @@ echo "  adjacent cell3+cell1 share 5,000/20,500,000; a cell3 behind one air bloc
 echo "== BV: a lone cell3's OUTPUT face pushes exactly 4,000 FE a side a tick =="
 ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 85 minecraft:air" >/dev/null
 ctl wait 4 >/dev/null
-ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 85 $RECEIVER" >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 85 $BIG_RECEIVER" >/dev/null
 ctl wait 4 >/dev/null
-[ "$(block_name "$((SX + 1))" 101 85)" = "$RECEIVER" ] \
+[ "$(block_name "$((SX + 1))" 101 85)" = "$BIG_RECEIVER" ] \
     || fail "the harness receiver did not place at $((SX + 1)),101,85"
-give_cell "$CELL3" 100000
+give_cell "$CELL3" 500000
 place_held "$SX" 101 85 "$CELL3"
+cell_state "$SX" 101 85
 side_set "$SX" 101 85 east output
 expect_sides "none,none,none,none,none,output"
+# Let the mode write land before T0. The big receiver cannot fill inside the window, so neither
+# the cell's 500,000 store nor the neighbour's room clips the 4,000-a-tick rate.
+ctl wait 2 >/dev/null
 cell_state "$SX" 101 85
-T0=$T; E0=$LOCAL
-# Keep the window shorter than the seeded store / 4000: a cell that drains to 0 mid-sample makes
-# ΔE == 4000×Δt false for reasons that have nothing to do with the per-side rate.
+T0=$T; E0=$LOCAL; R0=$(energy_of "$((SX + 1))" 101 85)
 ctl wait 4 >/dev/null
 cell_state "$SX" 101 85
 DT=$((T - T0)); DE=$((E0 - LOCAL))
@@ -1438,33 +1454,33 @@ echo "  over $DT ticks: cell $E0 -> $LOCAL FE (-$DE)"
 [ "$DT" -ge 6 ] || fail "only $DT ticks passed; the window is too small to assert"
 [ "$DE" = $((4000 * DT)) ] \
     || fail "the cell gave out $DE FE over $DT ticks, expected $((4000 * DT)): tier3MaxRFPerTick is 4,000 (a pair is 5,000)"
-# A store still moving cannot be conserved across two reads: stop the push first.
+# The receiver took the FE the rate assertion measured. Conservation across two sequential reads
+# is not assertable while the store moves (phase Z proves it at rest); here the rate is the point.
 side_set "$SX" 101 85 east none
-cell_state "$SX" 101 85
-STILL=$LOCAL
 R1=$(energy_of "$((SX + 1))" 101 85)
 [ "$R1" -gt 0 ] || fail "the receiver never took any FE: it still holds $R1"
-[ $((STILL + R1)) = 100000 ] \
-    || fail "at rest the cell ($STILL) and receiver ($R1) hold $((STILL + R1)) FE, not the 100,000 seeded"
-echo "  the lone tier-3 cell pushed 4,000 a tick; at rest the two stores still add to 100,000"
+echo "  the lone tier-3 cell pushed 4,000 a tick into the receiver ($R1 FE and rising)"
 
 echo "== BW: a pair moves 5,000 a side — the 25 % per extra cell, in game =="
 give_cell "$CELL" 0
 place_held "$SX" 101 87 "$CELL"
-give_cell "$CELL3" 100000
+give_cell "$CELL3" 500000
 place_held "$SX" 101 88 "$CELL3"
 cell_state "$SX" 101 88
 expect_tier 3
 expect_cells 2
-expect_network 100000 20500000
+expect_network 500000 20500000
 ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 88 minecraft:air" >/dev/null
 ctl wait 4 >/dev/null
-ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 88 $RECEIVER" >/dev/null
+ctl command "execute in minecraft:the_end run setblock $((SX + 1)) 101 88 $BIG_RECEIVER" >/dev/null
 ctl wait 4 >/dev/null
-side_set "$SX" 101 88 east output
 cell_state "$SX" 101 88
-T0=$T; E0=$LOCAL
+side_set "$SX" 101 88 east output
+# Let the mode write land, as in BV; the big receiver has room for the whole window.
 ctl wait 2 >/dev/null
+cell_state "$SX" 101 88
+T0=$T; E0=$LOCAL; R0=$(energy_of "$((SX + 1))" 101 88)
+ctl wait 1 >/dev/null
 cell_state "$SX" 101 88
 DT=$((T - T0)); DE=$((E0 - LOCAL))
 echo "  over $DT ticks: pair $E0 -> $LOCAL FE (-$DE)"
@@ -1472,12 +1488,9 @@ echo "  over $DT ticks: pair $E0 -> $LOCAL FE (-$DE)"
 [ "$DE" = $((5000 * DT)) ] \
     || fail "the pair gave out $DE FE over $DT ticks, expected $((5000 * DT)): 4,000 + 25 %"
 side_set "$SX" 101 88 east none
-cell_state "$SX" 101 88
-STILL=$LOCAL
 R1=$(energy_of "$((SX + 1))" 101 88)
-[ $((STILL + R1)) = 100000 ] \
-    || fail "at rest the paired cell ($STILL) and receiver ($R1) hold $((STILL + R1)) FE, not 100,000"
-echo "  a cell3 with one extra cell moves 5,000 a side and loses nothing along the way"
+[ "$R1" -gt 0 ] || fail "the receiver never took any FE: it still holds $R1"
+echo "  a cell3 with one extra cell moves 5,000 a side into the receiver ($R1 FE and rising)"
 
 echo "== BX: the carried core3 recipe crafts nothing here, and an unknown id is refused =="
 ctl command "gamemode creative" >/dev/null
@@ -1515,6 +1528,99 @@ UNKNOWN=$(ctl inventory | jq -r '[.hotbar[], .main[] | select(.item == "rftoolsp
 ctl messages 8 | jq -r '.chat[]' | grep -qi "unknown item\|No such item\|Unknown item" \
     || fail "the game did not refuse rftoolspower:cell4: $(ctl messages 8 | jq -c '.chat')"
 echo "  the core3 item is carried, a cell4 id is refused, and the core3 recipe needs the parent"
+}
+
+# The charge-item slot is a function so `SELFTEST=charge` can run just its rate inversion and exit 1
+# without replaying the 29 older phases before reaching it.
+chargeitem_phases() {
+# --- the charge-item slot (slice 11) -----------------------------------------
+# Upstream `handleChargingItem`: `min(CHARGEITEMPERTICK, stored)` — 1,000 FE a tick from
+# CoalGeneratorConfig — inserted into the charge-slot item's `Capabilities.Energy.ITEM` handler and
+# consumed from the generator's own store. A powercell item answers that capability with the energy
+# int in its `minecraft:block_entity_data` component, the same store a placed cell reads.
+
+echo "== BY: a powercell item in the charge slot takes exactly 1,000 FE a tick out of the store =="
+ctl close >/dev/null 2>&1 || true
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4 >/dev/null
+CX=$SX; CY=101; CZ=40   # the main arena floor reaches z=48; this row is clear
+# Stand in the row first: a setblock in an unloaded chunk lands nothing, and the player would fall
+# through the missing floor before the placement (the cell arena's trap).
+ctl command "execute in minecraft:the_end run tp @s $((CX - 2)).5 103 $CZ.5" >/dev/null
+ctl wait 20 >/dev/null
+ctl setblock "$CX" 100 "$CZ" minecraft:stone >/dev/null
+ctl setblock "$CX" "$CY" "$CZ" minecraft:air >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$CX" 100 "$CZ")" = minecraft:stone ] || fail "no floor under the charge generator at $CX,100,$CZ"
+# A seeded store, no fuel and no adjacent energy block: nothing generates and nothing is pushed,
+# so every FE the item gains must have left this store through the charge slot.
+ctl command "give @s $BLOCK[minecraft:block_entity_data={id:\"rftoolspower:coalgenerator_block_entity\",burn:0,burn_max:0,energy:100000}]" >/dev/null
+ctl wait 4 >/dev/null
+place_held "$CX" "$CY" "$CZ" "$BLOCK" || fail "the seeded generator did not place at $CX,$CY,$CZ"
+info "$CX" "$CY" "$CZ"
+[ "$ENERGY" = 100000 ] || fail "the seeded generator holds $ENERGY FE, expected 100000"
+[ "$CHARGE_ITEM" = empty ] || fail "a fresh generator already has a charge item: '$CHARGE_ITEM'"
+click_with "$CX" "$CY" "$CZ" "$CELL"
+info "$CX" "$CY" "$CZ"
+[ "$CHARGE_ITEM" = "$CELL" ] || fail "the right click did not put the cell in the charge slot: '$CHARGE_ITEM'"
+# The item's own energy component, as the SDK's ITEM_ENERGY handler reads it. The level tick
+# charges it during the click and this reply's latency, so it need not be zero yet: the rate below
+# is measured between the two replies' own t= values, not from insertion.
+Y_T0=$T; Y_FE0=$CHARGE_FE; Y_E0=$ENERGY
+ctl wait 30 >/dev/null
+info "$CX" "$CY" "$CZ"
+Y_DT=$((T - Y_T0)); Y_DFE=$((CHARGE_FE - Y_FE0)); Y_DE=$((ENERGY - Y_E0))
+[ "$Y_DT" -ge 20 ] || fail "the two replies name only $Y_DT ticks; the window is too small to assert"
+if [ "$SELFTEST_CHARGE" = 1 ]; then
+    echo "(selftest: asserting the charge rate is 2,000 FE a tick, not the artefact's 1,000)"
+    [ "$Y_DFE" = $((2000 * Y_DT)) ] \
+        || fail "selftest: the item gained $Y_DFE FE over $Y_DT ticks ($((Y_DFE / Y_DT)) a tick), so asserting 2,000 a tick fails — the assertion is alive"
+fi
+[ "$Y_DFE" = $((1000 * Y_DT)) ] \
+    || fail "the charge item gained $Y_DFE FE over $Y_DT ticks ($((Y_DFE / Y_DT)) a tick), expected 1,000 x $Y_DT = $((1000 * Y_DT))"
+[ "$Y_DE" = $((0 - Y_DFE)) ] \
+    || fail "the generator's store changed by $Y_DE FE while the item gained $Y_DFE; the slot must pay exactly what the item took, never feed the generator"
+echo "  the item's component rose $Y_DFE FE over $Y_DT ticks (1,000 x dt) and the store fell by exactly the same"
+
+echo "== BZ: a stone is refused in the charge slot and stays in the inventory =="
+BX=$SX; BY=101; BZZ=42
+ctl close >/dev/null 2>&1 || true
+ctl command "execute in minecraft:the_end run tp @s $((BX - 2)).5 103 $BZZ.5" >/dev/null
+ctl wait 20 >/dev/null
+ctl setblock "$BX" 100 "$BZZ" minecraft:stone >/dev/null
+ctl setblock "$BX" "$BY" "$BZZ" minecraft:air >/dev/null
+ctl wait 6 >/dev/null
+[ "$(block_name "$BX" 100 "$BZZ")" = minecraft:stone ] || fail "no floor under the refusal generator at $BX,100,$BZZ"
+hold "$BLOCK"
+ctl look-at-block "$BX" 100 "$BZZ" up >/dev/null \
+    || fail "cannot aim at the floor under $BX,$BY,$BZZ"
+place_block "$BX" "$BY" "$BZZ" "$BLOCK" \
+    || fail "ctl place at $BX,$BY,$BZZ failed: $PLACE_REPLY"
+info "$BX" "$BY" "$BZZ"
+[ "$CHARGE_ITEM" = empty ] || fail "a fresh generator already has a charge item: '$CHARGE_ITEM'"
+ctl command "item replace entity @s hotbar.0 with $STONE 1" >/dev/null
+ctl wait 4 >/dev/null
+ctl select 1 >/dev/null
+ctl wait 2 >/dev/null
+ctl command "execute in minecraft:the_end run tp @s $((BX - 2)).5 101 $BZZ.5" >/dev/null
+ctl wait 6 >/dev/null
+ctl look-at "$BX.5" 101.5 "$BZZ.5" >/dev/null || fail "cannot aim at the generator at $BX,$BY,$BZZ"
+ctl interact "$BX" "$BY" "$BZZ" >/dev/null
+ctl wait 10 >/dev/null
+info "$BX" "$BY" "$BZZ"
+[ "$CHARGE_ITEM" = empty ] || fail "the stone was accepted into the charge slot: '$CHARGE_ITEM'"
+[ "$CHARGE_FE" = 0 ] || fail "a refused stone somehow holds $CHARGE_FE FE"
+SERVER=$(server_inventory)
+case "$SERVER" in
+    *'"minecraft:stone"'*) ;;
+    *) fail "the server lost the stone: a refused click must change nothing ($SERVER)" ;;
+esac
+for cell in "$((BX - 1)) 101 $BZZ" "$BX 102 $BZZ" "$BX 101 $((BZZ + 1))"; do
+    [ "$(block_name $cell)" = minecraft:air ] \
+        || fail "the refused stone was placed against the generator at $cell ($(block_name $cell))"
+done
+echo "  a stone is refused, kept on the server and nothing is placed against the machine"
 }
 
 if [ "$SELFTEST_CELL3" = 1 ]; then
@@ -3520,5 +3626,6 @@ ctl wait 4 >/dev/null
 echo "  the parent's dimensional shard and machine frame are the recipe's limit here"
 
 cell3_phases
+chargeitem_phases
 
-echo "PASS: a blazing infuser spends one catalyst and 10 FE a run on the 11th tick after its counter resets (the field is 10, the period 11 — two replies' counters close it exactly), raising the rod's quality by the catalyst's percentage of a whole 64-step stack (a nether star +1,125 on a 60,000-quality rod, redstone +375 quality and no duration), moving it to the output slot on its last step, costing exactly one catalyst and 10 of its 50,000 FE a run (a hopper-fed window proved one run every 11 ticks over several runs), infusing nothing without a catalyst, and refusing a stone; its recipe needs the parent's dimensional shard and machine frame. Earlier: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"
+echo "PASS: the coal generator's charge slot inserted exactly 1,000 FE a tick into a powercell item's own energy component, the two info replies' t= closing the rate, and the store fell by exactly what the item gained; a stone in that slot was refused and kept on the server. Earlier: a blazing infuser spends one catalyst and 10 FE a run on the 11th tick after its counter resets (the field is 10, the period 11 — two replies' counters close it exactly), raising the rod's quality by the catalyst's percentage of a whole 64-step stack (a nether star +1,125 on a 60,000-quality rod, redstone +375 quality and no duration), moving it to the output slot on its last step, costing exactly one catalyst and 10 of its 50,000 FE a run (a hopper-fed window proved one run every 11 ticks over several runs), infusing nothing without a catalyst, and refusing a stone; its recipe needs the parent's dimensional shard and machine frame. Earlier: a blazing agitator is a 3x3 box of blazing rods whose quality and duration climb by the square of a factor built from the neighbouring rods and whose clocks run down — three rods in a row rose 0.5176/0.5523/0.5176 a tick (the artefact's 0.2275/0.235/0.2275 adjacency factors, not a factor of 1), matched the single-precision fold of the whole box to four decimals over the window the two replies named, spent exactly 10 FE a tick of the 50,000 buffer, took exactly 100 FE a tick from a neighbour, moved finished rods to one of nine output slots unless their slot was locked, converted a plain blaze rod, refused an already-infused one and a stone, carried an agitated rod's component out through a hopper, and kept its store, locks and rods across a relaunch; its recipe needs the parent's machine frame and the absent #c:rods/blaze tag. Earlier: a blazing generator is four rod slots whose rates each climb the artefact's 1/150th-of-the-gap curve onto a 60 FE a tick ceiling over a 1,000,000 FE store — the rate over the window two replies named matched the single-precision fold to six decimals, a rod at its ceiling raised the store by exactly 60 FE per game tick, the 400-tick rod emptied its slot at its 400th tick and the rate decayed a 30th of the gap a tick until working fell and the store stopped, a doctored 999,995 FE generator clamped at 1,000,000 while still burning, the store pushed its whole 100,000 FE into a neighbour with no reserve, the rod's rftoolspower:blazing_rod_data component survived the give and the game read it back, the store and the rods survived a relaunch, a stone was refused as a rod, and the carried recipe needs the parent's machine frame. Earlier: a power level is a 0..9 redstone reading of the block it faces — at 250,000 of 500,000 FE its display face's wire read power=5 (stored * 10 / capacity, not the brief's 4), at 0 FE it read 0, at a full store it clamped to 9, the mirror state and the readout agreed, and a wire on another face stayed 0; the powerlevel refusal and the recipe's missing parent are parsed. Earlier: an ender monitor is a one-tick redstone pulse for the one generator event its mode names — the pearl's arrival lit its display face's output and a lamp beside it for exactly one sampled tick and cleared, the same shot left it silent once its mode was set to 'lost', a pearl lost at an idle destination pulsed both the 'arrived' and the 'lost' monitors, a monitor whose display points at the generator never pulsed, the modes and counters survive a relaunch, the endermonitor refusals parse, and its recipe needs the parent's machine base. Earlier: the endergenic pair fires a pearl across a 2-tick link and the destination pays rfPerHit[mode] x 2 when it lands inside the 15-tick charging window and nothing when it lands at idle; a charge with no injector makes no FE; the generator pushes all but its 2,000 FE reserve; a broken endergenic carries its store; both endergenic recipes need the parent machine frame; the enderlink refusals parse; the store and the link survive a relaunch. Earlier: a fresh cell1 is empty with six NONE faces; against a 100,000 FE generator it refuses the push until its west face is set INPUT, then takes exactly 250 FE a tick (tier1MaxRFPerTick) until the generator is empty, with the two stores adding up to the 100,000 seeded; a second cell1 beside it shares one network (3,000/1,000,000 in both), and a cell with a gap does not; a cell2 beside a cell1 joins the same network (5,000/4,500,000) while one with a gap stays alone (4,000,000) — the network is adjacency, not tier; an OUTPUT face pushes 250 FE a tick into a neighbour with nothing created or lost; the store and the face modes survive save and relaunch; a broken cell carries its own store and placing it gives it back; the power core's recipe crafts once and consumes its diamond, redstone block and three redstones, while cell1's recipe crafts nothing without the parent's machine frame; and the side command's bad face, bad mode and no-cell refusals parse as replies"

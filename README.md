@@ -3,9 +3,9 @@
 
 A Horizon port of [RFTools Power](https://github.com/McJtyMods/RFToolsPower) 1.21-7.0.6
 (Minecraft Java 1.21.1 NeoForge), rewritten for Horizon 26.3 at the campaign pin
-`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.9**.
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / horizon-mixins `e59da909…`. Package **0.1.10**.
 
-Nine families so far (the powercell family gained its third tier in slice 10):
+Nine families so far (the coal generator gained its charge-item slot in slice 11):
 
 **The Coal Generator** (slice 1)
 
@@ -13,6 +13,9 @@ Nine families so far (the powercell family gained its third tier in slice 10):
   5,400 — at **60 FE a tick** (36,000 FE a coal) into a **500,000 FE** buffer;
 - lights its own front (`lit`) while it burns and goes dark the moment the fuel runs out;
 - takes fuel from its input slot (a hopper feeds it, or a right click puts the held fuel in);
+- charges an **energy item in its second slot at 1,000 FE a tick** out of its own store (upstream's
+  `handleChargingItem`); a powercell item is such an energy item, carrying its FE in the same
+  `minecraft:block_entity_data` store the block reads;
 - gives up to **2,000 FE an extract** through the energy capability on every face, and **pushes
   2,000 FE a tick into each adjacent energy block** (upstream's `handleSendingEnergy`);
 - keeps its store on its own item when broken, and clamps a doctored item back to the capacity;

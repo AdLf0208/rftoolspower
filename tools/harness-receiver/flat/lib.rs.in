@@ -30,8 +30,29 @@ impl Hooks for Mod {
                 extract_faces: [false; 6],
             },
         );
+        // A second, roomier buffer for the tier-3 per-side rate windows: the small receiver's
+        // 100,000 fills within the reply latency of the two readout commands on a loaded box,
+        // clipping the measured rate. Phase R keeps the small receiver's exact-full assertions.
+        let big_kind = r
+            .block_entity_type("big_receiver_block_entity")
+            .blocks(&["big_receiver"])
+            .build();
+        let big_block = r.block_key("rfpowerharness:big_receiver");
+        r.block_energy(
+            &big_block,
+            mod_api::ModEnergyBuffer {
+                capacity: 10_000_000,
+                max_insert: 10_000,
+                max_extract: 0,
+                insert_faces: [true; 6],
+                extract_faces: [false; 6],
+            },
+        );
         if let Err(error) = r.block_entity_part(&kind, ReceiverPart) {
             context.refuse(&format!("rfpowerharness: the receiver part was refused: {error}"));
+        }
+        if let Err(error) = r.block_entity_part(&big_kind, ReceiverPart) {
+            context.refuse(&format!("rfpowerharness: the big receiver part was refused: {error}"));
         }
     }
 }

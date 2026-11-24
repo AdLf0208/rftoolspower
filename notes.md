@@ -1,10 +1,13 @@
 # RFTools Power — port notes (slice 1: the coal generator; slice 2: the power monitor; slice 3: the
 # powercell; slice 4: the endergenic generator and the pearl injector; slice 5: the ender monitor;
 # slice 6: the power level; slice 7: the blazing generator and rod; slice 8: the blazing agitator;
-# slice 9: the blazing infuser; slice 10: `cell3`)
+# slice 9: the blazing infuser; slice 10: `cell3`; slice 11: the charge-item slot)
 
-> **Current state (2026-11-24): slice 10, package 0.1.9 at pin
-> `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 1 (0.1.0) is the coal
+> **Current state (2026-11-24): slice 11, package 0.1.10 at pin
+> `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` / mixins `e59da909…`.** Slice 11 adds the coal
+> generator's **charge-item slot**: an energy item in slot 1 is charged at 1,000 FE a tick out of
+> the generator's own store, through the pin's `horizon:item_energy` capability, and a powercell item
+> is such a carrier (its `minecraft:block_entity_data` energy int). Slice 1 (0.1.0) is the coal
 > generator; slice 2 (0.1.1) adds the **Power Monitor** and the generator's **energy push**
 > (`handleSendingEnergy`); slice 3 adds the **powercell** (`cell1`/`cell2`): a per-tier block
 > entity with a 500,000 / 4,000,000 FE buffer, six face modes that default to `NONE`, an adjacency
@@ -128,7 +131,7 @@ current pin. The gap list below is the rest of the mod.
 | ticks a coal | 600 | `CoalGeneratorConfig.TICKSPERCOAL` (`ticksPerCoal`) |
 | a coal block | 5,400 ticks | `handlePowerGeneration`'s `if (extracted.getItem() == Blocks.COAL_BLOCK.asItem()) burning *= 9` |
 | FE out a tick | 2,000 | `CoalGeneratorConfig.SENDPERTICK` (`generatorRFPerTick`); upstream's `handleSendingEnergy` |
-| a charge item | 1,000 FE a tick | `CoalGeneratorConfig.CHARGEITEMPERTICK` — **not ported**, see the gaps |
+| a charge item | 1,000 FE a tick | `CoalGeneratorConfig.CHARGEITEMPERTICK` — **ported in slice 11** |
 | fuels | coal, charcoal, coal block | `CoalGeneratorTileEntity.isValidFuel` |
 | redstone | ignored by default | `RedstoneMode.REDSTONE_IGNORED` is McJtyLib's `BaseBEData` default; `isMachineEnabled()` returns true |
 | block properties | 2.0 / 2.0, pickaxe, iron sound | McJtyLib `BlockBuilder.STANDARD_IRON` (`CoalGeneratorTileEntity.createBlock`) |
@@ -1613,13 +1616,117 @@ while its plain `power_core3` recipe is carried and proven uncraftable without t
 `rftoolsbase:dimensionalshard`; and the connected-cell `upper`/`lower` models stay omitted (the
 slice-3 simplification).
 
+## Slice 11 — the charge-item slot (package 0.1.10)
+
+Gap line it comes from (`## Gaps` below): **gap 2** — *"The charge-item slot (`SLOT_CHARGEITEM`,
+1,000 FE a tick into an energy item). Needs the item energy capability and an item that carries FE;
+not carried here."* Tier: still **machines** — one more container slot and one more tick rule on the
+existing block entity, plus a capability on an item the mod already carries. No GUI, renderer or
+new hook beyond the level-tick post the charge needs.
+
+**Capability gate (first command of the slice, before any code).** The pinned SDK at
+`ports/_shared/sdk/0a875da/` exposes `ITEM_ENERGY` (`horizon:item_energy`) in
+`crates/horizon-mod-vocab/src/item/energy_capability.rs`: `pub const ITEM_ENERGY:
+ItemCapabilityKey<dyn EnergyHandler>`, with `EnergyHandler::{amount, capacity, insert, extract}` and
+`ItemPlace::{capability, exchange}`. `surface.json` carries `capability:horizon:item_energy` and
+`trait:EnergyHandler`. So the pin **does** let a mod read and mutate FE on a carried item; the gate
+passed and the slice was implemented rather than `blocked(item-energy-capability)`.
+
+### What it does (upstream `CoalGeneratorTileEntity.handleChargingItem`, 1.21-7.0.6)
+
+```java
+ItemStack stack = handler.getStackInSlot(SLOT_CHARGEITEM);
+if (!stack.isEmpty()) {
+    long rfToGive = Math.min(CHARGEITEMPERTICK.get(), energyStorage.getEnergy());
+    long received = EnergyTools.receiveEnergy(stack, rfToGive);
+    energyStorage.consumeEnergy(received);
+}
+```
+
+- **The rate** is `CoalGeneratorConfig.CHARGEITEMPERTICK` = **1,000 FE a tick**, read from the jar's
+  own `CoalGeneratorConfig.class` (FINDINGS records it; not inferred from the 60 FE generation or
+  the 2,000 FE push). The tick offers `min(1,000, stored)` and deducts exactly what the item's own
+  handler took, so a nearly empty store or a full item cannot overdraw it.
+- **The slot** is slot 1 (`SLOT_COALINPUT` is 0); upstream's container is `ContainerFactory(2)` with
+  the charge slot `.in().out()` and an `EnergyTools.isEnergyItem` filter. The port has two slots;
+  the filter asks the item's own `ITEM_ENERGY` capability, so a stone is refused with nothing moved
+  (there is no per-slot predicate in `ModContainer` at this pin — the documented API limit).
+- **The carrier**: upstream's cell item keeps its FE in `mcjtylib:item_energy`. The port answers
+  `ITEM_ENERGY` for `cell1`/`cell2`/`cell3` from the same `minecraft:block_entity_data` energy int
+  placement reads, so a cell charged in the generator's slot carries that FE when later placed. No
+  new item was invented.
+- **Where it runs**: a block entity is out of the world during its own tick, so `ItemPlace::capability`
+  answers nothing there. The generator's part queues its position, and `level_tick_post` drains the
+  queue after the level's tick, where every block entity is back in the world (powah's proven
+  pattern). The FE removed from the store is written with `merge_data` in that same post phase.
+- **Upstream direction (a directive/artefact discrepancy, resolved for the artefact).** The dispatch
+  asked for "the item's FE must fall 1,000 × Δt while the generator's store does not rise". The jar's
+  `handleChargingItem` does the opposite: `receiveEnergy(stack, …)` puts FE **into** the item and
+  `consumeEnergy(received)` takes it **out** of the generator. Per the campaign's "the artefact wins"
+  rule the port implements charging: the item's FE rises 1,000 × Δt and the store falls by exactly
+  the same; the slot is never a source of FE for the generator.
+
+### Red → green (unit, verbatim)
+
+`ports/_shared/evidence/rftoolspower/red-chargeitem.log`: `test result: FAILED. 152 passed; 4 failed`,
+every new failure `not yet implemented: charge_step is not written yet`. Green: **156 passed; 0
+failed** (`sdk-test.log`, regenerated after the final 0.1.10 build and naming its sha).
+
+### In game (evidence under `../_shared/evidence/rftoolspower-e2e/`)
+
+Built with the launcher at the pin: `native-build` reported `Compiling rftoolspower (1 of 1)` and
+installed `native-0a875da-c77791f98fa0`; the two-mod e2e build is `native-0a875da-4936ffe0d492`
+(`rfpowerharness`, `rftoolspower`), whose `native-mods.json` names **0.1.10**.
+
+| log | verdict |
+|---|---|
+| `e2e-chargeitem.log` | **PASS**, `EXIT:0` — phases A–BX + BY/BZ |
+| `e2e-charge-selftest.log` | `FAIL: selftest: the item gained 41000 FE over 41 ticks (1000 a tick), so asserting 2,000 a tick fails — the assertion is alive`, `EXIT:1` |
+| `e2e-chargeitem-control.log` | `FAIL: ctl place at 302,101,0 failed: {"error":"no rftoolspower:coalgenerator in the inventory"}`, `EXIT:1` |
+
+`check-e2e-logs.py rftoolspower-e2e --strict` → `logs=32 ok=32 missing-exit=0 bad-exit=0`.
+
+The two new parsed assertions (each from `/rftoolspower info` replies, with the item's energy read
+through its own `ITEM_ENERGY` handler into the readout's `charge … (N FE, cap=yes)` field):
+
+| phase | what it asserts (observed) |
+|---|---|
+| BY | a `cell1` item clicked into the charge slot goes `14,000 → 53,000 FE` over replies naming `t=11462 → 11501` (**39,000 = 1,000 × 39**), while the generator's store goes `86,000 → 47,000` (**−39,000**); the slot never adds FE to the store |
+| BZ | a stone clicked on the charge slot leaves it `empty`, stays in the server-side `Inventory`, and nothing is placed against the generator |
+
+Counterfactual: `SELFTEST=charge` asserts 2,000 FE a tick in BY and fails, so the rate assertion can
+fail. BZ's differential is the same click on a fuel item (phase B) that is accepted into slot 0. The
+control leg proves a fresh generator cannot even be placed without this package.
+
+### Engines traps this slice cost (measured, not read)
+
+1. **An item capability inside its own block entity tick answers nothing.** The first in-game run
+   moved 0 FE with `cap=yes` in a command readout. The charge had to move to `level_tick_post` with
+   a per-level position queue; the generator store then fell 1,000 a tick as upstream's does.
+2. **The 100,000 FE harness receiver fills inside a loaded-box reply window**, clipping the tier-3
+   per-side rate in phases BV/BW. A second, roomier `rfpowerharness:big_receiver` (10,000,000 FE)
+   serves those two windows; phase R keeps the small receiver and its exact-full assertions.
+3. **Two sequential `data get` reads skew while a store moves**, so conservation cannot be asserted
+   across the tier-3 window (phase Z proves cell↔receiver conservation at rest). BV/BW assert only
+   the rate from the two replies' own `t=`.
+4. A dead crafting screen left by an earlier phase refuses `ctl place`; BY/BZ now `ctl close` first
+   and stand in the row before `setblock` so the End chunk is loaded.
+
+### Upstream defects fixed
+
+None adopted. The charge direction is upstream's, not the directive's (documented above); the
+level-tick post and the second harness receiver are this port's mechanisms for pin limits, not
+behaviour changes from the jar.
+
 ## Gaps (the rest of the mod)
 
 1. ~~**The FE push into a neighbour**~~ — **ported in slice 2**: `handleSendingEnergy` offers
    2,000 FE a tick to every adjacent energy handler and is proven in game (phase R, against the
    harness receiver). The powercell, the mod's own receiver, is still gap 9.
-2. **The charge-item slot** (`SLOT_CHARGEITEM`, 1,000 FE a tick into an energy item). Needs the item
-   energy capability and an item that carries FE; not carried here.
+2. ~~**The charge-item slot** (`SLOT_CHARGEITEM`, 1,000 FE a tick into an energy item)~~ — **ported
+   in slice 11**: the pin's `horizon:item_energy` capability answers for a powercell item's
+   `minecraft:block_entity_data` store, and `handleChargingItem` runs at the level tick's end (a
+   block entity's item capability answers nothing during its own tick).
 3. **The infusable upgrade factor** (`getRfPerTick`'s `factor`, and the burn's `+burning*factor/2`).
    Upstream's upgrade slot is McJtyLib's `DefaultInfusable`; the upgrade item family is not ported.
 4. **The GUI and its redstone mode** (`GuiCoalGenerator`, `RedstoneMode` Ignored/Off/On). The port
@@ -1742,9 +1849,9 @@ slice-3 simplification).
 | unknown id refused | tested (L) |
 | comparator output, TOP/Jade | not ported (gaps 4, 6) |
 | the GUI, the redstone toggle, the glow layer | not ported (gaps 4, 5) |
-| the charge-item slot, the infusable factor | not ported (gaps 2, 3) |
+| the charge-item slot, the infusable factor | the slot tested (BY/BZ, gap 2); the factor not ported (gap 3) |
 | the FE push into an adjacent energy handler, 2,000 a tick a neighbour | tested (R, against the harness receiver) |
-| the charge item | not ported (gap 2) |
+| the charge item: 1,000 FE a tick into an energy item, paid out of the store | tested (BY: the item's component rose 39,000 over 39 replies' ticks, 1,000 × Δt, and the store fell by exactly the same; BZ: a stone is refused and stays server-side; `SELFTEST=charge` inverts the rate) |
 | the recipe's craft | `blocked(rftoolsbase:machine_frame-absent)` (gap 7) |
 | the other nine blocks | not ported (gaps 9, 10) |
 
@@ -1786,44 +1893,43 @@ slice-3 simplification).
 | the smart wrench, the GUI, the powercell card | not ported (gap 9) |
 | the connected-cell `upper`/`lower` models and the animated glow | not ported (the documented simplification) |
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices (slices 1–10; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review (slices 1–11; slice 11 kept the charge rule in `runtime.rs` as a pure `charge_step` tested red-first, used `#[must_use]` constants with the jar value as the source, and re-read every gate's `PACKAGE` sha; slice 9 followed the vendored `rust-best-practices` checks `cargo fmt` / `clippy -D warnings` / `cargo test`, and its `#[must_use]`/`expect`-with-reason habits, the "group the arguments into a semantic type" rule for the readout, and `set -euo pipefail` in the gate script)
 
-## Verification (slice 10 run — every compile gate forwarded to `AdLf-PC`)
+## Verification (slice 11 run — every compile gate forwarded to `AdLf-PC`)
 
 | command | result |
 |---|---|
-| `cargo test --offline` | **152 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the package sha) |
+| `cargo test --offline` | **156 passed; 0 failed** (`../_shared/evidence/rftoolspower/sdk-test.log`, prints the final package sha) |
 | `cargo clippy --all-targets --offline -- -D warnings` | **0 warnings** (`sdk-clippy.log`) |
 | `cargo fmt --check` | clean (`sdk-fmt.log`) |
-| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 199,035 B (`sdk-build-1.log`, `sdk-build-2.log`) |
-| `cargo horizon-mod check` | exit 0, `0.1.9 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `199035 bytes, SHA-256 1e6beecf…` (`sdk-check.log`) |
+| two `cargo horizon-mod build` with `rm -f Cargo.lock` | `cmp`-identical, 202,754 B (`sdk-build-1.log`, `sdk-build-2.log`) |
+| `cargo horizon-mod check` | exit 0, `0.1.10 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `202754 bytes, SHA-256 acf020a0…` (`sdk-check.log`) |
 | `cargo horizon-mod fits --build 0a875da` / `--build 0b14f8a` | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits.log`) |
-| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, 154 entries, R9 clean |
-| `tools/assemble_content.py --check` | `ok: 177 entries re-derive exactly` |
-| the leg | `PASS` + `EXIT:0`; `SELFTEST=cell3` `EXIT:1`; control `EXIT:1`; `--strict` 29/29 |
+| `verify-sdk-package.py rftoolspower` | **1/1**, `package matches the tree`, R9 clean, no local `Block`/`Item` type |
+| the leg | `PASS` + `EXIT:0`; `SELFTEST=charge` `EXIT:1`; control `EXIT:1`; `--strict` 32/32 |
 
-Every SDK gate was run as `build-slot.sh run --job G11-rftoolspower --port ports/rftoolspower
---step …` and the runner printed `build-slot: forwarding … to the remote runner`; the hostname is
-`AdLf-PC`. The launcher game build and all three e2e legs stayed local (the exported instance, the
-offscreen renderer and the control game are on this box). No `BUILD_LOCAL=1` was used.
+Every SDK gate was run as `build-slot.sh run --job W1-rftoolspower --port ports/rftoolspower
+--step …` and the runner printed `build-slot: forwarding … to the remote runner`; the far hostname
+is `AdLf-PC`. The launcher game build and all three e2e legs stayed local (the exported instance,
+the offscreen renderer and the control game are here). No `BUILD_LOCAL=1` was used.
 
-The red proof for slice 9's rules is `ports/_shared/evidence/rftoolspower/red-infuser.log`:
-`test result: FAILED. 132 passed; 12 failed`, every failure `not yet implemented`. The slice-10 red
-proof is `red-cell3.log`: `FAILED. 150 passed; 1 failed`, `not yet implemented: cell3's saved block
-entity type is not written yet`. The green `sdk-test.log` was regenerated **after** the 0.1.9 build,
-so its `PACKAGE` line names `1e6beecf…` / 199,035 B. The launcher's own build printed `Compiling
-rftoolspower (1 of 1)` and exported `native-0a875da-2297fa36feae`; the two-mod e2e export is
-`native-0a875da-c0540063b510` (`native-mods.json` names version 0.1.9).
+The red proof is `ports/_shared/evidence/rftoolspower/red-chargeitem.log`: `test result: FAILED.
+152 passed; 4 failed`, every failure `not yet implemented: charge_step is not written yet`. The green
+`sdk-test.log` was regenerated **after** the final 0.1.10 build, so its `PACKAGE` line names
+`acf020a0…` / 202,754 B. The launcher's own build printed `Compiling rftoolspower (1 of 1)` and
+exported `native-0a875da-c77791f98fa0`; the two-mod e2e export is `native-0a875da-4936ffe0d492`
+(`native-mods.json` names version 0.1.10).
 
-## Artifact (0.1.9)
+## Artifact (0.1.10)
 
 | File | Size | SHA-256 | Entries |
 |---|---:|---|---:|
-| `rftoolspower.hmod` (port root) | 199,035 B | `1e6beecff03678042053c3a4d2bc52fded2c1bc41cbe2984ebbc876bbe16bb35` | 154 |
+| `rftoolspower.hmod` (port root) | 202,754 B | `acf020a0636fdebc6f799d721a034dcebc75a1b20e4a2c134f191377ad18f2fb` | 154 |
 
 Built twice with `rm -f Cargo.lock` before each (`cmp` identical), **no packed `Cargo.lock`**,
 `check` green, both `fits` green, `verify-sdk-package.py` 1/1 (`package matches the tree`, R9
-clean), and the three 0.1.9 legs ran on these bytes (their `PACKAGE` lines name them).
+clean), and the three 0.1.10 legs ran on these bytes (their `PACKAGE` lines name them). The earlier
+0.1.9 artifact was 199,035 B / `1e6beecf…` / 154 entries.
 
 ## Artifact (0.1.8, historical)
 
@@ -1839,3 +1945,23 @@ artifact (162,363 B, `7fe0e237…`, 122 entries) is the slice-7 record; the 0.1.
 artifact (141,168 B, `26485b9a…`, 105 entries) is the slice-6 record; the 0.1.4 (134,377 B,
 `e1c60156…`, 96 entries), 0.1.3 (122,516 B, `ab452bd8…`, 87 entries), 0.1.2 (100,317 B,
 `989543d7…`, 69 entries) and 0.1.1 records are kept in this file.
+
+## Next slice
+
+- **Family:** the generator's **infusable upgrade factor** (`getRfPerTick`'s `factor` and the burn's
+  `+burning*factor/2`) — gap 3, the highest-value remaining generator rule now that gap 2 is
+  ported. It fits `machines`: the generator already has an item slot and a saved compound, and the
+  change is one more slot plus two integer rules in its tick, with no GUI, renderer or new hook.
+- **Gap line it comes from:** gap 3 — *"The infusable upgrade factor (`getRfPerTick`'s `factor`, and
+  the burn's `+burning*factor/2`). Upstream's upgrade slot is McJtyLib's `DefaultInfusable`; the
+  upgrade item family is not ported."*
+- **Gate before code:** grep the pinned SDK for an infusable component/capability (the pin has none
+  for McJtyLib's `DefaultInfusable`); if absent, carry the factor as this port's own int component on
+  a carried item, exactly as the blazing rod's data was carried, and stop with
+  `blocked(infusable-capability)` only if even that is impossible.
+- **In-game assertion that would prove it:** with a doctored upgrade item carrying a known factor
+  in slot 0 (the fuel slot moves to 1), seed a generator with a coal and read `/rftoolspower info
+  <pos> <nonce>` twice; assert `Δenergy == 60 * (1 + factor) * Δburn` from the two replies' own `t=`
+  and burn values, and the burn's starting value equals `600 + 600*factor/2`. A `SELFTEST=factor`
+  run asserts the un-infused `60 * Δburn` and exits 1; a stone in the upgrade slot is refused and
+  stays in the server's inventory.

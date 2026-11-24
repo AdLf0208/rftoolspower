@@ -19,6 +19,17 @@ pub const TICKS_PER_COAL: u32 = 600;
 pub const COAL_BLOCK_TICKS: u32 = TICKS_PER_COAL * 9;
 /// The most FE one extract moves (`CoalGeneratorConfig.SENDPERTICK`, `generatorRFPerTick`).
 pub const EXTRACT_PER_TICK: i32 = 2_000;
+/// The most FE a tick the generator gives an energy item in its charge slot
+/// (`CoalGeneratorConfig.CHARGEITEMPERTICK`, `chargeItemPerTick`).
+pub const CHARGE_PER_TICK: i32 = 1_000;
+
+/// What the generator offers the charge-slot item this tick (upstream
+/// `handleChargingItem`: `min(CHARGEITEMPERTICK, storedPower)`, then the item's
+/// own handler caps it at its remaining room).
+#[must_use]
+pub fn charge_step(stored: i32, room: i32) -> i32 {
+    stored.min(CHARGE_PER_TICK).min(room.max(0)).max(0)
+}
 
 /// Coal (`Items.COAL`).
 pub const COAL: &str = "minecraft:coal";
@@ -3853,5 +3864,54 @@ mod tests {
         assert_eq!(clamp_infuser(999_999), INFUSER_CAPACITY);
         assert_eq!(clamp_infuser(-5), 0);
         assert_eq!(clamp_infuser(12_345), 12_345);
+    }
+
+    // Slice 11 — the charge-item slot (`CoalGeneratorTileEntity.handleChargingItem`).
+
+    #[test]
+    fn a_charge_item_takes_1000_fe_a_tick() {
+        assert_eq!(charge_step(100_000, 500_000), 1_000);
+        assert_eq!(charge_step(CAPACITY, 500_000), 1_000);
+    }
+
+    #[test]
+    fn a_charge_item_takes_no_more_than_the_generator_holds() {
+        assert_eq!(
+            charge_step(400, 500_000),
+            400,
+            "a nearly empty store gives its last 400"
+        );
+        assert_eq!(charge_step(0, 500_000), 0);
+    }
+
+    #[test]
+    fn a_charge_item_takes_no_more_than_its_own_room() {
+        assert_eq!(
+            charge_step(100_000, 250),
+            250,
+            "the item's handler caps the insert"
+        );
+        assert_eq!(charge_step(100_000, 0), 0, "a full item takes nothing");
+        assert_eq!(
+            charge_step(100_000, -5),
+            0,
+            "a corrupted room is clamped to zero"
+        );
+    }
+
+    #[test]
+    fn a_charge_item_over_many_ticks_takes_exactly_rate_times_the_window() {
+        let mut generator = burning(100_000);
+        let mut held = 0;
+        for _ in 0..40 {
+            let asked = charge_step(generator.energy, 500_000 - held);
+            held += asked;
+            generator.energy -= asked;
+        }
+        assert_eq!(held, 40_000, "40 x 1,000 FE into the item");
+        assert_eq!(
+            generator.energy, 60_000,
+            "and the same 40,000 off the generator"
+        );
     }
 }

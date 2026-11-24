@@ -18,9 +18,13 @@ LINE = re.compile(
     r"^Coal Generator at (?P<x>-?\d+),(?P<y>-?\d+),(?P<z>-?\d+): "
     r"(?P<energy>-?\d+)/(?P<capacity>\d+) FE "
     r"\(burning (?P<burn>\d+)/(?P<burn_max>\d+) ticks, lit (?P<lit>true|false), "
-    r"fuel (?P<fuel>.*?), t=(?P<t>\d+)(?: nonce=(?P<nonce>\S+))?\)$"
+    r"fuel (?P<fuel>.*?), charge (?P<charge>.*?), t=(?P<t>\d+)"
+    r"(?: nonce=(?P<nonce>\S+))?\)$"
 )
 STACK = re.compile(r"^(?P<item>\S+) x(?P<count>\d+)$")
+CHARGE = re.compile(
+    r"^(?P<item>\S+) x(?P<count>\d+) \((?P<fe>-?\d+) FE, cap=(?P<cap>yes|no)\)$"
+)
 
 
 def main() -> None:
@@ -36,6 +40,11 @@ def main() -> None:
     fuel = STACK.match(match["fuel"])
     print(f"FUEL_ITEM={fuel['item'] if fuel else 'empty'}")
     print(f"FUEL_COUNT={fuel['count'] if fuel else 0}")
+    charge = CHARGE.match(match["charge"])
+    print(f"CHARGE_ITEM={charge['item'] if charge else 'empty'}")
+    print(f"CHARGE_COUNT={charge['count'] if charge else 0}")
+    print(f"CHARGE_FE={charge['fe'] if charge else 0}")
+    print(f"CHARGE_CAP={charge['cap'] if charge else 'no'}")
 
 
 if __name__ == "__main__":

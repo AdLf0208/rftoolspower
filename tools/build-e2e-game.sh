@@ -44,6 +44,8 @@ cp -a "$PORT/tools/harness-receiver/flat/Cargo.toml.in" "$MODSET/rfpowerharness/
 cp -a "$PORT/tools/harness-receiver/flat/lib.rs.in" "$MODSET/rfpowerharness/src/lib.rs"
 cp -a "$PORT/tools/harness-receiver/flat/receiver.json" \
       "$MODSET/rfpowerharness/data/rfpowerharness/horizon/block/receiver.json"
+cp -a "$PORT/tools/harness-receiver/flat/big_receiver.json" \
+      "$MODSET/rfpowerharness/data/rfpowerharness/horizon/block/big_receiver.json"
 
 before=$(ls -1 "$VERSIONS" 2>/dev/null | tr '\n' ' ')
 built_json=$(env XDG_DATA_HOME="$DATA" XDG_CONFIG_HOME="$CONFIG" HOME="$HOME_DIR" \
